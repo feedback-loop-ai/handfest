@@ -84,27 +84,24 @@ pub fn try_render_canonical(ast: &HandfestAst) -> Result<String, AstError> {
 /// Renders a validated `HandfestAst` into its unique canonical `HANDFEST v1` Controlled-English string.
 #[must_use]
 pub fn render_canonical(ast: &HandfestAst) -> String {
-    let mut canon = ast.clone();
-    canon.canonicalize();
-
     let mut out = String::new();
     let _ = writeln!(out, "{MANDATE_VERSION}");
-    if let Some(parent) = canon.parent() {
+    if let Some(parent) = ast.parent() {
         let _ = writeln!(out, "PARENT {parent}");
     }
     out.push_str("FROM ");
-    write_actor(&mut out, canon.from());
+    write_actor(&mut out, ast.from());
     out.push('\n');
 
     out.push_str("TO ");
-    write_actor(&mut out, canon.to());
+    write_actor(&mut out, ast.to());
     out.push('\n');
 
-    let hop_word = if canon.max_hops() == 1 { "hop" } else { "hops" };
-    let _ = writeln!(out, "DELEGATION max {} {hop_word}", canon.max_hops());
+    let hop_word = if ast.max_hops() == 1 { "hop" } else { "hops" };
+    let _ = writeln!(out, "DELEGATION max {} {hop_word}", ast.max_hops());
 
     out.push_str("ALLOW ");
-    for (i, pat) in canon.allow().iter().enumerate() {
+    for (i, pat) in ast.allow().iter().enumerate() {
         if i > 0 {
             out.push_str(", ");
         }
@@ -113,7 +110,7 @@ pub fn render_canonical(ast: &HandfestAst) -> String {
     out.push('\n');
 
     out.push_str("ON ");
-    for (i, sel) in canon.on().iter().enumerate() {
+    for (i, sel) in ast.on().iter().enumerate() {
         if i > 0 {
             out.push_str(", ");
         }
@@ -123,13 +120,13 @@ pub fn render_canonical(ast: &HandfestAst) -> String {
     }
     out.push('\n');
 
-    for (i, pred) in canon.where_clauses().iter().enumerate() {
+    for (i, pred) in ast.where_clauses().iter().enumerate() {
         out.push_str(if i == 0 { "WHERE " } else { "  AND " });
         write_predicate(&mut out, pred);
         out.push('\n');
     }
 
-    for (i, quota) in canon.limits().iter().enumerate() {
+    for (i, quota) in ast.limits().iter().enumerate() {
         out.push_str(if i == 0 { "LIMIT " } else { "  AND " });
         write_quota(&mut out, quota);
         out.push('\n');
@@ -140,8 +137,7 @@ pub fn render_canonical(ast: &HandfestAst) -> String {
 
 /// Parses a `HANDFEST v1` mandate and rejects any input that is not byte-for-byte canonical.
 pub fn parse_canonical(input: &str) -> Result<HandfestAst, ParseError> {
-    let mut ast = parse_mandate(input)?;
-    ast.canonicalize();
+    let ast = parse_mandate(input)?;
     let expected = render_canonical(&ast);
     if expected != input {
         return Err(ParseError::NonCanonical { expected });

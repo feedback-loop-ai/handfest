@@ -2,7 +2,8 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use handfest_core::ast::{
     parse_rfc3339_utc, ActionPat, ActorDecl, AstError, Decimal, HandfestAst, HandfestAstBuilder,
-    KeyId, MandateId, Predicate, PredicateOp, Quota, ResourceSel, Scalar,
+    KeyId, MandateId, Predicate, PredicateOp, Quota, ResourceSel, Scalar, MAX_RFC3339_TIMESTAMP,
+    MIN_RFC3339_TIMESTAMP,
 };
 use handfest_core::cnl::parse_mandate;
 use handfest_core::lattice::{subsumes, NarrowError};
@@ -653,4 +654,232 @@ fn lattice_rejects_unsatisfiable_scalar_boundary_predicates() {
         .where_clauses
         .push(Predicate::lte("tag", Scalar::Str(String::new())).unwrap());
     assert!(subsumes(&p_empty, &cb_empty.build().unwrap()).is_ok());
+}
+
+#[test]
+fn lattice_enforces_rfc3339_timestamp_domain_bounds() {
+    let (parent, child) = base_parent_child();
+
+    let impossible_cases: Vec<Vec<Predicate>> = vec![
+        vec![Predicate::gt("tx.settled_at", Scalar::Timestamp(MAX_RFC3339_TIMESTAMP)).unwrap()],
+        vec![Predicate::lt("tx.settled_at", Scalar::Timestamp(MIN_RFC3339_TIMESTAMP)).unwrap()],
+    ];
+
+    for child_preds in impossible_cases {
+        let mut cb = child.clone().into_builder();
+        cb.parent = Some(parent.mandate_id());
+        cb.where_clauses.extend(child_preds.clone());
+        let c_ast = cb.build().unwrap();
+        assert!(
+            matches!(
+                subsumes(&parent, &c_ast),
+                Err(NarrowError::ContradictoryPredicates { .. })
+            ),
+            "expected ContradictoryPredicates for {child_preds:?}"
+        );
+    }
+
+    // Tightest satisfiable 4-digit-year endpoints collapse to exact equality
+    let mut pb_max = parent.clone().into_builder();
+    pb_max
+        .where_clauses
+        .push(Predicate::eq("tx.settled_at", Scalar::Timestamp(MAX_RFC3339_TIMESTAMP)).unwrap());
+    let p_max = pb_max.build().unwrap();
+    let mut cb_max = child.clone().into_builder();
+    cb_max.parent = Some(p_max.mandate_id());
+    cb_max
+        .where_clauses
+        .push(Predicate::gte("tx.settled_at", Scalar::Timestamp(MAX_RFC3339_TIMESTAMP)).unwrap());
+    assert!(subsumes(&p_max, &cb_max.build().unwrap()).is_ok());
+
+    let mut pb_min = parent.clone().into_builder();
+    pb_min
+        .where_clauses
+        .push(Predicate::eq("tx.settled_at", Scalar::Timestamp(MIN_RFC3339_TIMESTAMP)).unwrap());
+    let p_min = pb_min.build().unwrap();
+    let mut cb_min = child.clone().into_builder();
+    cb_min.parent = Some(p_min.mandate_id());
+    cb_min
+        .where_clauses
+        .push(Predicate::lte("tx.settled_at", Scalar::Timestamp(MIN_RFC3339_TIMESTAMP)).unwrap());
+    assert!(subsumes(&p_min, &cb_min.build().unwrap()).is_ok());
+
+    // Unsatisfiable parent `> MAX_RFC3339_TIMESTAMP` cannot be implied by any valid child
+    let mut pb_un = parent.into_builder();
+    pb_un
+        .where_clauses
+        .push(Predicate::gt("tx.settled_at", Scalar::Timestamp(MAX_RFC3339_TIMESTAMP)).unwrap());
+    let p_un = pb_un.build().unwrap();
+    let mut cb_un = child.into_builder();
+    cb_un.parent = Some(p_un.mandate_id());
+    cb_un
+        .where_clauses
+        .push(Predicate::eq("tx.settled_at", Scalar::Timestamp(MAX_RFC3339_TIMESTAMP)).unwrap());
+    assert!(matches!(
+        subsumes(&p_un, &cb_un.build().unwrap()),
+        Err(NarrowError::PredicateNotImplied { .. })
+    ));
+}
+
+fn assert_interval_implies_in(
+    parent: &HandfestAst,
+    child: &HandfestAst,
+    field: &str,
+    parent_set: &[Scalar],
+    child_preds: Vec<Predicate>,
+    expect_ok: bool,
+) {
+    let mut pb = parent.clone().into_builder();
+    pb.where_clauses
+        .push(Predicate::in_set(field, parent_set.iter().cloned().collect()).unwrap());
+    let p_ast = pb.build().unwrap();
+    let mut cb = child.clone().into_builder();
+    cb.parent = Some(p_ast.mandate_id());
+    cb.where_clauses.extend(child_preds);
+    let res = subsumes(&p_ast, &cb.build().unwrap());
+    if expect_ok {
+        assert!(res.is_ok(), "expected subsumes ok on {field}, got {res:?}");
+    } else {
+        assert!(
+            matches!(res, Err(NarrowError::PredicateNotImplied { .. })),
+            "expected PredicateNotImplied on {field}, got {res:?}"
+        );
+    }
+}
+
+#[test]
+fn lattice_bounded_int_and_timestamp_interval_implies_in_set() {
+    let (p, c) = base_parent_child();
+    let gte = |f: &str, v: Scalar| Predicate::gte(f, v).unwrap();
+    let gt = |f: &str, v: Scalar| Predicate::gt(f, v).unwrap();
+    let lte = |f: &str, v: Scalar| Predicate::lte(f, v).unwrap();
+    let lt = |f: &str, v: Scalar| Predicate::lt(f, v).unwrap();
+
+    let ints = [Scalar::Int(41), Scalar::Int(42), Scalar::Int(43)];
+    let gapped = [Scalar::Int(41), Scalar::Int(43), Scalar::Int(99)];
+    assert_interval_implies_in(
+        &p,
+        &c,
+        "n",
+        &ints,
+        vec![gte("n", Scalar::Int(41)), lte("n", Scalar::Int(42))],
+        true,
+    );
+    assert_interval_implies_in(
+        &p,
+        &c,
+        "n",
+        &ints,
+        vec![gt("n", Scalar::Int(40)), lt("n", Scalar::Int(44))],
+        true,
+    );
+    assert_interval_implies_in(
+        &p,
+        &c,
+        "n",
+        &ints,
+        vec![gte("n", Scalar::Int(41)), lte("n", Scalar::Int(44))],
+        false,
+    );
+    assert_interval_implies_in(
+        &p,
+        &c,
+        "n",
+        &gapped,
+        vec![gte("n", Scalar::Int(41)), lte("n", Scalar::Int(43))],
+        false,
+    );
+    assert_interval_implies_in(
+        &p,
+        &c,
+        "n",
+        &ints,
+        vec![
+            gte("n", Scalar::Int(0)),
+            lte("n", Scalar::Int(1_000_000_000)),
+        ],
+        false,
+    );
+    assert_interval_implies_in(
+        &p,
+        &c,
+        "n",
+        &ints,
+        vec![
+            gte("n", Scalar::Int(i64::MIN)),
+            lte("n", Scalar::Int(i64::MAX)),
+        ],
+        false,
+    );
+
+    let t0 = Scalar::Timestamp(ts("2026-11-24T18:00:00Z"));
+    let t1 = Scalar::Timestamp(ts("2026-11-24T18:00:01Z"));
+    let t2 = Scalar::Timestamp(ts("2026-11-24T18:00:02Z"));
+    let t3 = Scalar::Timestamp(ts("2026-11-24T18:00:03Z"));
+    let ts_set = [t0.clone(), t1.clone(), t2];
+    assert_interval_implies_in(
+        &p,
+        &c,
+        "tx.settled_at",
+        &ts_set,
+        vec![gte("tx.settled_at", t0.clone()), lte("tx.settled_at", t1)],
+        true,
+    );
+    assert_interval_implies_in(
+        &p,
+        &c,
+        "tx.settled_at",
+        &ts_set,
+        vec![gte("tx.settled_at", t0), lte("tx.settled_at", t3)],
+        false,
+    );
+}
+
+#[test]
+fn lattice_bounded_decimal_interval_implies_in_set() {
+    let (p, c) = base_parent_child();
+    let gte = |v: &Scalar| Predicate::gte("tx.amount", v.clone()).unwrap();
+    let lte = |v: &Scalar| Predicate::lte("tx.amount", v.clone()).unwrap();
+
+    let zero = Scalar::Decimal(dec("0.0"));
+    let eps = Scalar::Decimal(dec("0.0000000000000000000000000001"));
+    let two_eps = Scalar::Decimal(dec("0.0000000000000000000000000002"));
+    let one = Scalar::Decimal(dec("1.0"));
+    let max_s28 = Scalar::Decimal(dec("17014118346.0469231731687303715884105727"));
+    let next_s27 = Scalar::Decimal(dec("17014118346.046923173168730371588410573"));
+    let dec_set = [zero.clone(), eps.clone()];
+    let band_set = [max_s28.clone(), next_s27.clone()];
+
+    assert_interval_implies_in(
+        &p,
+        &c,
+        "tx.amount",
+        &dec_set,
+        vec![gte(&zero), lte(&eps)],
+        true,
+    );
+    assert_interval_implies_in(
+        &p,
+        &c,
+        "tx.amount",
+        &dec_set,
+        vec![gte(&zero), lte(&two_eps)],
+        false,
+    );
+    assert_interval_implies_in(
+        &p,
+        &c,
+        "tx.amount",
+        &band_set,
+        vec![gte(&max_s28), lte(&next_s27)],
+        true,
+    );
+    assert_interval_implies_in(
+        &p,
+        &c,
+        "tx.amount",
+        &dec_set,
+        vec![gte(&zero), lte(&one)],
+        false,
+    );
 }
