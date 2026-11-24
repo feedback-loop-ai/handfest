@@ -8,8 +8,8 @@ use alloc::vec::Vec;
 use sha2::{Digest, Sha256};
 
 use crate::ast::{
-    is_valid_ident, is_valid_quoted_str, try_format_rfc3339_utc, Decimal, HandfestAst, KeyId,
-    MandateId, Predicate, PredicateOp, Quota, Scalar,
+    is_valid_ident, is_valid_quoted_str, is_valid_timestamp, try_format_rfc3339_utc, Decimal,
+    HandfestAst, KeyId, MandateId, Predicate, PredicateOp, Quota, Scalar,
 };
 use crate::lattice::{scalar_satisfies, subsumes};
 use crate::{ActorKind, AssuranceLevel, Verdict};
@@ -275,18 +275,11 @@ pub fn authorize(
     now: i64,
     prev_receipt_hash: Option<MandateId>,
 ) -> (Verdict, DecisionReceipt) {
-    let mut canon_chain: Vec<VerifiedMandate> = Vec::with_capacity(chain.len());
     let mut chain_ids: Vec<MandateId> = Vec::with_capacity(chain.len());
     let mut ast_error: Option<String> = None;
 
     for (i, vm) in chain.iter().enumerate() {
-        let mut ast = vm.ast.clone();
-        if let Err(err) = ast.validate() {
-            ast_error = Some(format!("hop {i}: invalid mandate AST: {err}"));
-            break;
-        }
-        ast.canonicalize();
-        let mid = match ast.try_mandate_id() {
+        let mid = match vm.ast.try_mandate_id() {
             Ok(id) => id,
             Err(err) => {
                 ast_error = Some(format!("hop {i}: invalid mandate AST: {err}"));
@@ -294,15 +287,11 @@ pub fn authorize(
             }
         };
         chain_ids.push(mid);
-        canon_chain.push(VerifiedMandate {
-            ast,
-            proof: vm.proof.clone(),
-        });
     }
 
     let verdict = match ast_error {
         Some(reason) => Verdict::Deny { reason },
-        None => match evaluate_chain(&canon_chain, &chain_ids, request, facts, usage, now) {
+        None => match evaluate_chain(chain, &chain_ids, request, facts, usage, now) {
             Ok(()) => Verdict::Permit,
             Err(reason) => Verdict::Deny { reason },
         },
@@ -333,6 +322,11 @@ fn evaluate_chain(
 ) -> Result<(), String> {
     if chain.is_empty() {
         return Err("empty mandate chain".into());
+    }
+    if !is_valid_timestamp(now) {
+        return Err(format!(
+            "timestamp {now} outside 0000-01-01T00:00:00Z..=9999-12-31T23:59:59Z"
+        ));
     }
     if chain[0].ast.parent().is_some() {
         return Err("root mandate must not declare a PARENT digest".into());
@@ -476,6 +470,14 @@ fn evaluate_predicate(
     };
 
     check_predicate_type(hop, pred, fact_val)?;
+    if let Scalar::Timestamp(ts) = fact_val {
+        if !is_valid_timestamp(*ts) {
+            return Err(format!(
+                "hop {hop}: timestamp fact '{}' value {ts} outside 0000-01-01T00:00:00Z..=9999-12-31T23:59:59Z",
+                pred.field_path()
+            ));
+        }
+    }
 
     if !scalar_satisfies(fact_val, pred.op()) {
         return Err(format!(

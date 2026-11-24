@@ -890,6 +890,67 @@ impl Decimal {
         best
     }
 
+    /// Maps a validated `Decimal` to its unique contiguous scale-band ordinal (`0..=56`) and
+    /// integer coordinate within that band, in strictly increasing numeric order.
+    fn band_coord(&self) -> (u8, i128) {
+        let (m0, s0) = self.minimal_form();
+        let max_pow = 10_i128.pow(u32::from(MAX_DECIMAL_SCALE - s0));
+        if let Some(m) = m0.checked_mul(max_pow) {
+            return (MAX_DECIMAL_SCALE, m);
+        }
+        for s in (s0..MAX_DECIMAL_SCALE).rev() {
+            let pow = 10_i128.pow(u32::from(s - s0));
+            if let Some(m) = m0.checked_mul(pow) {
+                return if m < 0 {
+                    (s, m)
+                } else {
+                    (2 * MAX_DECIMAL_SCALE - s, m)
+                };
+            }
+        }
+        // Unreachable because s == s0 has pow == 1 and m0.checked_mul(1) == Some(m0).
+        if m0 < 0 {
+            (s0, m0)
+        } else {
+            (2 * MAX_DECIMAL_SCALE - s0, m0)
+        }
+    }
+
+    const fn band_bounds(band: u8) -> (i128, i128) {
+        if band < MAX_DECIMAL_SCALE {
+            (i128::MIN, i128::MIN / 10 - 1)
+        } else if band == MAX_DECIMAL_SCALE {
+            (i128::MIN, i128::MAX)
+        } else {
+            (i128::MAX / 10 + 1, i128::MAX)
+        }
+    }
+
+    /// Returns the exact number of representable `Decimal` inhabitants in `self..=hi`,
+    /// or `None` if either endpoint has an invalid scale or the count overflows `u128`.
+    #[must_use]
+    pub(crate) fn discrete_count_to(&self, hi: &Self) -> Option<u128> {
+        if self.scale > MAX_DECIMAL_SCALE || hi.scale > MAX_DECIMAL_SCALE {
+            return None;
+        }
+        if self > hi {
+            return Some(0);
+        }
+        let (b_lo, m_lo) = self.band_coord();
+        let (b_hi, m_hi) = hi.band_coord();
+        if b_lo == b_hi {
+            m_hi.abs_diff(m_lo).checked_add(1)
+        } else if b_hi == b_lo + 1 {
+            let (_, lo_band_max) = Self::band_bounds(b_lo);
+            let (hi_band_min, _) = Self::band_bounds(b_hi);
+            let left = lo_band_max.abs_diff(m_lo).checked_add(1)?;
+            let right = m_hi.abs_diff(hi_band_min).checked_add(1)?;
+            left.checked_add(right)
+        } else {
+            None
+        }
+    }
+
     /// Checked addition returning a canonical decimal on success, or `None` on overflow.
     #[must_use]
     pub fn checked_add(&self, other: &Self) -> Option<Self> {

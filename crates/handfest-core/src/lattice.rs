@@ -8,7 +8,7 @@ use core::fmt;
 
 use crate::ast::{
     ActionPat, AstError, Decimal, HandfestAst, KeyId, MandateId, Predicate, PredicateOp, Quota,
-    ResourceSel, Scalar, ScalarKind,
+    ResourceSel, Scalar, ScalarKind, MAX_RFC3339_TIMESTAMP, MIN_RFC3339_TIMESTAMP,
 };
 use crate::ActorKind;
 
@@ -419,8 +419,8 @@ impl FieldDomain {
                 self.tighten_upper(Scalar::Int(i64::MAX), true);
             }
             Some(ScalarKind::Timestamp) => {
-                self.tighten_lower(Scalar::Timestamp(i64::MIN), true);
-                self.tighten_upper(Scalar::Timestamp(i64::MAX), true);
+                self.tighten_lower(Scalar::Timestamp(MIN_RFC3339_TIMESTAMP), true);
+                self.tighten_upper(Scalar::Timestamp(MAX_RFC3339_TIMESTAMP), true);
             }
             Some(ScalarKind::Decimal) => {
                 self.tighten_lower(Scalar::Decimal(Decimal::MIN), true);
@@ -524,7 +524,8 @@ impl FieldDomain {
             return scalar_satisfies(eq_val, parent_op);
         }
         match parent_op {
-            PredicateOp::Eq(_) | PredicateOp::In(_) => false,
+            PredicateOp::Eq(_) => false,
+            PredicateOp::In(parent_set) => self.implies_in(parent_set),
             PredicateOp::Prefix(p_pfx) => self.implies_prefix(p_pfx),
             PredicateOp::Gte(v) => {
                 !matches!(v, Scalar::Bool(_))
@@ -536,6 +537,60 @@ impl FieldDomain {
             PredicateOp::Gt(v) => self.implies_gt(v),
             PredicateOp::Lte(v) => self.implies_lte(v),
             PredicateOp::Lt(v) => self.implies_lt(v),
+        }
+    }
+
+    fn implies_in(&self, parent_set: &BTreeSet<Scalar>) -> bool {
+        if parent_set.is_empty() {
+            return false;
+        }
+        let (Some((lo, true)), Some((hi, true))) = (&self.lower, &self.upper) else {
+            return false;
+        };
+        let max_len = u128::try_from(parent_set.len()).unwrap_or(u128::MAX);
+        match (lo, hi) {
+            (Scalar::Int(lo_n), Scalar::Int(hi_n)) => {
+                if lo_n > hi_n {
+                    return false;
+                }
+                let count = u128::from(hi_n.abs_diff(*lo_n)) + 1;
+                if count > max_len {
+                    return false;
+                }
+                (*lo_n..=*hi_n).all(|n| parent_set.contains(&Scalar::Int(n)))
+            }
+            (Scalar::Timestamp(lo_ts), Scalar::Timestamp(hi_ts)) => {
+                if lo_ts > hi_ts {
+                    return false;
+                }
+                let count = u128::from(hi_ts.abs_diff(*lo_ts)) + 1;
+                if count > max_len {
+                    return false;
+                }
+                (*lo_ts..=*hi_ts).all(|ts| parent_set.contains(&Scalar::Timestamp(ts)))
+            }
+            (Scalar::Decimal(lo_d), Scalar::Decimal(hi_d)) => {
+                let Some(count) = lo_d.discrete_count_to(hi_d) else {
+                    return false;
+                };
+                if count == 0 || count > max_len {
+                    return false;
+                }
+                let mut cur = *lo_d;
+                loop {
+                    if !parent_set.contains(&Scalar::Decimal(cur)) {
+                        return false;
+                    }
+                    if cur == *hi_d {
+                        return true;
+                    }
+                    let Some(next) = cur.next_up() else {
+                        return false;
+                    };
+                    cur = next;
+                }
+            }
+            _ => false,
         }
     }
 
@@ -586,6 +641,7 @@ impl FieldDomain {
                 .is_some_and(|min_req| *lo >= Scalar::Int(min_req)),
             Scalar::Timestamp(ts) => ts
                 .checked_add(1)
+                .filter(|&min_req| min_req <= MAX_RFC3339_TIMESTAMP)
                 .is_some_and(|min_req| *lo >= Scalar::Timestamp(min_req)),
             Scalar::Decimal(d) => d
                 .next_up()
@@ -629,6 +685,7 @@ impl FieldDomain {
                 .is_some_and(|max_req| *hi <= Scalar::Int(max_req)),
             Scalar::Timestamp(ts) => ts
                 .checked_sub(1)
+                .filter(|&max_req| max_req >= MIN_RFC3339_TIMESTAMP)
                 .is_some_and(|max_req| *hi <= Scalar::Timestamp(max_req)),
             Scalar::Decimal(d) => d
                 .next_down()
@@ -684,6 +741,7 @@ fn normalize_gt(field: &str, val: &Scalar) -> Result<(Scalar, bool), NarrowError
             .ok_or_else(|| contradiction(field, "integer > MAX is unsatisfiable".into())),
         Scalar::Timestamp(ts) => ts
             .checked_add(1)
+            .filter(|&next| next <= MAX_RFC3339_TIMESTAMP)
             .map(|next| (Scalar::Timestamp(next), true))
             .ok_or_else(|| contradiction(field, "timestamp > MAX is unsatisfiable".into())),
         Scalar::Decimal(d) => d
@@ -708,6 +766,7 @@ fn normalize_lt(field: &str, val: &Scalar) -> Result<(Scalar, bool), NarrowError
             .ok_or_else(|| contradiction(field, "integer < MIN is unsatisfiable".into())),
         Scalar::Timestamp(ts) => ts
             .checked_sub(1)
+            .filter(|&prev| prev >= MIN_RFC3339_TIMESTAMP)
             .map(|prev| (Scalar::Timestamp(prev), true))
             .ok_or_else(|| contradiction(field, "timestamp < MIN is unsatisfiable".into())),
         Scalar::Decimal(d) => d

@@ -1,5 +1,6 @@
 use handfest_core::ast::{
     parse_rfc3339_utc, Decimal, HandfestAst, KeyId, MandateId, Quota, ResourceSel, Scalar,
+    MAX_RFC3339_TIMESTAMP, MIN_RFC3339_TIMESTAMP,
 };
 use handfest_core::cnl::{parse_canonical, parse_mandate, render_canonical};
 use handfest_core::gate::{
@@ -770,4 +771,232 @@ fn gate_rejects_action_control_characters_and_escapes_receipts() {
     assert_ne!(r_ctrl.receipt_hash, r_lit.receipt_hash);
     assert!(r_ctrl.verify_hash());
     assert!(r_lit.verify_hash());
+}
+
+#[test]
+fn gate_fails_closed_on_out_of_range_timestamps() {
+    let root = parse_mandate(concat!(
+        "HANDFEST v1\n",
+        "FROM human \"valentin\" (key: ed25519:9b1e44a0)\n",
+        "TO agent \"brokkr:seat:settle\" (key: ed25519:7f01aa99)\n",
+        "DELEGATION max 0 hops\n",
+        "ALLOW billing.settle\n",
+        "ON account \"acct-1\"\n",
+        "WHERE tx.settled_at >= 2026-01-01T00:00:00Z\n",
+    ))
+    .unwrap();
+    let proof_wide = VerifiedAnchorProof {
+        anchor_id: "test-anchor".to_string(),
+        assurance: AssuranceLevel::QualifiedQes,
+        signer_key: root.from().key().clone(),
+        actor_kind: root.from().kind(),
+        valid_from: i64::MIN,
+        valid_until: i64::MAX,
+    };
+    let chain = vec![VerifiedMandate {
+        ast: root,
+        proof: proof_wide,
+    }];
+    let req = ActionRequest {
+        actor_key: k("ed25519:7f01aa99"),
+        action: "billing.settle".into(),
+        resource_kind: "account".into(),
+        resource_id: "acct-1".into(),
+    };
+    let now = ts("2026-11-24T18:00:00Z");
+
+    // Fact timestamp above 9999-12-31T23:59:59Z (253_402_300_800) must fail closed
+    let bad_hi_fact =
+        VerifiedFacts::new().with("tx.settled_at", Scalar::Timestamp(253_402_300_800));
+    let (v_hi, r_hi) = authorize(&chain, &req, &bad_hi_fact, &QuotaSnapshot::new(), now, None);
+    assert!(matches!(
+        v_hi,
+        Verdict::Deny { ref reason } if reason.contains("outside 0000-01-01T00:00:00Z..=9999-12-31T23:59:59Z")
+    ));
+    assert!(r_hi.verify_hash());
+
+    // Fact timestamp below 0000-01-01T00:00:00Z must also fail closed even when predicate is <=
+    let root_lte = parse_mandate(concat!(
+        "HANDFEST v1\n",
+        "FROM human \"valentin\" (key: ed25519:9b1e44a0)\n",
+        "TO agent \"brokkr:seat:settle\" (key: ed25519:7f01aa99)\n",
+        "DELEGATION max 0 hops\n",
+        "ALLOW billing.settle\n",
+        "ON account \"acct-1\"\n",
+        "WHERE tx.settled_at <= 2026-01-01T00:00:00Z\n",
+    ))
+    .unwrap();
+    let chain_lte = vec![VerifiedMandate {
+        proof: chain[0].proof.clone(),
+        ast: root_lte,
+    }];
+    let bad_lo_fact = VerifiedFacts::new().with(
+        "tx.settled_at",
+        Scalar::Timestamp(MIN_RFC3339_TIMESTAMP - 1),
+    );
+    let (v_lo, r_lo) = authorize(
+        &chain_lte,
+        &req,
+        &bad_lo_fact,
+        &QuotaSnapshot::new(),
+        now,
+        None,
+    );
+    assert!(matches!(v_lo, Verdict::Deny { .. }));
+    assert!(r_lo.verify_hash());
+
+    // Out-of-range `now` fails closed even when the anchor proof covers i64::MIN..i64::MAX
+    let ok_fact =
+        VerifiedFacts::new().with("tx.settled_at", Scalar::Timestamp(MAX_RFC3339_TIMESTAMP));
+    let (v_now_hi, r_now_hi) = authorize(
+        &chain,
+        &req,
+        &ok_fact,
+        &QuotaSnapshot::new(),
+        253_402_300_800,
+        None,
+    );
+    assert!(matches!(
+        v_now_hi,
+        Verdict::Deny { ref reason } if reason.contains("outside 0000-01-01T00:00:00Z..=9999-12-31T23:59:59Z")
+    ));
+    assert!(r_now_hi.verify_hash());
+
+    let (v_now_lo, r_now_lo) = authorize(
+        &chain,
+        &req,
+        &ok_fact,
+        &QuotaSnapshot::new(),
+        MIN_RFC3339_TIMESTAMP - 1,
+        None,
+    );
+    assert!(matches!(v_now_lo, Verdict::Deny { .. }));
+    assert!(r_now_lo.verify_hash());
+
+    // In-range 4-digit-year boundary timestamp succeeds
+    let (v_ok, r_ok) = authorize(
+        &chain,
+        &req,
+        &ok_fact,
+        &QuotaSnapshot::new(),
+        MAX_RFC3339_TIMESTAMP,
+        None,
+    );
+    assert_eq!(v_ok, Verdict::Permit);
+    assert!(r_ok.verify_hash());
+}
+
+#[test]
+fn gate_permits_bounded_discrete_interval_attenuated_from_parent_in_set() {
+    let parent = parse_mandate(concat!(
+        "HANDFEST v1\n",
+        "FROM human \"valentin\" (key: ed25519:9b1e44a0)\n",
+        "TO agent \"brokkr:dispatcher\" (key: ed25519:3c8d19f2)\n",
+        "DELEGATION max 1 hop\n",
+        "ALLOW git.pr.merge\n",
+        "ON repo \"feedback-loop-ai/*\"\n",
+        "WHERE resource.pr_number IN {41, 42, 43}\n",
+        "  AND tx.amount IN {0.0, 0.0000000000000000000000000001}\n",
+    ))
+    .unwrap();
+    let parent_id = parent.mandate_id();
+    let child = parse_mandate(&format!(
+        concat!(
+            "HANDFEST v1\n",
+            "PARENT {parent_id}\n",
+            "FROM agent \"brokkr:dispatcher\" (key: ed25519:3c8d19f2)\n",
+            "TO agent \"brokkr:seat:ship\" (key: ed25519:7f01aa99)\n",
+            "DELEGATION max 0 hops\n",
+            "ALLOW git.pr.merge\n",
+            "ON repo \"feedback-loop-ai/handfest\"\n",
+            "WHERE resource.pr_number >= 41\n",
+            "  AND resource.pr_number <= 42\n",
+            "  AND tx.amount >= 0.0\n",
+            "  AND tx.amount <= 0.0000000000000000000000000001\n",
+        ),
+        parent_id = parent_id
+    ))
+    .unwrap();
+
+    let chain = vec![
+        VerifiedMandate {
+            proof: proof_for(
+                &parent,
+                AssuranceLevel::QualifiedQes,
+                "2026-11-24T17:00:00Z",
+                "2026-11-25T02:00:00Z",
+            ),
+            ast: parent.clone(),
+        },
+        VerifiedMandate {
+            proof: proof_for(
+                &child,
+                AssuranceLevel::LocalKey,
+                "2026-11-24T17:59:00Z",
+                "2026-11-24T18:10:00Z",
+            ),
+            ast: child,
+        },
+    ];
+    let req = ActionRequest {
+        actor_key: k("ed25519:7f01aa99"),
+        action: "git.pr.merge".into(),
+        resource_kind: "repo".into(),
+        resource_id: "feedback-loop-ai/handfest".into(),
+    };
+    let now = ts("2026-11-24T18:01:30Z");
+    let facts = VerifiedFacts::new()
+        .with("resource.pr_number", Scalar::Int(42))
+        .with(
+            "tx.amount",
+            Scalar::Decimal(dec("0.0000000000000000000000000001")),
+        );
+
+    let (v, r) = authorize(&chain, &req, &facts, &QuotaSnapshot::new(), now, None);
+    assert_eq!(v, Verdict::Permit);
+    assert!(r.verify_hash());
+
+    // Widened interval (`<= 44`) fails attenuation check at gate
+    let widened_child = parse_mandate(&format!(
+        concat!(
+            "HANDFEST v1\n",
+            "PARENT {parent_id}\n",
+            "FROM agent \"brokkr:dispatcher\" (key: ed25519:3c8d19f2)\n",
+            "TO agent \"brokkr:seat:ship\" (key: ed25519:7f01aa99)\n",
+            "DELEGATION max 0 hops\n",
+            "ALLOW git.pr.merge\n",
+            "ON repo \"feedback-loop-ai/handfest\"\n",
+            "WHERE resource.pr_number >= 41\n",
+            "  AND resource.pr_number <= 44\n",
+            "  AND tx.amount >= 0.0\n",
+            "  AND tx.amount <= 0.0000000000000000000000000001\n",
+        ),
+        parent_id = parent_id
+    ))
+    .unwrap();
+    let widened_chain = vec![
+        chain[0].clone(),
+        VerifiedMandate {
+            proof: proof_for(
+                &widened_child,
+                AssuranceLevel::LocalKey,
+                "2026-11-24T17:59:00Z",
+                "2026-11-24T18:10:00Z",
+            ),
+            ast: widened_child,
+        },
+    ];
+    let (v_wide, r_wide) = authorize(
+        &widened_chain,
+        &req,
+        &facts,
+        &QuotaSnapshot::new(),
+        now,
+        None,
+    );
+    assert!(matches!(
+        v_wide,
+        Verdict::Deny { ref reason } if reason.contains("attenuation check failed")
+    ));
+    assert!(r_wide.verify_hash());
 }
