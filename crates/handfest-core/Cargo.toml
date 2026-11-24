@@ -1,0 +1,11 @@
+[package]
+name = "handfest-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Pure, no_std-capable Ricardian mandate AST, Controlled-English codec, lattice attenuation, and gate evaluator"
+
+[lints]
+workspace = true

@@ -1,0 +1,20 @@
+[package]
+name = "handfest-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Reference CLI for formatting, signing, narrowing, verifying, and auditing handfest mandates"
+
+[[bin]]
+name = "handfest"
+path = "src/main.rs"
+
+[dependencies]
+handfest-core.workspace = true
+handfest-anchors.workspace = true
+handfest-ledger.workspace = true
+
+[lints]
+workspace = true

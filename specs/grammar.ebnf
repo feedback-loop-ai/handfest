@@ -1,0 +1,39 @@
+(* HANDFEST v1 — Canonical Controlled-English Mandate Grammar *)
+(* Bijective with the HandfestAst meet-semilattice in handfest-core. *)
+
+mandate        = "HANDFEST v1" NL
+                 [ "PARENT " digest NL ]
+                 "FROM " actor_decl NL
+                 "TO " actor_decl NL
+                 "DELEGATION max " uint ( " hop" | " hops" ) NL
+                 "ALLOW " action_list NL
+                 "ON " resource_list NL
+                 [ "WHERE " predicate ( NL "  AND " predicate )* NL ]
+                 [ "LIMIT " quota ( NL "  AND " quota )* NL ] ;
+
+actor_decl     = actor_kind " " quoted_str " (" "key: " key_id ( ", " attr_kv )* ")" ;
+actor_kind     = "human" | "org" | "agent" | "service" ;
+attr_kv        = ident ": " scalar ;
+
+action_list    = action_pat ( ", " action_pat )* ;
+action_pat     = ident ( "." ident )* [ ".*" ] ;
+
+resource_list  = resource_sel ( ", " resource_sel )* ;
+resource_sel   = ident " " quoted_glob ;
+
+predicate      = field_path " " (
+                   ( "==" | ">=" | ">" | "<=" | "<" ) " " scalar
+                 | "IN {" scalar_list "}"
+                 | "PREFIX " quoted_str
+                 ) ;
+
+quota          = uint ( " call" | " calls" )
+               | decimal " " unit_ident " sum(" field_path ")" ;
+
+field_path     = ident ( "." ident )* ;
+scalar_list    = scalar ( ", " scalar )* ;
+scalar         = quoted_str | rfc3339_ts | decimal | int | bool ;
+bool           = "true" | "false" ;
+digest         = "sha256:" hex64 ;
+key_id         = ident ":" non_ws ;
+NL             = "\n" ;

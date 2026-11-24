@@ -1,0 +1,28 @@
+[licenses]
+include-dev = true
+allow = [
+  "MIT",
+  "Apache-2.0",
+  "Apache-2.0 WITH LLVM-exception",
+  "BSD-2-Clause",
+  "BSD-3-Clause",
+  "ISC",
+  "Zlib",
+  "Unicode-3.0",
+  "MIT-0",
+]
+
+[graph]
+all-features = true
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+
+[bans]
+multiple-versions = "deny"
+deny = [
+  { crate = "handfest-core", wrappers = ["handfest-anchors", "handfest-ledger", "handfest-cli"], reason = "core sits at the bottom of the one-way dependency graph" },
+  { crate = "handfest-anchors", wrappers = ["handfest-cli"], reason = "anchors verify external cryptographic roots above core" },
+  { crate = "handfest-ledger", wrappers = ["handfest-cli"], reason = "ledger persistence sits above core" },
+]

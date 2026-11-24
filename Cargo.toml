@@ -1,0 +1,37 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/handfest-core",
+    "crates/handfest-anchors",
+    "crates/handfest-ledger",
+    "crates/handfest-cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.88"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/feedback-loop-ai/handfest"
+homepage = "https://github.com/feedback-loop-ai/handfest"
+description = "Executable Ricardian mandates for humans, organizations, and AI agents"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+unexpected_cfgs = "warn"
+unreachable_pub = "warn"
+
+[workspace.lints.clippy]
+too_many_lines = "warn"
+excessive_nesting = "warn"
+struct_excessive_bools = "warn"
+fn_params_excessive_bools = "warn"
+allow_attributes = "warn"
+allow_attributes_without_reason = "warn"
+dbg_macro = "warn"
+todo = "warn"
+
+[workspace.dependencies]
+handfest-core = { path = "crates/handfest-core", version = "0.1.0" }
+handfest-anchors = { path = "crates/handfest-anchors", version = "0.1.0" }
+handfest-ledger = { path = "crates/handfest-ledger", version = "0.1.0" }

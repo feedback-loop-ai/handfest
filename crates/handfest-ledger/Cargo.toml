@@ -1,0 +1,14 @@
+[package]
+name = "handfest-ledger"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Hash-chained receipt store, atomic chain-wide quota tracking, and offline audit replay for handfest"
+
+[dependencies]
+handfest-core.workspace = true
+
+[lints]
+workspace = true
