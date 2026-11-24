@@ -9,6 +9,11 @@ description = "Pluggable cryptographic and regulatory trust-anchor verifiers for
 
 [dependencies]
 handfest-core.workspace = true
+ed25519-dalek.workspace = true
+rand_core.workspace = true
+hex.workspace = true
+serde.workspace = true
+serde_json.workspace = true
 
 [lints]
 workspace = true
