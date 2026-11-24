@@ -1,0 +1,26 @@
+{
+  "access": "read-only",
+  "charter": "charters/reviewer.md",
+  "description": "The single-seat reviewer: correctness and security in one pass, for recipes without a review panel.",
+  "efforts": {
+    "fable": "high",
+    "opus": "high"
+  },
+  "limits": {
+    "max_attempts": 2,
+    "timeout_seconds": 3600
+  },
+  "models": [
+    "fable",
+    "opus"
+  ],
+  "tools": {
+    "allow": [
+      "cargo",
+      "git",
+      "ls",
+      "rg"
+    ],
+    "mcp": []
+  }
+}

@@ -1,0 +1,11 @@
+{
+  "journal": "state/forge.db",
+  "realms": [
+    {
+      "default_branch": "main",
+      "name": "handfest",
+      "path": ".."
+    }
+  ],
+  "schema": "forge.realms/v3"
+}
