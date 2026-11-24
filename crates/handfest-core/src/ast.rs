@@ -11,13 +11,19 @@ use core::str::FromStr;
 
 use sha2::{Digest, Sha256};
 
-use crate::cnl::render_canonical;
+use crate::cnl::{render_canonical, try_render_canonical};
 use crate::ActorKind;
 
-/// Maximum fractional scale accepted when parsing a decimal literal.
+/// Maximum fractional scale accepted for a `Decimal` value.
 pub const MAX_DECIMAL_SCALE: u8 = 28;
 
-/// Error returned when constructing or parsing typed AST primitives.
+/// Minimum RFC 3339 4-digit-year UTC timestamp (`0000-01-01T00:00:00Z`).
+pub const MIN_RFC3339_TIMESTAMP: i64 = -62_167_219_200;
+
+/// Maximum RFC 3339 4-digit-year UTC timestamp (`9999-12-31T23:59:59Z`).
+pub const MAX_RFC3339_TIMESTAMP: i64 = 253_402_300_799;
+
+/// Error returned when constructing, validating, or parsing typed AST primitives.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AstError {
     InvalidMandateId(String),
@@ -26,8 +32,14 @@ pub enum AstError {
     InvalidResourceKind(String),
     InvalidFieldPath(String),
     InvalidIdent(String),
+    InvalidString(String),
     InvalidDecimal(String),
     InvalidTimestamp(String),
+    InvalidActorAttr(String),
+    InvalidPredicate(String),
+    InvalidQuota(String),
+    EmptyActions,
+    EmptyResources,
 }
 
 impl fmt::Display for AstError {
@@ -39,8 +51,14 @@ impl fmt::Display for AstError {
             Self::InvalidResourceKind(msg) => write!(f, "invalid resource kind: {msg}"),
             Self::InvalidFieldPath(msg) => write!(f, "invalid field path: {msg}"),
             Self::InvalidIdent(msg) => write!(f, "invalid identifier: {msg}"),
+            Self::InvalidString(msg) => write!(f, "invalid quoted string: {msg}"),
             Self::InvalidDecimal(msg) => write!(f, "invalid decimal: {msg}"),
             Self::InvalidTimestamp(msg) => write!(f, "invalid RFC 3339 UTC timestamp: {msg}"),
+            Self::InvalidActorAttr(msg) => write!(f, "invalid actor attribute: {msg}"),
+            Self::InvalidPredicate(msg) => write!(f, "invalid predicate: {msg}"),
+            Self::InvalidQuota(msg) => write!(f, "invalid quota: {msg}"),
+            Self::EmptyActions => f.write_str("ALLOW clause must declare at least one action"),
+            Self::EmptyResources => f.write_str("ON clause must declare at least one resource"),
         }
     }
 }
@@ -143,11 +161,33 @@ pub fn is_valid_field_path(s: &str) -> bool {
     !s.is_empty() && s.split('.').all(is_valid_ident)
 }
 
+/// Validates a quoted string value: control characters (including `\0`, `\n`, `\r`, `\t`) are rejected.
+#[must_use]
+pub fn is_valid_quoted_str(s: &str) -> bool {
+    !s.chars().any(char::is_control)
+}
+
+/// Returns true if `ts` is representable as a 4-digit-year RFC 3339 UTC timestamp
+/// (`0000-01-01T00:00:00Z..=9999-12-31T23:59:59Z`).
+#[must_use]
+pub const fn is_valid_timestamp(ts: i64) -> bool {
+    ts >= MIN_RFC3339_TIMESTAMP && ts <= MAX_RFC3339_TIMESTAMP
+}
+
 #[must_use]
 pub(crate) fn is_valid_key_value(s: &str) -> bool {
     !s.is_empty()
         && s.bytes()
             .all(|b| b.is_ascii_graphic() && !matches!(b, b',' | b'(' | b')' | b'"'))
+}
+
+fn validate_quoted_str(value: &str, context: &str) -> Result<(), AstError> {
+    if !is_valid_quoted_str(value) {
+        return Err(AstError::InvalidString(format!(
+            "{context} must not contain control characters"
+        )));
+    }
+    Ok(())
 }
 
 /// Cryptographic key identifier (`<scheme>:<value>`, e.g. `ed25519:9b1e...44a0`).
@@ -160,19 +200,29 @@ pub struct KeyId {
 impl KeyId {
     /// Creates a validated `KeyId` from scheme and value components.
     pub fn new(scheme: impl Into<String>, value: impl Into<String>) -> Result<Self, AstError> {
-        let scheme = scheme.into();
-        let value = value.into();
-        if !is_valid_ident(&scheme) {
+        let candidate = Self {
+            scheme: scheme.into(),
+            value: value.into(),
+        };
+        candidate.validate()?;
+        Ok(candidate)
+    }
+
+    /// Validates that this `KeyId` satisfies all lexical invariants.
+    pub fn validate(&self) -> Result<(), AstError> {
+        if !is_valid_ident(&self.scheme) {
             return Err(AstError::InvalidKeyId(format!(
-                "invalid key scheme '{scheme}'"
+                "invalid key scheme '{}'",
+                self.scheme
             )));
         }
-        if !is_valid_key_value(&value) {
+        if !is_valid_key_value(&self.value) {
             return Err(AstError::InvalidKeyId(format!(
-                "invalid key value '{value}'"
+                "invalid key value '{}'",
+                self.value
             )));
         }
-        Ok(Self { scheme, value })
+        Ok(())
     }
 
     /// Parses `<scheme>:<value>`.
@@ -215,10 +265,79 @@ impl FromStr for KeyId {
 /// Actor declaration appearing in `FROM` and `TO` clauses.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ActorDecl {
-    pub kind: ActorKind,
-    pub name: String,
-    pub key: KeyId,
-    pub attrs: BTreeMap<String, Scalar>,
+    kind: ActorKind,
+    name: String,
+    key: KeyId,
+    attrs: BTreeMap<String, Scalar>,
+}
+
+impl ActorDecl {
+    /// Creates a validated `ActorDecl`.
+    pub fn new(
+        kind: ActorKind,
+        name: impl Into<String>,
+        key: KeyId,
+        attrs: BTreeMap<String, Scalar>,
+    ) -> Result<Self, AstError> {
+        let actor = Self {
+            kind,
+            name: name.into(),
+            key,
+            attrs,
+        };
+        actor.validate()?;
+        Ok(actor)
+    }
+
+    /// Validates all lexical and value invariants on this `ActorDecl`.
+    pub fn validate(&self) -> Result<(), AstError> {
+        validate_quoted_str(&self.name, "actor name")?;
+        self.key.validate()?;
+        for (k, v) in &self.attrs {
+            if !is_valid_ident(k) {
+                return Err(AstError::InvalidIdent(k.clone()));
+            }
+            if k == "key" {
+                return Err(AstError::InvalidActorAttr(
+                    "reserved attribute 'key' cannot appear in attrs".to_string(),
+                ));
+            }
+            v.validate()?;
+        }
+        Ok(())
+    }
+
+    /// Returns the actor kind.
+    #[must_use]
+    pub const fn kind(&self) -> ActorKind {
+        self.kind
+    }
+
+    /// Returns the actor display name.
+    #[must_use]
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// Returns the actor's cryptographic key identifier.
+    #[must_use]
+    pub const fn key(&self) -> &KeyId {
+        &self.key
+    }
+
+    /// Returns the actor's attribute map.
+    #[must_use]
+    pub const fn attrs(&self) -> &BTreeMap<String, Scalar> {
+        &self.attrs
+    }
+
+    fn canonicalize(&mut self) {
+        for v in self.attrs.values_mut() {
+            if let Scalar::Decimal(d) = v {
+                *d = d.canonical();
+            }
+        }
+    }
 }
 
 /// Dot-separated action pattern with optional trailing `.*` wildcard.
@@ -253,6 +372,21 @@ impl ActionPat {
             segments.push(seg.to_string());
         }
         Ok(Self { segments, wildcard })
+    }
+
+    /// Validates all action pattern segments.
+    pub fn validate(&self) -> Result<(), AstError> {
+        if self.segments.is_empty() {
+            return Err(AstError::InvalidActionPat("empty action pattern".into()));
+        }
+        for seg in &self.segments {
+            if !is_valid_ident(seg) {
+                return Err(AstError::InvalidActionPat(format!(
+                    "invalid action segment '{seg}'"
+                )));
+            }
+        }
+        Ok(())
     }
 
     /// Returns the leading concrete identifier segments.
@@ -346,27 +480,46 @@ impl FromStr for ActionPat {
 /// Typed resource glob selector (e.g. `repo "feedback-loop-ai/*"`).
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ResourceSel {
-    pub kind: String,
-    pub pattern: String,
+    kind: String,
+    pattern: String,
 }
 
 impl ResourceSel {
     /// Creates a validated `ResourceSel`.
     pub fn new(kind: impl Into<String>, pattern: impl Into<String>) -> Result<Self, AstError> {
-        let kind = kind.into();
-        if !is_valid_ident(&kind) {
-            return Err(AstError::InvalidResourceKind(kind));
-        }
-        Ok(Self {
-            kind,
+        let sel = Self {
+            kind: kind.into(),
             pattern: pattern.into(),
-        })
+        };
+        sel.validate()?;
+        Ok(sel)
     }
 
-    /// Returns true if `resource_id` matches this selector's glob pattern.
+    /// Validates that `kind` is an identifier and `pattern` contains no control characters.
+    pub fn validate(&self) -> Result<(), AstError> {
+        if !is_valid_ident(&self.kind) {
+            return Err(AstError::InvalidResourceKind(self.kind.clone()));
+        }
+        validate_quoted_str(&self.pattern, "resource pattern")?;
+        Ok(())
+    }
+
+    /// Returns the resource kind identifier.
+    #[must_use]
+    pub fn kind(&self) -> &str {
+        &self.kind
+    }
+
+    /// Returns the resource glob pattern.
+    #[must_use]
+    pub fn pattern(&self) -> &str {
+        &self.pattern
+    }
+
+    /// Returns true if `resource_id` contains no control characters and matches this selector's glob pattern.
     #[must_use]
     pub fn matches(&self, resource_id: &str) -> bool {
-        glob_matches(&self.pattern, resource_id)
+        is_valid_quoted_str(resource_id) && glob_matches(&self.pattern, resource_id)
     }
 
     /// Returns true if this selector has the same `kind` and subsumes `child`'s glob pattern.
@@ -478,11 +631,97 @@ fn split_glob_collapsed(pattern: &str) -> Vec<&str> {
     parts
 }
 
-/// Exact base-10 fixed-point decimal number (`mantissa * 10^-scale`).
+/// Fixed-width big-endian unsigned 256-bit integer for exact `Decimal` addition.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct U256([u64; 4]);
+
+impl U256 {
+    const fn from_u128(v: u128) -> Self {
+        Self([0, 0, (v >> 64) as u64, v as u64])
+    }
+
+    const fn to_u128(self) -> Option<u128> {
+        if self.0[0] == 0 && self.0[1] == 0 {
+            Some(((self.0[2] as u128) << 64) | (self.0[3] as u128))
+        } else {
+            None
+        }
+    }
+
+    fn mul_pow10(mut self, steps: u8) -> Self {
+        for _ in 0..steps {
+            let mut carry = 0u128;
+            for limb in self.0.iter_mut().rev() {
+                let prod = u128::from(*limb) * 10 + carry;
+                *limb = prod as u64;
+                carry = prod >> 64;
+            }
+        }
+        self
+    }
+
+    fn div_rem_10(self) -> (Self, u8) {
+        let mut out = [0u64; 4];
+        let mut rem = 0u128;
+        for (i, &limb) in self.0.iter().enumerate() {
+            let cur = (rem << 64) | u128::from(limb);
+            out[i] = (cur / 10) as u64;
+            rem = cur % 10;
+        }
+        (Self(out), rem as u8)
+    }
+
+    fn add(self, rhs: Self) -> Self {
+        let mut out = [0u64; 4];
+        let mut carry = 0u128;
+        for i in (0..4).rev() {
+            let sum = u128::from(self.0[i]) + u128::from(rhs.0[i]) + carry;
+            out[i] = sum as u64;
+            carry = sum >> 64;
+        }
+        Self(out)
+    }
+
+    fn sub(self, rhs: Self) -> Self {
+        let mut out = [0u64; 4];
+        let mut borrow = 0u128;
+        for i in (0..4).rev() {
+            let lhs = u128::from(self.0[i]);
+            let sub = u128::from(rhs.0[i]) + borrow;
+            if lhs >= sub {
+                out[i] = (lhs - sub) as u64;
+                borrow = 0;
+            } else {
+                out[i] = ((1u128 << 64) + lhs - sub) as u64;
+                borrow = 1;
+            }
+        }
+        Self(out)
+    }
+}
+
+fn signed_from_u128(neg: bool, abs: u128) -> Option<i128> {
+    if abs == 0 {
+        return Some(0);
+    }
+    if neg {
+        if abs == (i128::MAX as u128) + 1 {
+            Some(i128::MIN)
+        } else if abs <= i128::MAX as u128 {
+            Some(-(abs as i128))
+        } else {
+            None
+        }
+    } else {
+        i128::try_from(abs).ok()
+    }
+}
+
+/// Exact base-10 fixed-point decimal number (`mantissa * 10^-scale`, `scale <= MAX_DECIMAL_SCALE`).
 #[derive(Debug, Clone, Copy)]
 pub struct Decimal {
-    pub mantissa: i128,
-    pub scale: u8,
+    mantissa: i128,
+    scale: u8,
 }
 
 impl Decimal {
@@ -492,10 +731,46 @@ impl Decimal {
         scale: 1,
     };
 
-    /// Creates a new `Decimal`.
+    /// Minimum representable `Decimal` (`i128::MIN * 10^0`).
+    pub(crate) const MIN: Self = Self {
+        mantissa: i128::MIN,
+        scale: 0,
+    };
+
+    /// Maximum representable `Decimal` (`i128::MAX * 10^0`).
+    pub(crate) const MAX: Self = Self {
+        mantissa: i128::MAX,
+        scale: 0,
+    };
+
+    /// Creates a validated `Decimal`, rejecting `scale > MAX_DECIMAL_SCALE`.
+    pub fn new(mantissa: i128, scale: u8) -> Result<Self, AstError> {
+        let dec = Self { mantissa, scale };
+        dec.validate()?;
+        Ok(dec)
+    }
+
+    /// Validates that `scale <= MAX_DECIMAL_SCALE`.
+    pub fn validate(&self) -> Result<(), AstError> {
+        if self.scale > MAX_DECIMAL_SCALE {
+            return Err(AstError::InvalidDecimal(format!(
+                "scale {} exceeds maximum {}",
+                self.scale, MAX_DECIMAL_SCALE
+            )));
+        }
+        Ok(())
+    }
+
+    /// Returns the signed base-10 mantissa.
     #[must_use]
-    pub const fn new(mantissa: i128, scale: u8) -> Self {
-        Self { mantissa, scale }
+    pub const fn mantissa(&self) -> i128 {
+        self.mantissa
+    }
+
+    /// Returns the fractional scale (`0..=MAX_DECIMAL_SCALE`).
+    #[must_use]
+    pub const fn scale(&self) -> u8 {
+        self.scale
     }
 
     /// Returns true if the decimal value is strictly negative.
@@ -504,7 +779,7 @@ impl Decimal {
         self.mantissa < 0
     }
 
-    /// Normalizes trailing fractional zeros down to minimal scale (`scale >= 1` for canonical display).
+    /// Normalizes trailing fractional zeros down to minimal scale (`scale >= 1` when representable).
     #[must_use]
     pub fn canonical(&self) -> Self {
         if self.mantissa == 0 {
@@ -543,22 +818,114 @@ impl Decimal {
         (m, s)
     }
 
+    /// Returns the smallest representable `Decimal` strictly greater than `self`,
+    /// or `None` if `self == Self::MAX` (or has an invalid scale).
+    #[must_use]
+    pub(crate) fn next_up(&self) -> Option<Self> {
+        if self.scale > MAX_DECIMAL_SCALE {
+            return None;
+        }
+        let (m0, s0) = self.minimal_form();
+        let mut best: Option<Self> = None;
+        for s in 0..=MAX_DECIMAL_SCALE {
+            let cand_m = if s >= s0 {
+                let p = 10_i128.pow(u32::from(s - s0));
+                match m0.checked_mul(p) {
+                    Some(prod) => prod.checked_add(1),
+                    None if m0 < 0 => Some(i128::MIN),
+                    None => None,
+                }
+            } else {
+                let p = 10_i128.pow(u32::from(s0 - s));
+                Some(m0.div_euclid(p) + 1)
+            };
+            if let Some(m) = cand_m {
+                let cand = Self {
+                    mantissa: m,
+                    scale: s,
+                }
+                .canonical();
+                if best.is_none_or(|cur| cand < cur) {
+                    best = Some(cand);
+                }
+            }
+        }
+        best
+    }
+
+    /// Returns the largest representable `Decimal` strictly less than `self`,
+    /// or `None` if `self == Self::MIN` (or has an invalid scale).
+    #[must_use]
+    pub(crate) fn next_down(&self) -> Option<Self> {
+        if self.scale > MAX_DECIMAL_SCALE {
+            return None;
+        }
+        let (m0, s0) = self.minimal_form();
+        let mut best: Option<Self> = None;
+        for s in 0..=MAX_DECIMAL_SCALE {
+            let cand_m = if s >= s0 {
+                let p = 10_i128.pow(u32::from(s - s0));
+                match m0.checked_mul(p) {
+                    Some(prod) => prod.checked_sub(1),
+                    None if m0 > 0 => Some(i128::MAX),
+                    None => None,
+                }
+            } else {
+                let p = 10_i128.pow(u32::from(s0 - s));
+                let q = m0.div_euclid(p);
+                let r = m0.rem_euclid(p);
+                Some(if r == 0 { q - 1 } else { q })
+            };
+            if let Some(m) = cand_m {
+                let cand = Self {
+                    mantissa: m,
+                    scale: s,
+                }
+                .canonical();
+                if best.is_none_or(|cur| cand > cur) {
+                    best = Some(cand);
+                }
+            }
+        }
+        best
+    }
+
     /// Checked addition returning a canonical decimal on success, or `None` on overflow.
     #[must_use]
     pub fn checked_add(&self, other: &Self) -> Option<Self> {
+        if self.scale > MAX_DECIMAL_SCALE || other.scale > MAX_DECIMAL_SCALE {
+            return None;
+        }
         let (m1, s1) = self.minimal_form();
         let (m2, s2) = other.minimal_form();
-        let target_scale = s1.max(s2);
-        let a = scale_up_i128(m1, target_scale - s1)?;
-        let b = scale_up_i128(m2, target_scale - s2)?;
-        let sum = a.checked_add(b)?;
-        Some(
-            Self {
-                mantissa: sum,
-                scale: target_scale,
+        let mut scale = s1.max(s2);
+        let a = U256::from_u128(m1.unsigned_abs()).mul_pow10(scale - s1);
+        let b = U256::from_u128(m2.unsigned_abs()).mul_pow10(scale - s2);
+        let neg1 = m1 < 0;
+        let neg2 = m2 < 0;
+
+        let (neg, mut mag) = if neg1 == neg2 {
+            (neg1, a.add(b))
+        } else {
+            match a.cmp(&b) {
+                Ordering::Equal => return Some(Self::ZERO),
+                Ordering::Greater => (neg1, a.sub(b)),
+                Ordering::Less => (neg2, b.sub(a)),
             }
-            .canonical(),
-        )
+        };
+
+        while scale > 0 {
+            let (q, r) = mag.div_rem_10();
+            if r != 0 {
+                break;
+            }
+            mag = q;
+            scale -= 1;
+        }
+
+        let abs = mag.to_u128()?;
+        let mantissa = signed_from_u128(neg, abs)?;
+        Some(Self { mantissa, scale }.canonical())
     }
 
     /// Parses a decimal literal (`-?[0-9]+\.[0-9]+`).
@@ -585,37 +952,25 @@ impl Decimal {
                 "invalid digits in '{input}'"
             )));
         }
+        let trimmed_frac = frac_part.trim_end_matches('0');
         let mut acc: u128 = 0;
-        for b in int_digits.bytes().chain(frac_part.bytes()) {
+        for b in int_digits.bytes().chain(trimmed_frac.bytes()) {
             acc = acc
                 .checked_mul(10)
                 .and_then(|v| v.checked_add(u128::from(b - b'0')))
                 .ok_or_else(|| AstError::InvalidDecimal("decimal overflow".into()))?;
         }
-        let mantissa = if neg {
-            if acc == 0 {
-                0
-            } else if acc == (i128::MAX as u128) + 1 {
-                i128::MIN
-            } else if acc <= i128::MAX as u128 {
-                -(acc as i128)
+        let mantissa = signed_from_u128(neg, acc).ok_or_else(|| {
+            AstError::InvalidDecimal(if neg {
+                "decimal underflow".into()
             } else {
-                return Err(AstError::InvalidDecimal("decimal underflow".into()));
-            }
-        } else {
-            i128::try_from(acc).map_err(|_| AstError::InvalidDecimal("decimal overflow".into()))?
-        };
-        let scale = u8::try_from(frac_part.len())
+                "decimal overflow".into()
+            })
+        })?;
+        let scale = u8::try_from(trimmed_frac.len())
             .map_err(|_| AstError::InvalidDecimal("decimal scale overflow".into()))?;
-        Ok(Self { mantissa, scale })
+        Ok(Self { mantissa, scale }.canonical())
     }
-}
-
-fn scale_up_i128(mut value: i128, steps: u8) -> Option<i128> {
-    for _ in 0..steps {
-        value = value.checked_mul(10)?;
-    }
-    Some(value)
 }
 
 fn decimal_digits_u128(mut v: u128) -> u8 {
@@ -785,6 +1140,23 @@ impl Scalar {
         }
     }
 
+    /// Validates that this scalar can be canonically represented in a `HANDFEST v1` mandate.
+    pub fn validate(&self) -> Result<(), AstError> {
+        match self {
+            Self::Str(s) => validate_quoted_str(s, "scalar string"),
+            Self::Timestamp(ts) => {
+                if !is_valid_timestamp(*ts) {
+                    return Err(AstError::InvalidTimestamp(format!(
+                        "timestamp {ts} outside 0000-01-01T00:00:00Z..=9999-12-31T23:59:59Z"
+                    )));
+                }
+                Ok(())
+            }
+            Self::Decimal(d) => d.validate(),
+            Self::Int(_) | Self::Bool(_) => Ok(()),
+        }
+    }
+
     /// Canonicalizes any inner `Decimal` representation.
     #[must_use]
     pub fn canonicalize_value(self) -> Self {
@@ -807,75 +1179,104 @@ pub enum PredicateOp {
     Prefix(String),
 }
 
+impl PredicateOp {
+    /// Validates all inner scalar/string/set invariants of this operator.
+    pub fn validate(&self) -> Result<(), AstError> {
+        match self {
+            Self::Eq(s) | Self::Gte(s) | Self::Gt(s) | Self::Lte(s) | Self::Lt(s) => s.validate(),
+            Self::In(set) => {
+                if set.is_empty() {
+                    return Err(AstError::InvalidPredicate(
+                        "IN set cannot be empty".to_string(),
+                    ));
+                }
+                for item in set {
+                    item.validate()?;
+                }
+                Ok(())
+            }
+            Self::Prefix(pfx) => validate_quoted_str(pfx, "PREFIX string"),
+        }
+    }
+}
+
 /// Typed caveat predicate over a dot-separated `field_path`.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Predicate {
-    pub field_path: String,
-    pub op: PredicateOp,
+    field_path: String,
+    op: PredicateOp,
 }
 
 impl Predicate {
-    /// Constructs an equality predicate (`field == value`).
-    #[must_use]
-    pub fn eq(field_path: impl Into<String>, value: Scalar) -> Self {
-        Self {
+    /// Constructs a validated predicate.
+    pub fn new(field_path: impl Into<String>, op: PredicateOp) -> Result<Self, AstError> {
+        let pred = Self {
             field_path: field_path.into(),
-            op: PredicateOp::Eq(value),
-        }
+            op,
+        };
+        pred.validate()?;
+        Ok(pred)
     }
 
-    /// Constructs a `>=` predicate.
-    #[must_use]
-    pub fn gte(field_path: impl Into<String>, value: Scalar) -> Self {
-        Self {
-            field_path: field_path.into(),
-            op: PredicateOp::Gte(value),
+    /// Validates that `field_path` is a valid dot-separated path and `op` is valid.
+    pub fn validate(&self) -> Result<(), AstError> {
+        if !is_valid_field_path(&self.field_path) {
+            return Err(AstError::InvalidFieldPath(self.field_path.clone()));
         }
+        self.op.validate()
     }
 
-    /// Constructs a `>` predicate.
+    /// Returns the dot-separated field path.
     #[must_use]
-    pub fn gt(field_path: impl Into<String>, value: Scalar) -> Self {
-        Self {
-            field_path: field_path.into(),
-            op: PredicateOp::Gt(value),
-        }
+    pub fn field_path(&self) -> &str {
+        &self.field_path
     }
 
-    /// Constructs a `<=` predicate.
+    /// Returns the predicate operator.
     #[must_use]
-    pub fn lte(field_path: impl Into<String>, value: Scalar) -> Self {
-        Self {
-            field_path: field_path.into(),
-            op: PredicateOp::Lte(value),
-        }
+    pub const fn op(&self) -> &PredicateOp {
+        &self.op
     }
 
-    /// Constructs a `<` predicate.
-    #[must_use]
-    pub fn lt(field_path: impl Into<String>, value: Scalar) -> Self {
-        Self {
-            field_path: field_path.into(),
-            op: PredicateOp::Lt(value),
-        }
+    /// Constructs a validated equality predicate (`field == value`).
+    pub fn eq(field_path: impl Into<String>, value: Scalar) -> Result<Self, AstError> {
+        Self::new(field_path, PredicateOp::Eq(value))
     }
 
-    /// Constructs a set membership predicate (`field IN { ... }`).
-    #[must_use]
-    pub fn in_set(field_path: impl Into<String>, values: BTreeSet<Scalar>) -> Self {
-        Self {
-            field_path: field_path.into(),
-            op: PredicateOp::In(values),
-        }
+    /// Constructs a validated `>=` predicate.
+    pub fn gte(field_path: impl Into<String>, value: Scalar) -> Result<Self, AstError> {
+        Self::new(field_path, PredicateOp::Gte(value))
     }
 
-    /// Constructs a string prefix predicate (`field PREFIX "..."`).
-    #[must_use]
-    pub fn prefix(field_path: impl Into<String>, prefix: impl Into<String>) -> Self {
-        Self {
-            field_path: field_path.into(),
-            op: PredicateOp::Prefix(prefix.into()),
-        }
+    /// Constructs a validated `>` predicate.
+    pub fn gt(field_path: impl Into<String>, value: Scalar) -> Result<Self, AstError> {
+        Self::new(field_path, PredicateOp::Gt(value))
+    }
+
+    /// Constructs a validated `<=` predicate.
+    pub fn lte(field_path: impl Into<String>, value: Scalar) -> Result<Self, AstError> {
+        Self::new(field_path, PredicateOp::Lte(value))
+    }
+
+    /// Constructs a validated `<` predicate.
+    pub fn lt(field_path: impl Into<String>, value: Scalar) -> Result<Self, AstError> {
+        Self::new(field_path, PredicateOp::Lt(value))
+    }
+
+    /// Constructs a validated set membership predicate (`field IN { ... }`).
+    pub fn in_set(
+        field_path: impl Into<String>,
+        values: BTreeSet<Scalar>,
+    ) -> Result<Self, AstError> {
+        Self::new(field_path, PredicateOp::In(values))
+    }
+
+    /// Constructs a validated string prefix predicate (`field PREFIX "..."`).
+    pub fn prefix(
+        field_path: impl Into<String>,
+        prefix: impl Into<String>,
+    ) -> Result<Self, AstError> {
+        Self::new(field_path, PredicateOp::Prefix(prefix.into()))
     }
 
     fn canonicalize(&mut self) {
@@ -913,6 +1314,43 @@ pub enum Quota {
 }
 
 impl Quota {
+    /// Creates a validated `Quota::Sum`.
+    pub fn sum(
+        max: Decimal,
+        unit: impl Into<String>,
+        field: impl Into<String>,
+    ) -> Result<Self, AstError> {
+        let quota = Self::Sum {
+            max,
+            unit: unit.into(),
+            field: field.into(),
+        };
+        quota.validate()?;
+        Ok(quota)
+    }
+
+    /// Validates all lexical and numeric invariants of this quota.
+    pub fn validate(&self) -> Result<(), AstError> {
+        match self {
+            Self::Calls(_) => Ok(()),
+            Self::Sum { max, unit, field } => {
+                max.validate()?;
+                if max.is_negative() {
+                    return Err(AstError::InvalidQuota(
+                        "sum quota bound must be non-negative".to_string(),
+                    ));
+                }
+                if !is_valid_ident(unit) {
+                    return Err(AstError::InvalidIdent(unit.clone()));
+                }
+                if !is_valid_field_path(field) {
+                    return Err(AstError::InvalidFieldPath(field.clone()));
+                }
+                Ok(())
+            }
+        }
+    }
+
     fn canonicalize(&mut self) {
         if let Self::Sum { max, .. } = self {
             *max = max.canonical();
@@ -920,9 +1358,9 @@ impl Quota {
     }
 }
 
-/// Complete typed `HANDFEST v1` mandate AST.
+/// Unvalidated draft used to build a validated [`HandfestAst`].
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct HandfestAst {
+pub struct HandfestAstBuilder {
     pub parent: Option<MandateId>,
     pub from: ActorDecl,
     pub to: ActorDecl,
@@ -933,20 +1371,133 @@ pub struct HandfestAst {
     pub limits: Vec<Quota>,
 }
 
+impl HandfestAstBuilder {
+    /// Validates all invariants and constructs a canonicalized [`HandfestAst`].
+    pub fn build(self) -> Result<HandfestAst, AstError> {
+        let mut ast = HandfestAst {
+            parent: self.parent,
+            from: self.from,
+            to: self.to,
+            max_hops: self.max_hops,
+            allow: self.allow,
+            on: self.on,
+            where_clauses: self.where_clauses,
+            limits: self.limits,
+        };
+        ast.validate()?;
+        ast.canonicalize();
+        Ok(ast)
+    }
+}
+
+/// Complete typed, validated `HANDFEST v1` mandate AST.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HandfestAst {
+    parent: Option<MandateId>,
+    from: ActorDecl,
+    to: ActorDecl,
+    max_hops: u32,
+    allow: Vec<ActionPat>,
+    on: Vec<ResourceSel>,
+    where_clauses: Vec<Predicate>,
+    limits: Vec<Quota>,
+}
+
 impl HandfestAst {
+    /// Converts this AST into a mutable builder; calling [`HandfestAstBuilder::build`]
+    /// re-validates all invariants.
+    #[must_use]
+    pub fn into_builder(self) -> HandfestAstBuilder {
+        HandfestAstBuilder {
+            parent: self.parent,
+            from: self.from,
+            to: self.to,
+            max_hops: self.max_hops,
+            allow: self.allow,
+            on: self.on,
+            where_clauses: self.where_clauses,
+            limits: self.limits,
+        }
+    }
+
+    /// Validates every lexical, structural, and value invariant required for canonical bijection.
+    pub fn validate(&self) -> Result<(), AstError> {
+        self.from.validate()?;
+        self.to.validate()?;
+        if self.allow.is_empty() {
+            return Err(AstError::EmptyActions);
+        }
+        for pat in &self.allow {
+            pat.validate()?;
+        }
+        if self.on.is_empty() {
+            return Err(AstError::EmptyResources);
+        }
+        for sel in &self.on {
+            sel.validate()?;
+        }
+        for pred in &self.where_clauses {
+            pred.validate()?;
+        }
+        for quota in &self.limits {
+            quota.validate()?;
+        }
+        Ok(())
+    }
+
+    /// Returns the optional `PARENT` mandate digest.
+    #[must_use]
+    pub const fn parent(&self) -> Option<MandateId> {
+        self.parent
+    }
+
+    /// Returns the `FROM` delegator actor declaration.
+    #[must_use]
+    pub const fn from(&self) -> &ActorDecl {
+        &self.from
+    }
+
+    /// Returns the `TO` delegatee actor declaration.
+    #[must_use]
+    pub const fn to(&self) -> &ActorDecl {
+        &self.to
+    }
+
+    /// Returns the maximum remaining delegation hops.
+    #[must_use]
+    pub const fn max_hops(&self) -> u32 {
+        self.max_hops
+    }
+
+    /// Returns the declared `ALLOW` action patterns.
+    #[must_use]
+    pub fn allow(&self) -> &[ActionPat] {
+        &self.allow
+    }
+
+    /// Returns the declared `ON` resource selectors.
+    #[must_use]
+    pub fn on(&self) -> &[ResourceSel] {
+        &self.on
+    }
+
+    /// Returns the declared `WHERE` predicates.
+    #[must_use]
+    pub fn where_clauses(&self) -> &[Predicate] {
+        &self.where_clauses
+    }
+
+    /// Returns the declared `LIMIT` quotas.
+    #[must_use]
+    pub fn limits(&self) -> &[Quota] {
+        &self.limits
+    }
+
     /// Sorts and deduplicates `allow`, `on`, `where_clauses`, `limits`, and `In` sets deterministically,
     /// and normalizes all `Decimal` values to canonical form.
     pub fn canonicalize(&mut self) {
-        for v in self.from.attrs.values_mut() {
-            if let Scalar::Decimal(d) = v {
-                *d = d.canonical();
-            }
-        }
-        for v in self.to.attrs.values_mut() {
-            if let Scalar::Decimal(d) = v {
-                *d = d.canonical();
-            }
-        }
+        self.from.canonicalize();
+        self.to.canonicalize();
         self.allow.sort();
         self.allow.dedup();
         self.on.sort();
@@ -961,6 +1512,12 @@ impl HandfestAst {
         }
         self.limits.sort();
         self.limits.dedup();
+    }
+
+    /// Validates the AST and computes its content-addressed `MandateId`.
+    pub fn try_mandate_id(&self) -> Result<MandateId, AstError> {
+        let canonical = try_render_canonical(self)?;
+        Ok(MandateId::sha256(canonical.as_bytes()))
     }
 
     /// Computes the content-addressed `MandateId` (`sha256` of `render_canonical(self)`).
@@ -1003,6 +1560,17 @@ pub fn parse_rfc3339_utc(input: &str) -> Result<i64, AstError> {
 
     let days = days_from_civil(i64::from(year), month, day);
     Ok(days * 86_400 + i64::from(hour) * 3_600 + i64::from(minute) * 60 + i64::from(second))
+}
+
+/// Formats Unix epoch seconds into strict 4-digit-year RFC 3339 UTC (`YYYY-MM-DDTHH:MM:SSZ`),
+/// rejecting timestamps outside `0000-01-01T00:00:00Z..=9999-12-31T23:59:59Z`.
+pub fn try_format_rfc3339_utc(ts: i64) -> Result<String, AstError> {
+    if !is_valid_timestamp(ts) {
+        return Err(AstError::InvalidTimestamp(format!(
+            "timestamp {ts} outside 0000-01-01T00:00:00Z..=9999-12-31T23:59:59Z"
+        )));
+    }
+    Ok(format_rfc3339_utc(ts))
 }
 
 /// Formats Unix epoch seconds into strict RFC 3339 UTC (`YYYY-MM-DDTHH:MM:SSZ`).

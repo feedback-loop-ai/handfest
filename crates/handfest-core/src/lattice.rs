@@ -7,13 +7,15 @@ use alloc::vec::Vec;
 use core::fmt;
 
 use crate::ast::{
-    ActionPat, HandfestAst, KeyId, MandateId, Predicate, PredicateOp, Quota, ResourceSel, Scalar,
-    ScalarKind,
+    ActionPat, AstError, Decimal, HandfestAst, KeyId, MandateId, Predicate, PredicateOp, Quota,
+    ResourceSel, Scalar, ScalarKind,
 };
+use crate::ActorKind;
 
 /// Reason a child mandate fails monotonic attenuation against its parent.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NarrowError {
+    InvalidAst(AstError),
     MissingParent,
     ParentDigestMismatch {
         expected: MandateId,
@@ -22,6 +24,10 @@ pub enum NarrowError {
     HandoffKeyMismatch {
         expected: KeyId,
         actual: KeyId,
+    },
+    HandoffActorKindMismatch {
+        expected: ActorKind,
+        actual: ActorKind,
     },
     HopOverflow {
         parent_max_hops: u32,
@@ -53,12 +59,19 @@ pub enum NarrowError {
 impl fmt::Display for NarrowError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::InvalidAst(err) => write!(f, "invalid mandate AST: {err}"),
             Self::MissingParent => f.write_str("child mandate is missing PARENT digest"),
             Self::ParentDigestMismatch { expected, actual } => {
                 write!(f, "PARENT digest mismatch: expected {expected}, got {actual}")
             }
             Self::HandoffKeyMismatch { expected, actual } => {
                 write!(f, "handoff key mismatch: parent TO is {expected}, child FROM is {actual}")
+            }
+            Self::HandoffActorKindMismatch { expected, actual } => {
+                write!(
+                    f,
+                    "handoff actor kind mismatch: parent TO is {expected:?}, child FROM is {actual:?}"
+                )
             }
             Self::HopOverflow {
                 parent_max_hops,
@@ -75,7 +88,7 @@ impl fmt::Display for NarrowError {
             Self::ResourceWidening { resource } => write!(
                 f,
                 "resource '{} \"{}\"' is not subsumed by parent ON list",
-                resource.kind, resource.pattern
+                resource.kind(), resource.pattern()
             ),
             Self::ContradictoryPredicates { field_path, detail } => {
                 write!(f, "contradictory predicates on '{field_path}': {detail}")
@@ -84,7 +97,7 @@ impl fmt::Display for NarrowError {
                 write!(
                     f,
                     "parent predicate on '{}' is not implied by child WHERE clauses",
-                    predicate.field_path
+                    predicate.field_path()
                 )
             }
             Self::QuotaWidening { quota } => {
@@ -99,6 +112,8 @@ impl core::error::Error for NarrowError {}
 
 /// Proves that `child` is a valid monotonic attenuation of `parent` across all five invariants.
 pub fn subsumes(parent: &HandfestAst, child: &HandfestAst) -> Result<(), NarrowError> {
+    parent.validate().map_err(NarrowError::InvalidAst)?;
+    child.validate().map_err(NarrowError::InvalidAst)?;
     check_handoff(parent, child)?;
     check_hops(parent, child)?;
     check_actions(parent, child)?;
@@ -109,8 +124,8 @@ pub fn subsumes(parent: &HandfestAst, child: &HandfestAst) -> Result<(), NarrowE
 }
 
 fn check_handoff(parent: &HandfestAst, child: &HandfestAst) -> Result<(), NarrowError> {
-    let expected_id = parent.mandate_id();
-    let Some(actual_id) = child.parent else {
+    let expected_id = parent.try_mandate_id().map_err(NarrowError::InvalidAst)?;
+    let Some(actual_id) = child.parent() else {
         return Err(NarrowError::MissingParent);
     };
     if actual_id != expected_id {
@@ -119,31 +134,37 @@ fn check_handoff(parent: &HandfestAst, child: &HandfestAst) -> Result<(), Narrow
             actual: actual_id,
         });
     }
-    if child.from.key != parent.to.key {
+    if child.from().key() != parent.to().key() {
         return Err(NarrowError::HandoffKeyMismatch {
-            expected: parent.to.key.clone(),
-            actual: child.from.key.clone(),
+            expected: parent.to().key().clone(),
+            actual: child.from().key().clone(),
+        });
+    }
+    if child.from().kind() != parent.to().kind() {
+        return Err(NarrowError::HandoffActorKindMismatch {
+            expected: parent.to().kind(),
+            actual: child.from().kind(),
         });
     }
     Ok(())
 }
 
 fn check_hops(parent: &HandfestAst, child: &HandfestAst) -> Result<(), NarrowError> {
-    if parent.max_hops == 0 || child.max_hops > parent.max_hops - 1 {
+    if parent.max_hops() == 0 || child.max_hops() > parent.max_hops() - 1 {
         return Err(NarrowError::HopOverflow {
-            parent_max_hops: parent.max_hops,
-            child_max_hops: child.max_hops,
+            parent_max_hops: parent.max_hops(),
+            child_max_hops: child.max_hops(),
         });
     }
     Ok(())
 }
 
 fn check_actions(parent: &HandfestAst, child: &HandfestAst) -> Result<(), NarrowError> {
-    if child.allow.is_empty() {
+    if child.allow().is_empty() {
         return Err(NarrowError::EmptyActions);
     }
-    for child_pat in &child.allow {
-        if !parent.allow.iter().any(|p| p.subsumes(child_pat)) {
+    for child_pat in child.allow() {
+        if !parent.allow().iter().any(|p| p.subsumes(child_pat)) {
             return Err(NarrowError::ActionWidening {
                 action: child_pat.clone(),
             });
@@ -153,11 +174,11 @@ fn check_actions(parent: &HandfestAst, child: &HandfestAst) -> Result<(), Narrow
 }
 
 fn check_resources(parent: &HandfestAst, child: &HandfestAst) -> Result<(), NarrowError> {
-    if child.on.is_empty() {
+    if child.on().is_empty() {
         return Err(NarrowError::EmptyResources);
     }
-    for child_sel in &child.on {
-        if !parent.on.iter().any(|p| p.subsumes(child_sel)) {
+    for child_sel in child.on() {
+        if !parent.on().iter().any(|p| p.subsumes(child_sel)) {
             return Err(NarrowError::ResourceWidening {
                 resource: child_sel.clone(),
             });
@@ -168,11 +189,11 @@ fn check_resources(parent: &HandfestAst, child: &HandfestAst) -> Result<(), Narr
 
 fn check_predicates(parent: &HandfestAst, child: &HandfestAst) -> Result<(), NarrowError> {
     let mut by_field: BTreeMap<&str, Vec<&PredicateOp>> = BTreeMap::new();
-    for pred in &child.where_clauses {
+    for pred in child.where_clauses() {
         by_field
-            .entry(pred.field_path.as_str())
+            .entry(pred.field_path())
             .or_default()
-            .push(&pred.op);
+            .push(pred.op());
     }
 
     let mut domains: BTreeMap<&str, FieldDomain> = BTreeMap::new();
@@ -181,13 +202,13 @@ fn check_predicates(parent: &HandfestAst, child: &HandfestAst) -> Result<(), Nar
         domains.insert(field, domain);
     }
 
-    for parent_pred in &parent.where_clauses {
-        let Some(domain) = domains.get(parent_pred.field_path.as_str()) else {
+    for parent_pred in parent.where_clauses() {
+        let Some(domain) = domains.get(parent_pred.field_path()) else {
             return Err(NarrowError::PredicateNotImplied {
                 predicate: parent_pred.clone(),
             });
         };
-        if !domain.implies(&parent_pred.op) {
+        if !domain.implies(parent_pred.op()) {
             return Err(NarrowError::PredicateNotImplied {
                 predicate: parent_pred.clone(),
             });
@@ -197,7 +218,7 @@ fn check_predicates(parent: &HandfestAst, child: &HandfestAst) -> Result<(), Nar
 }
 
 fn check_quotas(parent: &HandfestAst, child: &HandfestAst) -> Result<(), NarrowError> {
-    for q in parent.limits.iter().chain(child.limits.iter()) {
+    for q in parent.limits().iter().chain(child.limits().iter()) {
         if let Quota::Sum { max, field, .. } = q {
             if max.is_negative() {
                 return Err(NarrowError::InvalidQuota {
@@ -207,17 +228,17 @@ fn check_quotas(parent: &HandfestAst, child: &HandfestAst) -> Result<(), NarrowE
         }
     }
 
-    for p_quota in &parent.limits {
+    for p_quota in parent.limits() {
         let implied = match p_quota {
             Quota::Calls(p_max) => child
-                .limits
+                .limits()
                 .iter()
                 .any(|c| matches!(c, Quota::Calls(c_max) if c_max <= p_max)),
             Quota::Sum {
                 max: p_max,
                 unit: p_unit,
                 field: p_field,
-            } => child.limits.iter().any(|c| {
+            } => child.limits().iter().any(|c| {
                 matches!(
                     c,
                     Quota::Sum {
@@ -359,6 +380,10 @@ impl FieldDomain {
                 }
             }
         }
+        self.tighten_lower(Scalar::Str(pfx.to_string()), true);
+        if let Some(upper_bound) = prefix_upper_bound(pfx) {
+            self.tighten_upper(Scalar::Str(upper_bound), false);
+        }
         Ok(())
     }
 
@@ -387,6 +412,23 @@ impl FieldDomain {
     }
 
     fn finalize(&mut self, field: &str) -> Result<(), NarrowError> {
+        match self.kind {
+            Some(ScalarKind::Str) => self.tighten_lower(Scalar::Str(String::new()), true),
+            Some(ScalarKind::Int) => {
+                self.tighten_lower(Scalar::Int(i64::MIN), true);
+                self.tighten_upper(Scalar::Int(i64::MAX), true);
+            }
+            Some(ScalarKind::Timestamp) => {
+                self.tighten_lower(Scalar::Timestamp(i64::MIN), true);
+                self.tighten_upper(Scalar::Timestamp(i64::MAX), true);
+            }
+            Some(ScalarKind::Decimal) => {
+                self.tighten_lower(Scalar::Decimal(Decimal::MIN), true);
+                self.tighten_upper(Scalar::Decimal(Decimal::MAX), true);
+            }
+            Some(ScalarKind::Bool) | None => {}
+        }
+
         if let (Some((lo, lo_inc)), Some((hi, hi_inc))) = (&self.lower, &self.upper) {
             if lo > hi || (lo == hi && !(*lo_inc && *hi_inc)) {
                 return Err(contradiction(
@@ -408,6 +450,17 @@ impl FieldDomain {
                 return Err(contradiction(
                     field,
                     "upper string bound excludes PREFIX".into(),
+                ));
+            }
+        }
+
+        if let (Some(pfx), Some(Scalar::Str(lower_s))) =
+            (&self.prefix, self.lower.as_ref().map(|(s, _)| s))
+        {
+            if prefix_strictly_below(pfx, lower_s) {
+                return Err(contradiction(
+                    field,
+                    "lower string bound excludes PREFIX".into(),
                 ));
             }
         }
@@ -472,10 +525,7 @@ impl FieldDomain {
         }
         match parent_op {
             PredicateOp::Eq(_) | PredicateOp::In(_) => false,
-            PredicateOp::Prefix(p_pfx) => self
-                .prefix
-                .as_deref()
-                .is_some_and(|c_pfx| c_pfx.starts_with(p_pfx.as_str())),
+            PredicateOp::Prefix(p_pfx) => self.implies_prefix(p_pfx),
             PredicateOp::Gte(v) => {
                 !matches!(v, Scalar::Bool(_))
                     && self
@@ -484,14 +534,39 @@ impl FieldDomain {
                         .is_some_and(|(lo, _)| lo.kind() == v.kind() && lo >= v)
             }
             PredicateOp::Gt(v) => self.implies_gt(v),
-            PredicateOp::Lte(v) => {
-                !matches!(v, Scalar::Bool(_))
-                    && self
-                        .upper
-                        .as_ref()
-                        .is_some_and(|(hi, _)| hi.kind() == v.kind() && hi <= v)
-            }
+            PredicateOp::Lte(v) => self.implies_lte(v),
             PredicateOp::Lt(v) => self.implies_lt(v),
+        }
+    }
+
+    fn implies_prefix(&self, p_pfx: &str) -> bool {
+        if self
+            .prefix
+            .as_deref()
+            .is_some_and(|c_pfx| c_pfx.starts_with(p_pfx))
+        {
+            return true;
+        }
+        if p_pfx.is_empty() {
+            return self.kind == Some(ScalarKind::Str);
+        }
+        let lower_ok = match &self.lower {
+            Some((Scalar::Str(lo), lo_inc)) => {
+                lo.as_str() >= p_pfx || (!*lo_inc && p_pfx.strip_prefix(lo.as_str()) == Some("\0"))
+            }
+            _ => false,
+        };
+        if !lower_ok {
+            return false;
+        }
+        match prefix_upper_bound(p_pfx) {
+            None => true,
+            Some(limit) => match &self.upper {
+                Some((Scalar::Str(hi), hi_inc)) => {
+                    hi.as_str() < limit.as_str() || (!*hi_inc && hi.as_str() == limit.as_str())
+                }
+                _ => false,
+            },
         }
     }
 
@@ -512,13 +587,35 @@ impl FieldDomain {
             Scalar::Timestamp(ts) => ts
                 .checked_add(1)
                 .is_some_and(|min_req| *lo >= Scalar::Timestamp(min_req)),
+            Scalar::Decimal(d) => d
+                .next_up()
+                .is_some_and(|min_req| *lo >= Scalar::Decimal(min_req)),
             _ => lo > v || (lo == v && !lo_inc),
         }
+    }
+
+    fn implies_lte(&self, v: &Scalar) -> bool {
+        if matches!(v, Scalar::Bool(_)) {
+            return false;
+        }
+        if let (Some(pfx), Scalar::Str(bound)) = (&self.prefix, v) {
+            if prefix_strictly_below(pfx, bound) {
+                return true;
+            }
+        }
+        self.upper
+            .as_ref()
+            .is_some_and(|(hi, _)| hi.kind() == v.kind() && hi <= v)
     }
 
     fn implies_lt(&self, v: &Scalar) -> bool {
         if matches!(v, Scalar::Bool(_)) {
             return false;
+        }
+        if let (Some(pfx), Scalar::Str(bound)) = (&self.prefix, v) {
+            if prefix_strictly_below(pfx, bound) {
+                return true;
+            }
         }
         let Some((hi, hi_inc)) = &self.upper else {
             return false;
@@ -533,8 +630,39 @@ impl FieldDomain {
             Scalar::Timestamp(ts) => ts
                 .checked_sub(1)
                 .is_some_and(|max_req| *hi <= Scalar::Timestamp(max_req)),
+            Scalar::Decimal(d) => d
+                .next_down()
+                .is_some_and(|max_req| *hi <= Scalar::Decimal(max_req)),
             _ => hi < v || (hi == v && !hi_inc),
         }
+    }
+}
+
+/// Returns true iff every string starting with `pfx` is strictly less than `bound`
+/// in lexicographical (UTF-8 / code point) order.
+fn prefix_strictly_below(pfx: &str, bound: &str) -> bool {
+    pfx < bound && !bound.starts_with(pfx)
+}
+
+/// Returns the lexicographically smallest Rust `String` strictly greater than every string
+/// starting with non-empty `pfx`, or `None` if every character in `pfx` is `char::MAX`.
+fn prefix_upper_bound(pfx: &str) -> Option<String> {
+    for (idx, ch) in pfx.char_indices().rev() {
+        if let Some(next_ch) = next_char(ch) {
+            let mut bound = String::with_capacity(idx + next_ch.len_utf8());
+            bound.push_str(&pfx[..idx]);
+            bound.push(next_ch);
+            return Some(bound);
+        }
+    }
+    None
+}
+
+fn next_char(ch: char) -> Option<char> {
+    match ch as u32 {
+        0xD7FF => char::from_u32(0xE000),
+        0x10_FFFF => None,
+        code => char::from_u32(code + 1),
     }
 }
 
@@ -558,6 +686,16 @@ fn normalize_gt(field: &str, val: &Scalar) -> Result<(Scalar, bool), NarrowError
             .checked_add(1)
             .map(|next| (Scalar::Timestamp(next), true))
             .ok_or_else(|| contradiction(field, "timestamp > MAX is unsatisfiable".into())),
+        Scalar::Decimal(d) => d
+            .next_up()
+            .map(|next| (Scalar::Decimal(next), true))
+            .ok_or_else(|| contradiction(field, "decimal > MAX is unsatisfiable".into())),
+        Scalar::Str(s) => {
+            let mut next = String::with_capacity(s.len() + 1);
+            next.push_str(s);
+            next.push('\0');
+            Ok((Scalar::Str(next), true))
+        }
         other => Ok((other.clone(), false)),
     }
 }
@@ -572,6 +710,14 @@ fn normalize_lt(field: &str, val: &Scalar) -> Result<(Scalar, bool), NarrowError
             .checked_sub(1)
             .map(|prev| (Scalar::Timestamp(prev), true))
             .ok_or_else(|| contradiction(field, "timestamp < MIN is unsatisfiable".into())),
+        Scalar::Decimal(d) => d
+            .next_down()
+            .map(|prev| (Scalar::Decimal(prev), true))
+            .ok_or_else(|| contradiction(field, "decimal < MIN is unsatisfiable".into())),
+        Scalar::Str(s) if s.is_empty() => Err(contradiction(
+            field,
+            "string < \"\" is unsatisfiable".into(),
+        )),
         other => Ok((other.clone(), false)),
     }
 }

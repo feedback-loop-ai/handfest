@@ -8,8 +8,8 @@ use core::fmt::{self, Write};
 
 use crate::ast::{
     format_rfc3339_utc, is_valid_field_path, is_valid_ident, parse_rfc3339_utc, ActionPat,
-    ActorDecl, AstError, Decimal, HandfestAst, KeyId, MandateId, Predicate, PredicateOp, Quota,
-    ResourceSel, Scalar,
+    ActorDecl, AstError, Decimal, HandfestAst, HandfestAstBuilder, KeyId, MandateId, Predicate,
+    PredicateOp, Quota, ResourceSel, Scalar,
 };
 use crate::{ActorKind, MANDATE_VERSION};
 
@@ -37,7 +37,7 @@ impl core::error::Error for ParseError {}
 
 /// Parses a `HANDFEST v1` Controlled-English mandate into a typed `HandfestAst`.
 pub fn parse_mandate(input: &str) -> Result<HandfestAst, ParseError> {
-    let lines = split_lines(input);
+    let lines = split_lines(input)?;
     let mut idx = 0usize;
 
     expect_exact_line(&lines, &mut idx, MANDATE_VERSION)?;
@@ -58,7 +58,7 @@ pub fn parse_mandate(input: &str) -> Result<HandfestAst, ParseError> {
         });
     }
 
-    Ok(HandfestAst {
+    HandfestAstBuilder {
         parent,
         from,
         to,
@@ -67,10 +67,21 @@ pub fn parse_mandate(input: &str) -> Result<HandfestAst, ParseError> {
         on,
         where_clauses,
         limits,
+    }
+    .build()
+    .map_err(|error| ParseError::Ast {
+        line: lines.len().max(1),
+        error,
     })
 }
 
-/// Renders a `HandfestAst` into its unique canonical `HANDFEST v1` Controlled-English string.
+/// Validates `ast` and renders it into its unique canonical `HANDFEST v1` Controlled-English string.
+pub fn try_render_canonical(ast: &HandfestAst) -> Result<String, AstError> {
+    ast.validate()?;
+    Ok(render_canonical(ast))
+}
+
+/// Renders a validated `HandfestAst` into its unique canonical `HANDFEST v1` Controlled-English string.
 #[must_use]
 pub fn render_canonical(ast: &HandfestAst) -> String {
     let mut canon = ast.clone();
@@ -78,22 +89,22 @@ pub fn render_canonical(ast: &HandfestAst) -> String {
 
     let mut out = String::new();
     let _ = writeln!(out, "{MANDATE_VERSION}");
-    if let Some(parent) = canon.parent {
+    if let Some(parent) = canon.parent() {
         let _ = writeln!(out, "PARENT {parent}");
     }
     out.push_str("FROM ");
-    write_actor(&mut out, &canon.from);
+    write_actor(&mut out, canon.from());
     out.push('\n');
 
     out.push_str("TO ");
-    write_actor(&mut out, &canon.to);
+    write_actor(&mut out, canon.to());
     out.push('\n');
 
-    let hop_word = if canon.max_hops == 1 { "hop" } else { "hops" };
-    let _ = writeln!(out, "DELEGATION max {} {hop_word}", canon.max_hops);
+    let hop_word = if canon.max_hops() == 1 { "hop" } else { "hops" };
+    let _ = writeln!(out, "DELEGATION max {} {hop_word}", canon.max_hops());
 
     out.push_str("ALLOW ");
-    for (i, pat) in canon.allow.iter().enumerate() {
+    for (i, pat) in canon.allow().iter().enumerate() {
         if i > 0 {
             out.push_str(", ");
         }
@@ -102,23 +113,23 @@ pub fn render_canonical(ast: &HandfestAst) -> String {
     out.push('\n');
 
     out.push_str("ON ");
-    for (i, sel) in canon.on.iter().enumerate() {
+    for (i, sel) in canon.on().iter().enumerate() {
         if i > 0 {
             out.push_str(", ");
         }
-        out.push_str(&sel.kind);
+        out.push_str(sel.kind());
         out.push(' ');
-        write_quoted(&mut out, &sel.pattern);
+        write_quoted(&mut out, sel.pattern());
     }
     out.push('\n');
 
-    for (i, pred) in canon.where_clauses.iter().enumerate() {
+    for (i, pred) in canon.where_clauses().iter().enumerate() {
         out.push_str(if i == 0 { "WHERE " } else { "  AND " });
         write_predicate(&mut out, pred);
         out.push('\n');
     }
 
-    for (i, quota) in canon.limits.iter().enumerate() {
+    for (i, quota) in canon.limits().iter().enumerate() {
         out.push_str(if i == 0 { "LIMIT " } else { "  AND " });
         write_quota(&mut out, quota);
         out.push('\n');
@@ -145,9 +156,6 @@ pub(crate) fn write_quoted(out: &mut String, value: &str) {
         match ch {
             '"' => out.push_str("\\\""),
             '\\' => out.push_str("\\\\"),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
             c => out.push(c),
         }
     }
@@ -155,11 +163,11 @@ pub(crate) fn write_quoted(out: &mut String, value: &str) {
 }
 
 fn write_actor(out: &mut String, actor: &ActorDecl) {
-    out.push_str(actor_kind_str(actor.kind));
+    out.push_str(actor_kind_str(actor.kind()));
     out.push(' ');
-    write_quoted(out, &actor.name);
-    let _ = write!(out, " (key: {}", actor.key);
-    for (k, v) in &actor.attrs {
+    write_quoted(out, actor.name());
+    let _ = write!(out, " (key: {}", actor.key());
+    for (k, v) in actor.attrs() {
         out.push_str(", ");
         out.push_str(k);
         out.push_str(": ");
@@ -192,8 +200,8 @@ fn write_scalar(out: &mut String, scalar: &Scalar) {
 }
 
 fn write_predicate(out: &mut String, pred: &Predicate) {
-    out.push_str(&pred.field_path);
-    match &pred.op {
+    out.push_str(pred.field_path());
+    match pred.op() {
         PredicateOp::Eq(v) => {
             out.push_str(" == ");
             write_scalar(out, v);
@@ -243,18 +251,25 @@ fn write_quota(out: &mut String, quota: &Quota) {
     }
 }
 
-fn split_lines(input: &str) -> Vec<&str> {
-    let trimmed = input
-        .strip_suffix("\r\n")
-        .or_else(|| input.strip_suffix('\n'))
-        .unwrap_or(input);
-    if trimmed.is_empty() {
-        return Vec::new();
+fn split_lines(input: &str) -> Result<Vec<&str>, ParseError> {
+    if input.is_empty() {
+        return Err(ParseError::Syntax {
+            line: 1,
+            message: format!("expected '{MANDATE_VERSION}', found end of input"),
+        });
     }
-    trimmed
+    let Some(trimmed) = input.strip_suffix('\n') else {
+        let line = input.bytes().filter(|&b| b == b'\n').count() + 1;
+        return Err(ParseError::Syntax {
+            line,
+            message: "mandate must end with a trailing newline ('\\n')".into(),
+        });
+    };
+    let trimmed = trimmed.strip_suffix('\r').unwrap_or(trimmed);
+    Ok(trimmed
         .split('\n')
         .map(|line| line.strip_suffix('\r').unwrap_or(line))
-        .collect()
+        .collect())
 }
 
 fn expect_exact_line(lines: &[&str], idx: &mut usize, expected: &str) -> Result<(), ParseError> {
@@ -354,12 +369,7 @@ fn parse_actor_decl(cur: &mut Cursor<'_>) -> Result<ActorDecl, ParseError> {
         }
     }
 
-    Ok(ActorDecl {
-        kind,
-        name,
-        key,
-        attrs,
-    })
+    ActorDecl::new(kind, name, key, attrs).map_err(|error| cur.ast(error))
 }
 
 fn parse_delegation_line(lines: &[&str], idx: &mut usize) -> Result<u32, ParseError> {
@@ -510,10 +520,7 @@ fn parse_predicate_line(
     };
 
     cur.expect_eol()?;
-    Ok(Predicate {
-        field_path: field_path.to_string(),
-        op,
-    })
+    Predicate::new(field_path, op).map_err(|error| cur.ast(error))
 }
 
 fn parse_scalar_set(cur: &mut Cursor<'_>) -> Result<BTreeSet<Scalar>, ParseError> {
@@ -583,7 +590,7 @@ fn parse_quota_line(line: &str, line_no: usize, keyword: &str) -> Result<Quota, 
         cur.expect_str("sum(")?;
         let field = cur.take_field_path()?.to_string();
         cur.expect_char(')')?;
-        Quota::Sum { max, unit, field }
+        Quota::sum(max, unit, field).map_err(|error| cur.ast(error))?
     } else {
         if num_tok.starts_with('-') {
             return Err(cur.syntax("call quota bound must be non-negative".into()));
@@ -788,9 +795,6 @@ impl<'a> Cursor<'a> {
                     match esc {
                         '"' => out.push('"'),
                         '\\' => out.push('\\'),
-                        'n' => out.push('\n'),
-                        'r' => out.push('\r'),
-                        't' => out.push('\t'),
                         other => {
                             return Err(self
                                 .syntax(format!("invalid escape sequence '\\{other}' in string")));
