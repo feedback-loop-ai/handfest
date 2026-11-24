@@ -1,0 +1,35 @@
+{
+  "description": "Review panel member, adversarial (the security position): Gemini 4 Carbon through Antigravity CLI (agy) at high, with Claude Fable 5.2 behind it at medium (operator 2026-11-23: \"use Fable at mid, no need to go excessive here\"), in decision 0043's workspace box (operator 2026-11-22: \"move the seat off qwen, I'd say put it to Carbon with Fable fallback\"). It replaces Qwen 4.0 Max in this seat: on the 2026-11-22 eval (#1259) Qwen filed no security-hold on branches with known highs, while Carbon alone found the masking gap and Fable was the strongest finder outside codex. An agy seat's hands are boxed (decision 0075 level 3): its one tool is the engine's workspace tool.",
+  "charter": "charters/review-adversarial.md",
+  "models": [
+    "agy-carbon",
+    "fable"
+  ],
+  "efforts": {
+    "agy-carbon": "high",
+    "fable": "medium"
+  },
+  "hands": {
+    "kind": "workspace",
+    "network": false,
+    "binds": [
+      {
+        "path": "~/.cargo",
+        "mode": "overlay",
+        "mask": [
+          "credentials.toml",
+          "credentials"
+        ]
+      },
+      {
+        "path": "~/.rustup",
+        "mode": "ro"
+      }
+    ]
+  },
+  "results": [
+    "clean",
+    "residual",
+    "security-hold"
+  ]
+}

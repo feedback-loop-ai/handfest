@@ -1,0 +1,33 @@
+{
+  "description": "Review panel member: does the fix do what the issue asks, and do its tests prove it? gpt-6-sol at high effort in decision 0043's workspace box (operator swap 2026-09-25, replacing GLM-5.3 Flash on the Spark).",
+  "charter": "charters/review-correctness.md",
+  "models": [
+    "sol"
+  ],
+  "efforts": {
+    "sol": "medium"
+  },
+  "hands": {
+    "kind": "workspace",
+    "network": false,
+    "binds": [
+      {
+        "path": "~/.cargo",
+        "mode": "overlay",
+        "mask": [
+          "credentials.toml",
+          "credentials"
+        ]
+      },
+      {
+        "path": "~/.rustup",
+        "mode": "ro"
+      }
+    ]
+  },
+  "results": [
+    "clean",
+    "residual",
+    "security-hold"
+  ]
+}

@@ -1,0 +1,32 @@
+{
+  "description": "Story implementer on Gemini 4 Neon through Antigravity CLI (agy) at high effort, with boxed hands: its one tool is the engine's workspace tool (decision 0075 level 3). The incumbent story-implementer's charter and limits. Operator 2026-11-22: 'neon as implementer'; on the 2026-11-22 eval (#1259) Neon was the lean agy implementer. Provisional until #1252 lands: the realm lists this office as provisional.",
+  "charter": "charters/implementer.md",
+  "models": [
+    "agy-neon"
+  ],
+  "efforts": {
+    "agy-neon": "high"
+  },
+  "limits": {
+    "max_attempts": 2,
+    "timeout_seconds": 7200
+  },
+  "hands": {
+    "kind": "workspace",
+    "network": false,
+    "binds": [
+      {
+        "path": "~/.cargo",
+        "mode": "overlay",
+        "mask": [
+          "credentials.toml",
+          "credentials"
+        ]
+      },
+      {
+        "path": "~/.rustup",
+        "mode": "ro"
+      }
+    ]
+  }
+}

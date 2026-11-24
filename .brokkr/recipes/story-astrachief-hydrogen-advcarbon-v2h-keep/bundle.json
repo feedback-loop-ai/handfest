@@ -1,0 +1,25 @@
+{
+  "name": "story-astrachief-hydrogen-advcarbon-v2h-keep",
+  "description": "Story delivery with Gemini 4 Hydrogen implementing (operator, 2026-11-24: 'add hydrogen as implementer in a new library version'): Hydrogen implements at high with boxed hands; everything else is story-astrachief-neon-advcarbon-v2h-keep's: the review panel is Gemini 4 Carbon adversarial at high (the security position; Claude Fable 5.2 at medium behind it) and gpt-6.2-sol correctness at medium; the gpt-6.2-astra chief judges at medium, sol (high) its fallback. Verify's deadline is 7200 s and it keeps each command's output.",
+  "extends": "story-astrachief-neon-advcarbon-v2h-keep",
+  "override": {
+    "bundle": [
+      "description"
+    ],
+    "seats": [
+      "implement"
+    ]
+  },
+  "seats": {
+    "implement": {
+      "results": [
+        "complete",
+        "broken",
+        "blocked",
+        "oversized"
+      ],
+      "class": "work",
+      "agent": "story-implementer-hydrogen"
+    }
+  }
+}

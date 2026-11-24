@@ -1,0 +1,46 @@
+{
+  "name": "landing-story-astrachief-advcarbon-v2h-keep",
+  "description": "Landing (decision 0051) on the claude + codex crew (operator, 2026-11-17): a hand-written branch is classified, verified when it is code (7200 s, output kept), judged by the panel (gpt-6.2-sol adversarial at high and correctness at medium) and the Claude Fable 5.2 chief at medium (gpt-6.2-sol high, then gpt-6.2-astra medium, as fallbacks), remediated by the Claude Opus 5.5 implementer at medium on findings, and shipped by a run that vouches for it. Variant 2026-11-18: the panel's adversarial member runs on Claude Opus 5.5 at high (bugfix-review-adversarial-opus), for a branch whose content OpenAI's cyber_policy filter refuses at the sol seat.",
+  "cost": "low",
+  "extends": "story-astrachief-neon-advcarbon-v2h-keep",
+  "policy": "policy.json",
+  "override": {
+    "bundle": [
+      "description",
+      "cost"
+    ],
+    "table": [
+      "initial",
+      "description"
+    ]
+  },
+  "seats": {
+    "classify": {
+      "results": [
+        "docs",
+        "code"
+      ],
+      "class": "gate",
+      "limits": {
+        "max_attempts": 2,
+        "timeout_seconds": 300
+      },
+      "driver": {
+        "command": [
+          "{brokkr}",
+          "driver",
+          "exec",
+          "--",
+          "bash",
+          "./scripts/classify-seat.sh",
+          "{prompt_file}"
+        ]
+      },
+      "hands": {
+        "kind": "workspace",
+        "network": false,
+        "binds": []
+      }
+    }
+  }
+}

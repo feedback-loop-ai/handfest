@@ -1,0 +1,30 @@
+{
+  "description": "Review chief (judge) for the code-health epic: checks the panel's findings against the diff and rules the protected phase without lowering its verdict. gpt-6.2-astra (medium) judges in Fable's place, gpt-6.2-sol (high) its fallback: the operator, 2026-10-26, 'you can use astra instead of fable' and 'you can use astra for that seat', while the Claude account's Fable limit is exhausted. Efforts set by the operator 2026-11-17: 'make the review chief at medium for astra and fable, high for sol 6.1, everywhere'.",
+  "charter": "charters/review-chief.md",
+  "models": [
+    "astra",
+    "sol"
+  ],
+  "efforts": {
+    "astra": "medium",
+    "sol": "high"
+  },
+  "hands": {
+    "kind": "workspace",
+    "network": false,
+    "binds": [
+      {
+        "path": "~/.cargo",
+        "mode": "overlay",
+        "mask": [
+          "credentials.toml",
+          "credentials"
+        ]
+      },
+      {
+        "path": "~/.rustup",
+        "mode": "ro"
+      }
+    ]
+  }
+}
