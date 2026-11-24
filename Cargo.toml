@@ -32,6 +32,7 @@ dbg_macro = "warn"
 todo = "warn"
 
 [workspace.dependencies]
+sha2 = { version = "0.10", default-features = false }
 handfest-core = { path = "crates/handfest-core", version = "0.1.0" }
 handfest-anchors = { path = "crates/handfest-anchors", version = "0.1.0" }
 handfest-ledger = { path = "crates/handfest-ledger", version = "0.1.0" }
