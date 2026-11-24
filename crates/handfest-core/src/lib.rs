@@ -5,13 +5,18 @@
 
 extern crate alloc;
 
+pub mod ast;
+pub mod cnl;
+pub mod gate;
+pub mod lattice;
+
 use alloc::string::String;
 
 /// Current canonical wire and Controlled-English version header.
 pub const MANDATE_VERSION: &str = "HANDFEST v1";
 
 /// Actor class participating in a mandate chain.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum ActorKind {
     Human,
     Org,
@@ -20,7 +25,7 @@ pub enum ActorKind {
 }
 
 /// Normalized assurance tier reported by a verified trust anchor.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum AssuranceLevel {
     LocalKey,
     CryptoWallet,
