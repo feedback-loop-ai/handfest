@@ -4,7 +4,6 @@
 use std::collections::BTreeSet;
 use std::io::{self, BufRead, BufReader, Cursor, Read, Write};
 use std::path::Path;
-use std::process::Command;
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 
@@ -301,26 +300,251 @@ fn run_raw<L: ReceiptLedger>(
     (res, responses, captured)
 }
 
-fn query_sqlite_receipts(db_path: &Path) -> Vec<Value> {
-    let output = Command::new("sqlite3")
-        .args([
-            "-readonly",
-            "-json",
-            db_path.to_str().expect("utf-8 sqlite path"),
-            "SELECT seq, receipt_hash, action, resource_kind, resource_id, verdict, deny_reason              FROM receipts ORDER BY seq ASC",
-        ])
-        .output()
-        .expect("invoke sqlite3 to inspect persisted receipts");
-    assert!(
-        output.status.success(),
-        "sqlite3 query failed: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let stdout = String::from_utf8(output.stdout).expect("utf-8 sqlite3 json");
-    if stdout.trim().is_empty() {
-        return Vec::new();
+/// Minimal read-only SQLite 3 B-tree decoder for inspecting persisted `receipts` rows directly
+/// from disk without depending on an external `sqlite3` CLI executable.
+enum SqliteValue {
+    Null,
+    Int(i64),
+    Text(String),
+    Other,
+}
+
+impl SqliteValue {
+    fn into_json(self) -> Value {
+        match self {
+            Self::Null => Value::Null,
+            Self::Int(n) => json!(n),
+            Self::Text(s) => json!(s),
+            Self::Other => Value::Null,
+        }
     }
-    serde_json::from_str(&stdout).expect("valid sqlite3 json array")
+}
+
+fn read_sqlite_varint(buf: &[u8]) -> (u64, usize) {
+    let mut val = 0u64;
+    for (idx, &byte) in buf.iter().take(9).enumerate() {
+        if idx == 8 {
+            val = (val << 8) | u64::from(byte);
+            return (val, 9);
+        }
+        val = (val << 7) | u64::from(byte & 0x7f);
+        if (byte & 0x80) == 0 {
+            return (val, idx + 1);
+        }
+    }
+    panic!("truncated SQLite varint");
+}
+
+fn read_be_signed(bytes: &[u8]) -> i64 {
+    let sign_extend = if bytes[0] & 0x80 != 0 { -1i64 } else { 0i64 };
+    bytes
+        .iter()
+        .fold(sign_extend, |acc, &b| (acc << 8) | i64::from(b))
+}
+
+fn decode_sqlite_record(payload: &[u8]) -> Vec<SqliteValue> {
+    let (header_len_u64, mut pos) = read_sqlite_varint(payload);
+    let header_len = usize::try_from(header_len_u64).expect("header_len fits usize");
+    let mut serial_types = Vec::new();
+    while pos < header_len {
+        let (st, used) = read_sqlite_varint(&payload[pos..header_len]);
+        serial_types.push(st);
+        pos += used;
+    }
+    let mut body_pos = header_len;
+    let mut cols = Vec::with_capacity(serial_types.len());
+    for st in serial_types {
+        let val = match st {
+            0 => SqliteValue::Null,
+            1..=4 => {
+                let len = usize::try_from(st).unwrap();
+                let v = read_be_signed(&payload[body_pos..body_pos + len]);
+                body_pos += len;
+                SqliteValue::Int(v)
+            }
+            5 => {
+                let v = read_be_signed(&payload[body_pos..body_pos + 6]);
+                body_pos += 6;
+                SqliteValue::Int(v)
+            }
+            6 => {
+                let v = read_be_signed(&payload[body_pos..body_pos + 8]);
+                body_pos += 8;
+                SqliteValue::Int(v)
+            }
+            7 => {
+                body_pos += 8;
+                SqliteValue::Other
+            }
+            8 => SqliteValue::Int(0),
+            9 => SqliteValue::Int(1),
+            st if st >= 12 && st % 2 == 0 => {
+                let len = usize::try_from((st - 12) / 2).unwrap();
+                body_pos += len;
+                SqliteValue::Other
+            }
+            st if st >= 13 && st % 2 == 1 => {
+                let len = usize::try_from((st - 13) / 2).unwrap();
+                let s = String::from_utf8(payload[body_pos..body_pos + len].to_vec())
+                    .expect("valid utf-8 SQLite text column");
+                body_pos += len;
+                SqliteValue::Text(s)
+            }
+            other => panic!("unsupported SQLite serial type {other}"),
+        };
+        cols.push(val);
+    }
+    cols
+}
+
+fn assemble_table_payload(
+    db: &[u8],
+    page_size: usize,
+    usable_size: usize,
+    cell: &[u8],
+    payload_len: usize,
+) -> Vec<u8> {
+    let max_local = usable_size - 35;
+    if payload_len <= max_local {
+        return cell[..payload_len].to_vec();
+    }
+    let min_local = ((usable_size - 12) * 32 / 255) - 23;
+    let k = min_local + ((payload_len - min_local) % (usable_size - 4));
+    let local_len = if k <= max_local { k } else { min_local };
+
+    let mut out = Vec::with_capacity(payload_len);
+    out.extend_from_slice(&cell[..local_len]);
+    let mut overflow_page = u32::from_be_bytes(
+        cell[local_len..local_len + 4]
+            .try_into()
+            .expect("overflow page pointer"),
+    );
+    while out.len() < payload_len && overflow_page != 0 {
+        let p_off = (usize::try_from(overflow_page).unwrap() - 1) * page_size;
+        let page = &db[p_off..p_off + usable_size];
+        overflow_page = u32::from_be_bytes(page[0..4].try_into().unwrap());
+        let take = (payload_len - out.len()).min(usable_size - 4);
+        out.extend_from_slice(&page[4..4 + take]);
+    }
+    assert_eq!(out.len(), payload_len, "incomplete SQLite overflow chain");
+    out
+}
+
+fn read_sqlite_table_rows(
+    db: &[u8],
+    page_size: usize,
+    usable_size: usize,
+    page_num: usize,
+    rows: &mut Vec<(i64, Vec<SqliteValue>)>,
+) {
+    let page_off = (page_num - 1) * page_size;
+    let page = &db[page_off..page_off + page_size];
+    let hdr = if page_num == 1 { 100 } else { 0 };
+    let page_type = page[hdr];
+    let cell_count = usize::from(u16::from_be_bytes([page[hdr + 3], page[hdr + 4]]));
+
+    match page_type {
+        0x0d => {
+            let ptrs_off = hdr + 8;
+            for i in 0..cell_count {
+                let cell_off = usize::from(u16::from_be_bytes([
+                    page[ptrs_off + i * 2],
+                    page[ptrs_off + i * 2 + 1],
+                ]));
+                let (payload_len_u64, used1) = read_sqlite_varint(&page[cell_off..]);
+                let (rowid_u64, used2) = read_sqlite_varint(&page[cell_off + used1..]);
+                let payload_start = cell_off + used1 + used2;
+                let payload = assemble_table_payload(
+                    db,
+                    page_size,
+                    usable_size,
+                    &page[payload_start..],
+                    usize::try_from(payload_len_u64).unwrap(),
+                );
+                rows.push((rowid_u64 as i64, decode_sqlite_record(&payload)));
+            }
+        }
+        0x05 => {
+            let ptrs_off = hdr + 12;
+            for i in 0..cell_count {
+                let cell_off = usize::from(u16::from_be_bytes([
+                    page[ptrs_off + i * 2],
+                    page[ptrs_off + i * 2 + 1],
+                ]));
+                let child =
+                    u32::from_be_bytes(page[cell_off..cell_off + 4].try_into().unwrap()) as usize;
+                read_sqlite_table_rows(db, page_size, usable_size, child, rows);
+            }
+            let right_child =
+                u32::from_be_bytes(page[hdr + 8..hdr + 12].try_into().unwrap()) as usize;
+            read_sqlite_table_rows(db, page_size, usable_size, right_child, rows);
+        }
+        other => panic!("unexpected SQLite table B-tree page type 0x{other:02x}"),
+    }
+}
+
+fn query_sqlite_receipts(db_path: &Path) -> Vec<Value> {
+    let db = std::fs::read(db_path).expect("read persisted sqlite database");
+    assert!(
+        db.starts_with(b"SQLite format 3\0"),
+        "valid SQLite 3 header"
+    );
+    let raw_page_size = u16::from_be_bytes([db[16], db[17]]);
+    let page_size = if raw_page_size == 1 {
+        65536
+    } else {
+        usize::from(raw_page_size)
+    };
+    let usable_size = page_size - usize::from(db[20]);
+
+    let mut schema_rows = Vec::new();
+    read_sqlite_table_rows(&db, page_size, usable_size, 1, &mut schema_rows);
+    let root_page = schema_rows
+        .into_iter()
+        .find_map(|(_, cols)| {
+            let is_receipts_table = matches!(
+                (cols.first(), cols.get(1)),
+                (Some(SqliteValue::Text(kind)), Some(SqliteValue::Text(name)))
+                    if kind == "table" && name == "receipts"
+            );
+            if is_receipts_table {
+                match cols.get(3) {
+                    Some(SqliteValue::Int(page)) => Some(usize::try_from(*page).unwrap()),
+                    _ => None,
+                }
+            } else {
+                None
+            }
+        })
+        .expect("receipts table rootpage in sqlite_master");
+
+    let mut receipt_rows = Vec::new();
+    read_sqlite_table_rows(&db, page_size, usable_size, root_page, &mut receipt_rows);
+    receipt_rows.sort_by_key(|(seq, _)| *seq);
+    receipt_rows
+        .into_iter()
+        .map(|(seq, mut cols)| {
+            assert_eq!(cols.len(), 11, "unexpected receipts table column count");
+            let deny_reason = cols.pop().unwrap().into_json();
+            let verdict = cols.pop().unwrap().into_json();
+            let _timestamp = cols.pop().unwrap();
+            let resource_id = cols.pop().unwrap().into_json();
+            let resource_kind = cols.pop().unwrap().into_json();
+            let action = cols.pop().unwrap().into_json();
+            let _actor_key = cols.pop().unwrap();
+            let _chain_ids_json = cols.pop().unwrap();
+            let receipt_hash = cols.pop().unwrap().into_json();
+            json!({
+                "seq": seq,
+                "receipt_hash": receipt_hash,
+                "action": action,
+                "resource_kind": resource_kind,
+                "resource_id": resource_id,
+                "verdict": verdict,
+                "deny_reason": deny_reason,
+            })
+        })
+        .collect()
 }
 
 #[test]

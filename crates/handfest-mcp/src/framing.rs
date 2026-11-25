@@ -309,6 +309,9 @@ pub(crate) fn read_bounded_line<R: BufRead>(
             if buf.is_empty() {
                 return Ok(None);
             }
+            if buf.len() > max_bytes {
+                return Err(LineReadError::TooLong);
+            }
             if buf.contains(&b'\r') {
                 return Err(LineReadError::BareCr);
             }
@@ -318,13 +321,22 @@ pub(crate) fn read_bounded_line<R: BufRead>(
         }
 
         if let Some(nl_pos) = chunk.iter().position(|&b| b == b'\n') {
-            if buf.len().saturating_add(nl_pos) > max_bytes {
+            let has_trailing_cr = if nl_pos > 0 {
+                chunk[nl_pos - 1] == b'\r'
+            } else {
+                buf.last() == Some(&b'\r')
+            };
+            let payload_len = buf
+                .len()
+                .saturating_add(nl_pos)
+                .saturating_sub(usize::from(has_trailing_cr));
+            if payload_len > max_bytes {
                 reader.consume(nl_pos + 1);
                 return Err(LineReadError::TooLong);
             }
             buf.extend_from_slice(&chunk[..nl_pos]);
             reader.consume(nl_pos + 1);
-            if buf.ends_with(b"\r") {
+            if has_trailing_cr {
                 buf.pop();
             }
             if buf.contains(&b'\r') {
@@ -336,7 +348,12 @@ pub(crate) fn read_bounded_line<R: BufRead>(
         }
 
         let chunk_len = chunk.len();
-        if buf.len().saturating_add(chunk_len) > max_bytes {
+        let total = buf.len().saturating_add(chunk_len);
+        // Allow one extra byte beyond `max_bytes` ONLY when it is a trailing CR that may pair
+        // with an LF at the start of the next chunk.
+        let pending_crlf =
+            max_bytes < usize::MAX && total == max_bytes + 1 && chunk.last() == Some(&b'\r');
+        if total > max_bytes && !pending_crlf {
             reader.consume(chunk_len);
             return Err(LineReadError::TooLong);
         }
@@ -377,6 +394,58 @@ mod tests {
         assert!(matches!(
             read_bounded_line(&mut eof_cr, 64),
             Err(LineReadError::BareCr)
+        ));
+    }
+
+    #[test]
+    fn read_bounded_line_accepts_exact_limit_payload_with_lf_and_crlf_across_chunk_splits() {
+        use std::io::BufReader;
+
+        let payload = br#"{"a":1}"#;
+        let limit = payload.len();
+
+        let mut lf = Cursor::new(b"{\"a\":1}\n".as_slice());
+        assert_eq!(
+            read_bounded_line(&mut lf, limit).unwrap(),
+            Some("{\"a\":1}".to_string())
+        );
+
+        let mut crlf = Cursor::new(b"{\"a\":1}\r\n".as_slice());
+        assert_eq!(
+            read_bounded_line(&mut crlf, limit).unwrap(),
+            Some("{\"a\":1}".to_string())
+        );
+
+        let mut crlf_split = BufReader::with_capacity(1, Cursor::new(b"{\"a\":1}\r\n".as_slice()));
+        assert_eq!(
+            read_bounded_line(&mut crlf_split, limit).unwrap(),
+            Some("{\"a\":1}".to_string())
+        );
+
+        let mut crlf_over = Cursor::new(b"{\"a\":12}\r\n".as_slice());
+        assert!(matches!(
+            read_bounded_line(&mut crlf_over, limit),
+            Err(LineReadError::TooLong)
+        ));
+
+        let mut crlf_over_split =
+            BufReader::with_capacity(1, Cursor::new(b"{\"a\":12}\r\n".as_slice()));
+        assert!(matches!(
+            read_bounded_line(&mut crlf_over_split, limit),
+            Err(LineReadError::TooLong)
+        ));
+
+        let mut eof_trailing_cr =
+            BufReader::with_capacity(1, Cursor::new(b"{\"a\":1}\r".as_slice()));
+        assert!(matches!(
+            read_bounded_line(&mut eof_trailing_cr, limit),
+            Err(LineReadError::TooLong)
+        ));
+
+        let mut double_cr_at_limit = Cursor::new(b"{\"a\":1}\r\r\n".as_slice());
+        assert!(matches!(
+            read_bounded_line(&mut double_cr_at_limit, limit),
+            Err(LineReadError::TooLong)
         ));
     }
 

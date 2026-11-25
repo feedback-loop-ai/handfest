@@ -2,8 +2,11 @@
 //! writes so idle notifications flow immediately, bidirectional pipe traffic cannot deadlock, and
 //! client EOF or cancellation is always observable while waiting on upstream replies.
 
+use std::collections::VecDeque;
 use std::io::{BufRead, Write};
-use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender, TryRecvError, TrySendError};
+use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -16,7 +19,8 @@ const EVENT_CHANNEL_BOUND: usize = 64;
 pub(crate) enum IoEvent {
     ClientLine(Result<Option<String>, LineReadError>),
     UpstreamLine(Result<Option<String>, LineReadError>),
-    UpstreamWriteError(ProxyError),
+    UpstreamWriteReady,
+    UpstreamWriteFailed,
 }
 
 pub(crate) enum RecvOutcome {
@@ -28,6 +32,8 @@ pub(crate) enum RecvOutcome {
 pub(crate) struct DuplexTransport {
     event_rx: Receiver<IoEvent>,
     upstream_tx: Option<SyncSender<String>>,
+    pending_upstream: VecDeque<String>,
+    writer_wakeup_armed: Arc<AtomicBool>,
     writer_done_rx: Receiver<Result<(), ProxyError>>,
 }
 
@@ -46,6 +52,7 @@ impl DuplexTransport {
         let (event_tx, event_rx) = mpsc::sync_channel::<IoEvent>(EVENT_CHANNEL_BOUND);
         let (upstream_tx, upstream_rx) = mpsc::sync_channel::<String>(MAX_QUEUED_CLIENT_FRAMES);
         let (writer_done_tx, writer_done_rx) = mpsc::sync_channel::<Result<(), ProxyError>>(1);
+        let writer_wakeup_armed = Arc::new(AtomicBool::new(false));
 
         let client_tx = event_tx.clone();
         thread::spawn(move || loop {
@@ -76,23 +83,32 @@ impl DuplexTransport {
         });
 
         let up_write_tx = event_tx;
+        let writer_wakeup = Arc::clone(&writer_wakeup_armed);
         thread::spawn(move || {
             let mut final_res = Ok(());
             while let Ok(frame) = upstream_rx.recv() {
+                if writer_wakeup.swap(false, Ordering::SeqCst) {
+                    let _ = up_write_tx.try_send(IoEvent::UpstreamWriteReady);
+                }
                 if let Err(err) = write_raw_line(&mut upstream_in, &frame) {
-                    let preserved = duplicate_write_error(&err);
-                    let _ = up_write_tx.send(IoEvent::UpstreamWriteError(err));
-                    final_res = Err(preserved);
+                    final_res = Err(err);
                     break;
                 }
             }
             drop(upstream_in);
+            let failed = final_res.is_err();
             let _ = writer_done_tx.send(final_res);
+            drop(upstream_rx);
+            if failed {
+                let _ = up_write_tx.try_send(IoEvent::UpstreamWriteFailed);
+            }
         });
 
         Self {
             event_rx,
             upstream_tx: Some(upstream_tx),
+            pending_upstream: VecDeque::new(),
+            writer_wakeup_armed,
             writer_done_rx,
         }
     }
@@ -108,8 +124,8 @@ impl DuplexTransport {
         if remaining.is_zero() {
             return match self.event_rx.try_recv() {
                 Ok(ev) => RecvOutcome::Event(ev),
-                Err(mpsc::TryRecvError::Empty) => RecvOutcome::Timeout,
-                Err(mpsc::TryRecvError::Disconnected) => RecvOutcome::Disconnected,
+                Err(TryRecvError::Empty) => RecvOutcome::Timeout,
+                Err(TryRecvError::Disconnected) => RecvOutcome::Disconnected,
             };
         }
         match self.event_rx.recv_timeout(remaining) {
@@ -119,18 +135,72 @@ impl DuplexTransport {
         }
     }
 
-    pub(crate) fn send_upstream(&self, frame: String) -> Result<(), ProxyError> {
+    pub(crate) fn has_pending_upstream(&self) -> bool {
+        !self.pending_upstream.is_empty()
+    }
+
+    pub(crate) fn poll_writer_error(&self) -> Option<ProxyError> {
+        match self.writer_done_rx.try_recv() {
+            Ok(Err(err)) => Some(err),
+            Ok(Ok(())) | Err(TryRecvError::Empty | TryRecvError::Disconnected) => None,
+        }
+    }
+
+    pub(crate) fn take_writer_error(&self) -> ProxyError {
+        match self.writer_done_rx.recv() {
+            Ok(Err(err)) => err,
+            Ok(Ok(())) | Err(_) => ProxyError::Io(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "upstream writer thread terminated",
+            )),
+        }
+    }
+
+    pub(crate) fn flush_upstream(&mut self) -> Result<(), ProxyError> {
+        let Some(tx) = &self.upstream_tx else {
+            return Ok(());
+        };
+        while let Some(frame) = self.pending_upstream.pop_front() {
+            match try_send_with_wakeup(tx, frame, &self.writer_wakeup_armed) {
+                Ok(()) => {}
+                Err(TrySendError::Full(frame)) => {
+                    self.pending_upstream.push_front(frame);
+                    return Ok(());
+                }
+                Err(TrySendError::Disconnected(_)) => {
+                    return Err(self.take_writer_error());
+                }
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn send_upstream(&mut self, frame: String) -> Result<(), ProxyError> {
+        self.flush_upstream()?;
         let Some(tx) = &self.upstream_tx else {
             return Err(ProxyError::UpstreamProtocol(
                 "upstream stdin pipe is already closed".to_string(),
             ));
         };
-        tx.send(frame).map_err(|_| {
-            ProxyError::Io(std::io::Error::new(
-                std::io::ErrorKind::BrokenPipe,
-                "upstream writer thread terminated",
-            ))
-        })
+        if self.pending_upstream.is_empty() {
+            match try_send_with_wakeup(tx, frame, &self.writer_wakeup_armed) {
+                Ok(()) => return Ok(()),
+                Err(TrySendError::Full(frame)) => {
+                    self.pending_upstream.push_back(frame);
+                    return Ok(());
+                }
+                Err(TrySendError::Disconnected(_)) => {
+                    return Err(self.take_writer_error());
+                }
+            }
+        }
+        if self.pending_upstream.len() >= MAX_QUEUED_CLIENT_FRAMES {
+            return Err(ProxyError::UpstreamProtocol(
+                "upstream writer queue exceeded maximum pending frames".to_string(),
+            ));
+        }
+        self.pending_upstream.push_back(frame);
+        self.flush_upstream()
     }
 
     pub(crate) fn close_upstream_stdin(&mut self) {
@@ -139,8 +209,8 @@ impl DuplexTransport {
 
     pub(crate) fn finish_writer(mut self, timeout: Duration) -> Result<(), ProxyError> {
         self.close_upstream_stdin();
-        // Drop `event_rx` before awaiting `writer_done_rx` so a writer thread blocked on a full
-        // `event_tx` channel immediately unblocks with `SendError` instead of deadlocking.
+        // Drop `event_rx` before awaiting `writer_done_rx` so reader threads blocked on a full
+        // `event_tx` channel unblock immediately, then return the writer's exact `Result`.
         drop(self.event_rx);
         let wait_res = if Instant::now().checked_add(timeout).is_some() {
             self.writer_done_rx.recv_timeout(timeout)
@@ -156,12 +226,18 @@ impl DuplexTransport {
     }
 }
 
-fn duplicate_write_error(err: &ProxyError) -> ProxyError {
-    match err {
-        ProxyError::Io(io_err) => {
-            ProxyError::Io(std::io::Error::new(io_err.kind(), io_err.to_string()))
+fn try_send_with_wakeup(
+    tx: &SyncSender<String>,
+    frame: String,
+    wakeup_armed: &AtomicBool,
+) -> Result<(), TrySendError<String>> {
+    match tx.try_send(frame) {
+        Ok(()) => Ok(()),
+        Err(TrySendError::Full(frame)) => {
+            wakeup_armed.store(true, Ordering::SeqCst);
+            tx.try_send(frame)
         }
-        other => ProxyError::UpstreamProtocol(other.to_string()),
+        Err(TrySendError::Disconnected(frame)) => Err(TrySendError::Disconnected(frame)),
     }
 }
 
@@ -211,19 +287,17 @@ mod tests {
         }
     }
 
-    struct FailingWriter {
+    struct RawOsFailingWriter {
+        raw_os_code: i32,
         attempted_tx: Option<mpsc::SyncSender<()>>,
     }
 
-    impl Write for FailingWriter {
+    impl Write for RawOsFailingWriter {
         fn write(&mut self, _buf: &[u8]) -> io::Result<usize> {
             if let Some(tx) = self.attempted_tx.take() {
                 let _ = tx.send(());
             }
-            Err(io::Error::new(
-                io::ErrorKind::BrokenPipe,
-                "simulated broken upstream pipe",
-            ))
+            Err(io::Error::from_raw_os_error(self.raw_os_code))
         }
 
         fn flush(&mut self) -> io::Result<()> {
@@ -262,13 +336,16 @@ mod tests {
     }
 
     #[test]
-    fn finish_writer_drops_full_event_channel_without_deadlock_and_preserves_io_error() {
+    fn finish_writer_drops_full_event_channel_without_deadlock_and_preserves_raw_os_error() {
+        const RAW_OS_CODE: i32 = 32;
+        let expected_kind = io::Error::from_raw_os_error(RAW_OS_CODE).kind();
         let (full_tx, full_rx) = mpsc::sync_channel(1);
         let (fail_tx, fail_rx) = mpsc::sync_channel(1);
         let (_client_hold_tx, client_hold_rx) = mpsc::sync_channel(1);
-        let transport = DuplexTransport::start(
+        let mut transport = DuplexTransport::start(
             BufReader::new(BlockingEofReader(client_hold_rx)),
-            FailingWriter {
+            RawOsFailingWriter {
+                raw_os_code: RAW_OS_CODE,
                 attempted_tx: Some(fail_tx),
             },
             BufReader::new(BurstLineReader::new(EVENT_CHANNEL_BOUND + 1, full_tx)),
@@ -285,7 +362,7 @@ mod tests {
             .expect("queued frame to failing writer");
         fail_rx
             .recv_timeout(Duration::from_secs(2))
-            .expect("writer observed broken pipe");
+            .expect("writer observed raw OS error");
 
         let started = Instant::now();
         let res = transport.finish_writer(Duration::from_secs(5));
@@ -297,24 +374,61 @@ mod tests {
             matches!(
                 res,
                 Err(ProxyError::Io(ref io_err))
-                    if io_err.kind() == io::ErrorKind::BrokenPipe
-                        && io_err.to_string().contains("simulated broken upstream pipe")
+                    if io_err.kind() == expected_kind && io_err.raw_os_error() == Some(RAW_OS_CODE)
             ),
-            "expected preserved ProxyError::Io(BrokenPipe), got {res:?}"
+            "expected preserved ProxyError::Io with raw_os_error={RAW_OS_CODE}, got {res:?}"
         );
     }
 
     #[test]
-    fn upstream_tx_is_bounded_and_finish_writer_handles_duration_max() {
+    fn live_writer_failure_preserves_raw_os_error_via_event_and_take_writer_error() {
+        const RAW_OS_CODE: i32 = 9;
+        let expected_kind = io::Error::from_raw_os_error(RAW_OS_CODE).kind();
+        let (_client_hold_tx, client_hold_rx) = mpsc::sync_channel(1);
+        let (_up_hold_tx, up_hold_rx) = mpsc::sync_channel(1);
+        let mut transport = DuplexTransport::start(
+            BufReader::new(BlockingEofReader(client_hold_rx)),
+            RawOsFailingWriter {
+                raw_os_code: RAW_OS_CODE,
+                attempted_tx: None,
+            },
+            BufReader::new(BlockingEofReader(up_hold_rx)),
+            1024,
+        );
+
+        transport
+            .send_upstream(r#"{"jsonrpc":"2.0","id":1,"method":"ping"}"#.to_string())
+            .expect("queued frame to failing writer");
+
+        let ev = transport.recv_event(Some(Instant::now() + Duration::from_secs(2)));
+        assert!(matches!(
+            ev,
+            RecvOutcome::Event(IoEvent::UpstreamWriteFailed)
+        ));
+        let err = transport.take_writer_error();
+        assert!(
+            matches!(
+                err,
+                ProxyError::Io(ref io_err)
+                    if io_err.kind() == expected_kind && io_err.raw_os_error() == Some(RAW_OS_CODE)
+            ),
+            "expected live writer error to preserve raw_os_error={RAW_OS_CODE}, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn send_upstream_never_blocks_when_writer_queue_is_full_and_wakes_on_drain() {
         let (gate_tx, gate_rx) = mpsc::sync_channel(1);
         let (entered_tx, entered_rx) = mpsc::sync_channel(1);
-        let transport = DuplexTransport::start(
-            BufReader::new(Cursor::new(Vec::<u8>::new())),
+        let (_client_hold_tx, client_hold_rx) = mpsc::sync_channel(1);
+        let (_up_hold_tx, up_hold_rx) = mpsc::sync_channel(1);
+        let mut transport = DuplexTransport::start(
+            BufReader::new(BlockingEofReader(client_hold_rx)),
             GateWriter {
                 gate_rx: Some(gate_rx),
                 entered_tx: Some(entered_tx),
             },
-            BufReader::new(Cursor::new(Vec::<u8>::new())),
+            BufReader::new(BlockingEofReader(up_hold_rx)),
             1024,
         );
 
@@ -334,28 +448,69 @@ mod tests {
                 )
                 .unwrap();
         }
+        assert!(!transport.has_pending_upstream());
 
-        // Next `try_send` must report `Full`, proving `upstream_tx` is bounded.
-        let overflow = transport
-            .upstream_tx
-            .as_ref()
-            .unwrap()
-            .try_send(r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#.to_string());
-        assert!(matches!(overflow, Err(mpsc::TrySendError::Full(_))));
+        // Next `send_upstream` must NOT block; it spills into `pending_upstream` instead.
+        let started = Instant::now();
+        transport
+            .send_upstream(r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#.to_string())
+            .expect("spilled frame must not block");
+        assert!(
+            started.elapsed() < Duration::from_millis(250),
+            "send_upstream blocked when writer queue was full"
+        );
+        assert!(transport.has_pending_upstream());
 
-        // Release writer and verify `finish_writer(Duration::MAX)` does not panic on overflow.
+        // Release writer -> `UpstreamWriteReady` wakes the consumer, `flush_upstream` drains it,
+        // and `finish_writer(Duration::MAX)` does not panic on overflow.
         let _ = gate_tx.send(());
+        let woke = transport.recv_event(Some(Instant::now() + Duration::from_secs(2)));
+        assert!(matches!(
+            woke,
+            RecvOutcome::Event(IoEvent::UpstreamWriteReady)
+        ));
+        transport.flush_upstream().unwrap();
+        assert!(!transport.has_pending_upstream());
+
         transport
             .finish_writer(Duration::MAX)
             .expect("finish_writer(Duration::MAX) must succeed without panicking");
     }
 
     #[test]
-    fn duplicate_write_error_preserves_protocol_variant() {
-        let err = ProxyError::UpstreamProtocol("embedded LF".to_string());
+    fn send_upstream_fails_closed_when_pending_overflow_reaches_cap() {
+        let (_gate_tx, gate_rx) = mpsc::sync_channel(1);
+        let (entered_tx, entered_rx) = mpsc::sync_channel(1);
+        let mut transport = DuplexTransport::start(
+            BufReader::new(Cursor::new(Vec::<u8>::new())),
+            GateWriter {
+                gate_rx: Some(gate_rx),
+                entered_tx: Some(entered_tx),
+            },
+            BufReader::new(Cursor::new(Vec::<u8>::new())),
+            1024,
+        );
+
+        transport
+            .send_upstream(r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#.to_string())
+            .unwrap();
+        entered_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("writer blocked");
+
+        for _ in 0..(MAX_QUEUED_CLIENT_FRAMES * 2) {
+            transport
+                .send_upstream(
+                    r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#.to_string(),
+                )
+                .unwrap();
+        }
+        let overflow = transport
+            .send_upstream(r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#.to_string());
         assert!(matches!(
-            duplicate_write_error(&err),
-            ProxyError::UpstreamProtocol(msg) if msg.contains("embedded LF")
+            overflow,
+            Err(ProxyError::UpstreamProtocol(ref msg))
+                if msg == "upstream writer queue exceeded maximum pending frames"
         ));
     }
 }

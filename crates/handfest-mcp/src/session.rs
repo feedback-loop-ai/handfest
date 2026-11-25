@@ -20,7 +20,6 @@ const MAX_CANCELLED_IN_FLIGHT: usize = 1024;
 
 const ALLOWED_NOTIFICATION_METHODS: &[&str] = &[
     "notifications/initialized",
-    "notifications/cancelled",
     "notifications/roots/list_changed",
 ];
 
@@ -36,14 +35,29 @@ pub(crate) struct PendingRequest {
 
 pub(crate) struct DispatchCtx<'a, CW> {
     pub(crate) state: &'a mut SessionState,
-    pub(crate) transport: &'a DuplexTransport,
+    pub(crate) transport: &'a mut DuplexTransport,
     pub(crate) client_out: &'a mut CW,
 }
 
 enum QueuedClientItem {
-    Line(String),
     BareCr,
     InvalidUtf8,
+    ParseError(String),
+    InvalidFrame {
+        id: Option<JsonRpcId>,
+        message: String,
+    },
+    Notification {
+        method: String,
+        raw_frame: String,
+        cancel_request_id: Option<JsonRpcId>,
+    },
+    Request {
+        id: JsonRpcId,
+        method: String,
+        obj: BTreeMap<String, ExactJson>,
+        raw_frame: String,
+    },
 }
 
 #[derive(Default)]
@@ -98,17 +112,24 @@ impl<C: Clock, L: ReceiptLedger> McpProxy<C, L> {
         UR: BufRead + Send + 'static,
         UW: Write + Send + 'static,
     {
-        let transport =
+        let mut transport =
             DuplexTransport::start(client_in, upstream_in, upstream_out, self.max_line_bytes);
         let mut state = SessionState::default();
 
         loop {
-            self.drain_queued_client(&mut state, &transport, client_out)?;
-            if state.client_eof && state.queued_client.is_empty() {
-                if state.active_request.is_none() {
+            transport.flush_upstream()?;
+            if let Some(err) = transport.poll_writer_error() {
+                return Err(err);
+            }
+            self.drain_queued_client(&mut state, &mut transport, client_out)?;
+            if state.client_eof {
+                if state.queued_client.is_empty()
+                    && !transport.has_pending_upstream()
+                    && state.active_request.is_none()
+                {
                     return transport.finish_writer(self.shutdown_timeout);
                 }
-                if state.upstream_eof {
+                if state.upstream_eof && state.active_request.is_some() {
                     return emit_upstream_eof(client_out, state.active_id());
                 }
                 state.set_shutdown_timeout(self.shutdown_timeout);
@@ -116,18 +137,22 @@ impl<C: Clock, L: ReceiptLedger> McpProxy<C, L> {
 
             match transport.recv_event(state.shutdown_deadline) {
                 RecvOutcome::Event(IoEvent::ClientLine(res)) => {
-                    self.on_client_read(res, &mut state, &transport, client_out)?;
+                    self.on_client_read(res, &mut state, &mut transport, client_out)?;
                 }
                 RecvOutcome::Event(IoEvent::UpstreamLine(res)) => {
-                    self.on_upstream_read(res, &mut state, &transport, client_out)?;
+                    self.on_upstream_read(res, &mut state, &mut transport, client_out)?;
                 }
-                RecvOutcome::Event(IoEvent::UpstreamWriteError(err)) => {
-                    return Err(err);
+                RecvOutcome::Event(IoEvent::UpstreamWriteReady) => {}
+                RecvOutcome::Event(IoEvent::UpstreamWriteFailed) => {
+                    return Err(transport.take_writer_error());
                 }
                 RecvOutcome::Timeout => {
                     return Ok(());
                 }
                 RecvOutcome::Disconnected => {
+                    if let Some(err) = transport.poll_writer_error() {
+                        return Err(err);
+                    }
                     if state.active_request.is_some() {
                         return emit_upstream_eof(client_out, state.active_id());
                     }
@@ -141,7 +166,7 @@ impl<C: Clock, L: ReceiptLedger> McpProxy<C, L> {
         &mut self,
         res: Result<Option<String>, LineReadError>,
         state: &mut SessionState,
-        transport: &DuplexTransport,
+        transport: &mut DuplexTransport,
         client_out: &mut CW,
     ) -> Result<(), ProxyError> {
         match res {
@@ -178,15 +203,13 @@ impl<C: Clock, L: ReceiptLedger> McpProxy<C, L> {
                 client_out,
             ),
             Ok(Some(raw_line)) => {
-                if matches_active_cancellation(&raw_line, state) {
-                    return cancel_active_request(&raw_line, state, transport, client_out);
+                let item = classify_client_line(raw_line);
+                if !transport.has_pending_upstream() && is_active_cancellation(&item, state) {
+                    if let QueuedClientItem::Notification { raw_frame, .. } = item {
+                        return cancel_active_request(&raw_frame, state, transport, client_out);
+                    }
                 }
-                self.enqueue_or_process_client(
-                    QueuedClientItem::Line(raw_line),
-                    state,
-                    transport,
-                    client_out,
-                )
+                self.enqueue_or_process_client(item, state, transport, client_out)
             }
         }
     }
@@ -195,10 +218,14 @@ impl<C: Clock, L: ReceiptLedger> McpProxy<C, L> {
         &mut self,
         item: QueuedClientItem,
         state: &mut SessionState,
-        transport: &DuplexTransport,
+        transport: &mut DuplexTransport,
         client_out: &mut CW,
     ) -> Result<(), ProxyError> {
-        if state.active_request.is_none() && state.queued_client.is_empty() {
+        if !transport.has_pending_upstream()
+            && state.queued_client.is_empty()
+            && (state.active_request.is_none()
+                || matches!(item, QueuedClientItem::Notification { .. }))
+        {
             return self.process_client_item(item, state, transport, client_out);
         }
         if state.queued_client.len() >= MAX_QUEUED_CLIENT_FRAMES {
@@ -220,24 +247,23 @@ impl<C: Clock, L: ReceiptLedger> McpProxy<C, L> {
     fn drain_queued_client<CW: Write>(
         &mut self,
         state: &mut SessionState,
-        transport: &DuplexTransport,
+        transport: &mut DuplexTransport,
         client_out: &mut CW,
     ) -> Result<(), ProxyError> {
         loop {
-            if state.active_request.is_some() {
-                let cancel_pos = state.queued_client.iter().position(|item| {
-                    matches!(
-                        item,
-                        QueuedClientItem::Line(line) if matches_active_cancellation(line, state)
-                    )
-                });
-                let Some(pos) = cancel_pos else {
-                    break;
-                };
-                if let Some(QueuedClientItem::Line(raw_line)) = state.queued_client.remove(pos) {
-                    cancel_active_request(&raw_line, state, transport, client_out)?;
-                }
-                continue;
+            if transport.has_pending_upstream() {
+                break;
+            }
+            if state.active_request.is_some()
+                && !matches!(
+                    state.queued_client.front(),
+                    Some(QueuedClientItem::Notification { .. })
+                )
+            {
+                // Strict FIFO head-of-queue draining: only a notification at the front advances
+                // while a request is active, preventing later cancellations from overtaking earlier
+                // queued notifications and avoiding any scan/reparse of queued frames.
+                break;
             }
             let Some(item) = state.queued_client.pop_front() else {
                 break;
@@ -251,7 +277,7 @@ impl<C: Clock, L: ReceiptLedger> McpProxy<C, L> {
         &mut self,
         item: QueuedClientItem,
         state: &mut SessionState,
-        transport: &DuplexTransport,
+        transport: &mut DuplexTransport,
         client_out: &mut CW,
     ) -> Result<(), ProxyError> {
         match item {
@@ -269,62 +295,38 @@ impl<C: Clock, L: ReceiptLedger> McpProxy<C, L> {
                 "invalid UTF-8 in JSON-RPC frame",
                 None,
             ),
-            QueuedClientItem::Line(raw_line) => {
-                self.handle_client_frame(&raw_line, state, transport, client_out)
+            QueuedClientItem::ParseError(message) => {
+                write_jsonrpc_error(client_out, None, JSONRPC_PARSE_ERROR, &message, None)
             }
-        }
-    }
-
-    fn handle_client_frame<CW: Write>(
-        &mut self,
-        raw_frame: &str,
-        state: &mut SessionState,
-        transport: &DuplexTransport,
-        client_out: &mut CW,
-    ) -> Result<(), ProxyError> {
-        let parsed = match parse_exact_json(raw_frame) {
-            Ok(val) => val,
-            Err(err) => {
-                return write_jsonrpc_error(
-                    client_out,
-                    None,
-                    JSONRPC_PARSE_ERROR,
-                    &format!("invalid JSON-RPC frame: {err}"),
-                    None,
-                );
-            }
-        };
-
-        let Some(obj) = parsed.as_object() else {
-            return write_jsonrpc_error(
+            QueuedClientItem::InvalidFrame { id, message } => write_jsonrpc_error(
                 client_out,
-                None,
+                id.as_ref(),
                 JSONRPC_INVALID_REQUEST,
-                "JSON-RPC frame must be a JSON object",
+                &message,
                 None,
-            );
-        };
-
-        let env = match validate_client_envelope(obj) {
-            Ok(env) => env,
-            Err(err) => {
-                return write_jsonrpc_error(
-                    client_out,
-                    err.id.as_ref(),
-                    JSONRPC_INVALID_REQUEST,
-                    &err.message,
-                    None,
-                );
-            }
-        };
-
-        match env.id {
-            None => handle_notification(env.method, raw_frame, transport),
-            Some(req_id) => {
-                if state.is_in_flight(&req_id) {
+            ),
+            QueuedClientItem::Notification {
+                method,
+                raw_frame,
+                cancel_request_id,
+            } => handle_notification(
+                &method,
+                &raw_frame,
+                cancel_request_id.as_ref(),
+                state,
+                transport,
+                client_out,
+            ),
+            QueuedClientItem::Request {
+                id,
+                method,
+                obj,
+                raw_frame,
+            } => {
+                if state.is_in_flight(&id) {
                     return write_jsonrpc_error(
                         client_out,
-                        Some(&req_id),
+                        Some(&id),
                         JSONRPC_INVALID_REQUEST,
                         "duplicate in-flight JSON-RPC request id",
                         None,
@@ -335,7 +337,7 @@ impl<C: Clock, L: ReceiptLedger> McpProxy<C, L> {
                     transport,
                     client_out,
                 };
-                self.handle_request(req_id, env.method, obj, raw_frame, &mut ctx)
+                self.handle_request(id, &method, &obj, &raw_frame, &mut ctx)
             }
         }
     }
@@ -383,7 +385,7 @@ impl<C: Clock, L: ReceiptLedger> McpProxy<C, L> {
         &mut self,
         res: Result<Option<String>, LineReadError>,
         state: &mut SessionState,
-        transport: &DuplexTransport,
+        transport: &mut DuplexTransport,
         client_out: &mut CW,
     ) -> Result<(), ProxyError> {
         let raw_line = match res {
@@ -526,30 +528,73 @@ pub(crate) fn dispatch_to_upstream<CW: Write>(
     Ok(())
 }
 
-fn matches_active_cancellation(raw_line: &str, state: &SessionState) -> bool {
-    let Some(active_id) = state.active_id() else {
-        return false;
+fn classify_client_line(raw_line: String) -> QueuedClientItem {
+    let parsed = match parse_exact_json(&raw_line) {
+        Ok(val) => val,
+        Err(err) => return QueuedClientItem::ParseError(format!("invalid JSON-RPC frame: {err}")),
     };
-    let Ok(ExactJson::Object(obj)) = parse_exact_json(raw_line) else {
-        return false;
+    let ExactJson::Object(obj) = parsed else {
+        return QueuedClientItem::InvalidFrame {
+            id: None,
+            message: "JSON-RPC frame must be a JSON object".to_string(),
+        };
     };
-    let Ok(env) = validate_client_envelope(&obj) else {
-        return false;
+    let (id, method) = match validate_client_envelope(&obj) {
+        Ok(env) => (env.id, env.method.to_string()),
+        Err(err) => {
+            return QueuedClientItem::InvalidFrame {
+                id: err.id,
+                message: err.message,
+            };
+        }
     };
-    if env.id.is_some() || env.method != "notifications/cancelled" {
-        return false;
+    match id {
+        None => {
+            let cancel_request_id = if method == "notifications/cancelled" {
+                extract_cancel_request_id(&obj)
+            } else {
+                None
+            };
+            QueuedClientItem::Notification {
+                method,
+                raw_frame: raw_line,
+                cancel_request_id,
+            }
+        }
+        Some(req_id) => QueuedClientItem::Request {
+            id: req_id,
+            method,
+            obj,
+            raw_frame: raw_line,
+        },
     }
+}
+
+fn extract_cancel_request_id(obj: &BTreeMap<String, ExactJson>) -> Option<JsonRpcId> {
     obj.get("params")
         .and_then(ExactJson::as_object)
         .and_then(|params| params.get("requestId"))
         .and_then(|val| extract_id_value(val).ok())
-        .is_some_and(|cancel_id| &cancel_id == active_id)
+}
+
+fn is_active_cancellation(item: &QueuedClientItem, state: &SessionState) -> bool {
+    let Some(active_id) = state.active_id() else {
+        return false;
+    };
+    matches!(
+        item,
+        QueuedClientItem::Notification {
+            method,
+            cancel_request_id: Some(cancel_id),
+            ..
+        } if method == "notifications/cancelled" && cancel_id == active_id
+    )
 }
 
 fn cancel_active_request<CW: Write>(
     raw_line: &str,
     state: &mut SessionState,
-    transport: &DuplexTransport,
+    transport: &mut DuplexTransport,
     client_out: &mut CW,
 ) -> Result<(), ProxyError> {
     if state.cancelled_requests.len() >= MAX_CANCELLED_IN_FLIGHT {
@@ -603,11 +648,23 @@ pub(crate) fn emit_upstream_eof<CW: Write>(
     Err(ProxyError::UpstreamEof)
 }
 
-fn handle_notification(
+fn handle_notification<CW: Write>(
     method: &str,
     raw_frame: &str,
-    transport: &DuplexTransport,
+    cancel_request_id: Option<&JsonRpcId>,
+    state: &mut SessionState,
+    transport: &mut DuplexTransport,
+    client_out: &mut CW,
 ) -> Result<(), ProxyError> {
+    if method == "notifications/cancelled" {
+        if cancel_request_id.is_some_and(|id| state.active_id().is_some_and(|active| active == id))
+        {
+            return cancel_active_request(raw_frame, state, transport, client_out);
+        }
+        // Drop cancellations missing a valid requestId or targeting idle, unknown, completed, or
+        // locally-denied requests instead of leaking them upstream.
+        return Ok(());
+    }
     if ALLOWED_NOTIFICATION_METHODS.contains(&method) {
         transport.send_upstream(raw_frame.to_string())?;
     }
