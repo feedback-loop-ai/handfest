@@ -118,6 +118,20 @@ LIMIT 5 calls
 * [`crates/handfest-cli`](crates/handfest-cli) — Reference CLI (`handfest fmt`, `keygen`, `sign`, `verify`, `check`, `audit`).
 * [`specs/`](specs/) — Formal `HANDFEST v1` grammar (`grammar.ebnf`) and architecture specification.
 
+## Concept & Literature: Executable Ricardian Mandates
+
+`handfest` builds on **Ian Grigg's Ricardian Contract** (1996, formalized in 2004) — a single cryptographically hashed artifact that is simultaneously human-readable intent (for principals, wallets, and courts) and machine-parsable structure (for deterministic execution and ledgers), linked by Grigg's *Bow-Tie* hash knot.
+
+Where a *contract* is a bilateral agreement, a **Ricardian Mandate** (from civil-law *mandatum* / Power of Attorney) is unilateral, bounded delegation of authority from a principal to an actor (human, service, or AI agent). Unlike earlier template-based Ricardian systems where prose only parameterized external code, a `HANDFEST v1` mandate compiles **1:1** between canonical Controlled English and a typed meet-semilattice AST — so there is no hidden program that can diverge from the words you signed (*WYSIWYS*).
+
+### Foundational Papers, Standards & Prior Art
+
+* **Ricardian Contracts & The Bow-Tie Model:** Ian Grigg, [*The Ricardian Contract*](https://iang.org/papers/ricardian_contract.html) (IEEE Workshop on Electronic Contracting, 2004).
+* **Human-Readable Cryptographic Capability Delegation:** SpruceID, [*ERC-5573: Sign-In with Ethereum Capabilities (ReCaps)*](https://eips.ethereum.org/EIPS/eip-5573) — deterministic English capability rendering inside wallet signing prompts.
+* **Offline Monotonic Capability Attenuation:** [*Eclipse Biscuit*](https://www.biscuitsec.org/) — public-key capability tokens with offline attenuation and Datalog checks; [*UCAN (User-Controlled Authorization Networks)*](https://ucan.xyz/).
+* **Controlled Natural Language & Computational Law:** Norbert E. Fuchs et al., [*Attempto Controlled English (ACE)*](http://attempto.ifi.uzh.ch/site/) — unambiguous Controlled English compiled 1:1 into formal logic; [*CNCF / AWS Cedar Policy Language*](https://www.cedarpolicy.com/) (formally verified authorization semantics).
+* **Trust Anchors, eIDAS 2.0 & Agent Delegation:** [*EU Digital Identity Wallet Architecture and Reference Framework (ARF)*](https://eu-digital-identity-wallet.github.io/eudi-doc-architecture-and-reference-framework/), [*ETSI TS 119 612 (Trusted Lists / LOTL)*](https://www.etsi.org/deliver/etsi_ts/119600_119699/119612/), [*W3C Verifiable Credentials Data Model 2.0*](https://www.w3.org/TR/vc-data-model-2.0/), and [*IETF RFC 8693 (OAuth 2.0 Token Exchange / `act` claim)*](https://datatracker.ietf.org/doc/html/rfc8693).
+
 ## Status
 
 Active development (`v0.1.0-dev`): `handfest-core`, `handfest-anchors` (Ed25519), `handfest-ledger` (SQLite), and `handfest-cli` are live on `main`, with `handfest-mcp` in progress. See [`specs/architecture.md`](specs/architecture.md) and [`specs/grammar.ebnf`](specs/grammar.ebnf).
