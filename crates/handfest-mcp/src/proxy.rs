@@ -5,8 +5,8 @@ use std::fmt;
 use std::io::Write;
 use std::time::Duration;
 
-use handfest_core::ast::{is_valid_timestamp, KeyId, MandateId};
-use handfest_core::gate::{ActionRequest, VerifiedMandate};
+use handfest_core::ast::{KeyId, MandateId};
+use handfest_core::gate::{verify_chain_runtime, ActionRequest, VerifiedMandate};
 use handfest_core::Verdict;
 pub use handfest_ledger::ReceiptLedger;
 use handfest_ledger::SqliteLedger;
@@ -267,7 +267,7 @@ impl<C: Clock, L: ReceiptLedger> McpProxy<C, L> {
         mapping_reason: String,
         client_out: &mut CW,
     ) -> Result<(), ProxyError> {
-        let reason = match self.check_chain_at(now) {
+        let reason = match verify_chain_runtime(&self.verified_chain, &self.actor_key, now) {
             Ok(()) => mapping_reason,
             Err(chain_reason) => chain_reason,
         };
@@ -297,54 +297,8 @@ impl<C: Clock, L: ReceiptLedger> McpProxy<C, L> {
         )
     }
 
-    fn check_chain_at(&self, now: i64) -> Result<(), String> {
-        if !is_valid_timestamp(now) {
-            return Err(format!(
-                "timestamp {now} outside 0000-01-01T00:00:00Z..=9999-12-31T23:59:59Z"
-            ));
-        }
-        for (hop, vm) in self.verified_chain.iter().enumerate() {
-            if &vm.proof.signer_key != vm.ast.from().key() {
-                return Err(format!(
-                    "hop {hop}: proof signer key {} does not match mandate FROM key {}",
-                    vm.proof.signer_key,
-                    vm.ast.from().key()
-                ));
-            }
-            if vm.proof.actor_kind != vm.ast.from().kind() {
-                return Err(format!(
-                    "hop {hop}: proof actor kind {:?} does not match mandate FROM kind {:?}",
-                    vm.proof.actor_kind,
-                    vm.ast.from().kind()
-                ));
-            }
-            if vm.proof.valid_from >= vm.proof.valid_until {
-                return Err(format!(
-                    "hop {hop}: invalid anchor proof validity window [{}..{})",
-                    vm.proof.valid_from, vm.proof.valid_until
-                ));
-            }
-            if now < vm.proof.valid_from || now >= vm.proof.valid_until {
-                return Err(format!(
-                    "hop {hop}: timestamp {now} outside anchor proof validity window [{}..{})",
-                    vm.proof.valid_from, vm.proof.valid_until
-                ));
-            }
-        }
-        if let Some(leaf) = self.verified_chain.last() {
-            if leaf.ast.to().key() != &self.actor_key {
-                return Err(format!(
-                    "request actor key {} does not match leaf mandate TO key {}",
-                    self.actor_key,
-                    leaf.ast.to().key()
-                ));
-            }
-        }
-        Ok(())
-    }
-
     fn is_tool_permitted(&self, tool_name: &str, now: i64) -> bool {
-        if self.check_chain_at(now).is_err() {
+        if verify_chain_runtime(&self.verified_chain, &self.actor_key, now).is_err() {
             return false;
         }
         let Some(policy) = self.policy_map.get(tool_name) else {

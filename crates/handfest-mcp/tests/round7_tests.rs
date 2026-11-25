@@ -800,7 +800,7 @@ fn round8_eof_behind_64_notifications_aborts_tools_call_in_o1_without_burning_qu
     let mut proxy = make_proxy("LIMIT 1 calls\n");
     let (client_in_w, client_in_r) = step_pipe();
     let (client_out_w, mut client_out_r) = mem_pipe_timeout();
-    let (up_in_w, mut up_in_r) = mem_pipe();
+    let (up_in_w, mut up_in_r) = mem_pipe_timeout();
     let (release_tx, release_rx) = mpsc::sync_channel(1);
     let (eof_tx, eof_rx) = mpsc::sync_channel(1);
     let (done_tx, done_rx) = mpsc::sync_channel(1);
@@ -825,8 +825,7 @@ fn round8_eof_behind_64_notifications_aborts_tools_call_in_o1_without_burning_qu
     });
 
     client_in_w.send_bytes(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"ping\"}\n");
-    let mut seen_ping = String::new();
-    up_in_r.read_line(&mut seen_ping).unwrap();
+    let seen_ping = up_in_r.read_line_timeout(Duration::from_secs(2), "initial outbound ping");
     assert!(seen_ping.contains("\"id\":1"));
 
     client_in_w.send_and_sync_queued(
@@ -857,4 +856,196 @@ fn round8_eof_behind_64_notifications_aborts_tools_call_in_o1_without_burning_qu
         0,
         "tools/call must not burn SQLite quota when EOF sits behind 64+ notifications"
     );
+}
+
+#[test]
+fn round9_rejects_negative_zero_ids_and_matches_upstream_float_int() {
+    // 1. Client id: -0 rejected with -32600 before upstream.
+    let mut proxy = make_proxy("");
+    let (up_in_tx, up_in_rx) = mpsc::channel::<Vec<u8>>();
+    let mut client_out = Vec::new();
+    proxy
+        .run(
+            BufReader::new(Cursor::new(
+                b"{\"jsonrpc\":\"2.0\",\"id\":-0,\"method\":\"ping\"}\n".to_vec(),
+            )),
+            &mut client_out,
+            PipeWriter { tx: up_in_tx },
+            BufReader::new(Cursor::new(Vec::<u8>::new())),
+        )
+        .expect("id: -0 must emit -32600 without crashing session");
+    assert!(
+        up_in_rx.try_recv().is_err(),
+        "id: -0 must never reach upstream"
+    );
+    let resp: Value =
+        serde_json::from_str(String::from_utf8(client_out).unwrap().trim_end()).unwrap();
+    assert_eq!(resp["id"], json!(null));
+    assert_eq!(resp["error"]["code"], json!(-32600));
+
+    // 2. notifications/cancelled with requestId: -0 must NOT cancel active id: 0 or reach upstream.
+    let mut cancel_proxy = make_proxy("");
+    let (client_in_w, client_in_r) = step_pipe();
+    let (mut client_out_w, mut client_out_r) = mem_pipe_timeout();
+    let (up_in_tx, up_in_rx) = mpsc::channel::<Vec<u8>>();
+    let (mut up_out_w, up_out_r) = mem_pipe();
+    let (done_tx, done_rx) = mpsc::sync_channel(1);
+    let proxy_thread = thread::spawn(move || {
+        let res = cancel_proxy.run(
+            client_in_r,
+            &mut client_out_w,
+            PipeWriter { tx: up_in_tx },
+            up_out_r,
+        );
+        let _ = done_tx.send(res);
+    });
+
+    client_in_w.send_bytes(b"{\"jsonrpc\":\"2.0\",\"id\":0,\"method\":\"ping\"}\n");
+    let f0 = String::from_utf8(up_in_rx.recv_timeout(Duration::from_secs(2)).unwrap()).unwrap();
+    assert_eq!(
+        serde_json::from_str::<Value>(f0.trim_end()).unwrap()["id"],
+        json!(0)
+    );
+
+    client_in_w.send_and_sync_queued(
+        concat!(
+            r#"{"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":-0}}"#,
+            "\n",
+            r#"{"jsonrpc":"2.0","id":1,"method":"ping"}"#,
+            "\n",
+        )
+        .as_bytes(),
+    );
+    assert!(
+        up_in_rx.try_recv().is_err(),
+        "requestId: -0 must not cancel active id: 0 or reach upstream"
+    );
+
+    writeln!(
+        up_out_w,
+        r#"{{"jsonrpc":"2.0","id":0,"result":{{"pong":0}}}}"#
+    )
+    .unwrap();
+    let r0 = client_out_r.read_line_timeout(Duration::from_secs(2), "resp 0");
+    assert_eq!(
+        serde_json::from_str::<Value>(r0.trim_end()).unwrap()["id"],
+        json!(0)
+    );
+
+    // 3. Upstream reply with 1.0 matches client plain safe-integer id: 1 cleanly.
+    let f1 = String::from_utf8(up_in_rx.recv_timeout(Duration::from_secs(2)).unwrap()).unwrap();
+    assert_eq!(
+        serde_json::from_str::<Value>(f1.trim_end()).unwrap()["id"],
+        json!(1)
+    );
+    writeln!(
+        up_out_w,
+        r#"{{"jsonrpc":"2.0","id":1.0,"result":{{"pong":1}}}}"#
+    )
+    .unwrap();
+    let r1 = client_out_r.read_line_timeout(Duration::from_secs(2), "resp 1 via 1.0");
+    let r1_val: Value = serde_json::from_str(r1.trim_end()).unwrap();
+    assert_eq!(r1_val["result"]["pong"], json!(1));
+
+    drop(client_in_w);
+    drop(up_out_w);
+    done_rx
+        .recv_timeout(Duration::from_secs(2))
+        .expect("proxy exit timed out")
+        .unwrap();
+    proxy_thread.join().unwrap();
+}
+
+#[test]
+fn round9_denies_negative_zero_int_argument_fact_with_receipt() {
+    // tools/call argument `mode: -0` mapped to FactType::Int is denied with receipt & never forwarded.
+    let root_kp = Ed25519Keypair::generate();
+    let agent_kp = Ed25519Keypair::generate();
+    let valid_from = parse_rfc3339_utc("2026-01-01T00:00:00Z").unwrap();
+    let valid_until = parse_rfc3339_utc("2027-01-01T00:00:00Z").unwrap();
+    let now = parse_rfc3339_utc("2026-06-01T00:00:00Z").unwrap();
+    let mandate_text = format!(
+        "HANDFEST v1\n\
+             FROM human \"Admin\" (key: {root})\n\
+             TO agent \"Worker\" (key: {agent})\n\
+             DELEGATION max 0 hops\n\
+             ALLOW ops.run\n\
+             ON target \"prod\"\n\
+             WHERE resource.mode == 0\n",
+        root = root_kp.key_id(),
+        agent = agent_kp.key_id(),
+    );
+    let signed = sign_mandate(&root_kp, &mandate_text, valid_from, valid_until);
+    let verified = verify_mandate_chain(&[signed]).unwrap();
+    let policy_map = ToolPolicyMap::from_json_str(
+        r#"{
+            "tools": {
+                "run_op": {
+                    "action": "ops.run",
+                    "resource_kind": "target",
+                    "static_resource_id": "prod",
+                    "arg_facts": {
+                        "mode": { "field": "resource.mode", "type": "int" }
+                    }
+                }
+            }
+        }"#,
+    )
+    .unwrap();
+    let mut mode_proxy = McpProxy::new(
+        verified,
+        agent_kp.key_id(),
+        policy_map,
+        SqliteLedger::open_in_memory().unwrap(),
+        FixedClock::new(now),
+    )
+    .unwrap();
+
+    let (mut client_in_w, client_in_r) = mem_pipe();
+    let (mut client_out_w, mut client_out_r) = mem_pipe_timeout();
+    let (up_in_w, mut up_in_r) = mem_pipe_timeout();
+    let (mut up_out_w, up_out_r) = mem_pipe();
+    let (done_tx, done_rx) = mpsc::sync_channel(1);
+    let handle = thread::spawn(move || {
+        let res = mode_proxy.run(client_in_r, &mut client_out_w, up_in_w, up_out_r);
+        let _ = done_tx.send((mode_proxy, res));
+    });
+
+    writeln!(
+        client_in_w,
+        r#"{{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{{"name":"run_op","arguments":{{"mode":-0}}}}}}"#
+    )
+    .unwrap();
+    let denied_line = client_out_r.read_line_timeout(Duration::from_secs(2), "mode -0 denial");
+    let denied: Value = serde_json::from_str(denied_line.trim_end()).unwrap();
+    assert_eq!(denied["id"], json!(1));
+    assert_eq!(denied["error"]["code"], json!(-32001));
+    assert!(denied["error"]["data"]["receipt_hash"].is_string());
+
+    writeln!(
+        client_in_w,
+        r#"{{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{{"name":"run_op","arguments":{{"mode":0}}}}}}"#
+    )
+    .unwrap();
+    let fwd_line = up_in_r.read_line_timeout(Duration::from_secs(2), "mode 0 forwarded");
+    let fwd: Value = serde_json::from_str(fwd_line.trim_end()).unwrap();
+    assert_eq!(fwd["id"], json!(2));
+
+    writeln!(
+        up_out_w,
+        r#"{{"jsonrpc":"2.0","id":2.0,"result":{{"ok":true}}}}"#
+    )
+    .unwrap();
+    let ok_line = client_out_r.read_line_timeout(Duration::from_secs(2), "mode 0 reply");
+    let ok_val: Value = serde_json::from_str(ok_line.trim_end()).unwrap();
+    assert_eq!(ok_val["result"]["ok"], json!(true));
+
+    drop(client_in_w);
+    drop(up_out_w);
+    let (mode_proxy, res) = done_rx
+        .recv_timeout(Duration::from_secs(2))
+        .expect("mode proxy exit timed out");
+    handle.join().unwrap();
+    res.expect("mode: -0 denied cleanly and mode: 0 permitted with 2.0 reply");
+    assert_eq!(mode_proxy.ledger().verify_integrity().unwrap(), 2);
 }

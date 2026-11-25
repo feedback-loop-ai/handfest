@@ -365,12 +365,12 @@ fn build_receipt(
     receipt
 }
 
-fn evaluate_chain(
+/// Verifies runtime chain validity at `now` for `actor_key`: non-empty chain, valid RFC 3339
+/// timestamp bounds, root absence of `PARENT`, per-hop anchor proof bindings and validity
+/// windows, monotonic lattice attenuation across hops, and leaf `TO` key match.
+pub fn verify_chain_runtime(
     chain: &[VerifiedMandate],
-    chain_ids: &[MandateId],
-    request: &ActionRequest,
-    facts: &VerifiedFacts,
-    usage: &QuotaSnapshot,
+    actor_key: &KeyId,
     now: i64,
 ) -> Result<(), String> {
     if chain.is_empty() {
@@ -389,13 +389,24 @@ fn evaluate_chain(
     verify_attenuation(chain)?;
 
     let leaf = &chain[chain.len() - 1];
-    if leaf.ast.to().key() != &request.actor_key {
+    if leaf.ast.to().key() != actor_key {
         return Err(format!(
-            "request actor key {} does not match leaf mandate TO key {}",
-            request.actor_key,
+            "request actor key {actor_key} does not match leaf mandate TO key {}",
             leaf.ast.to().key()
         ));
     }
+    Ok(())
+}
+
+fn evaluate_chain(
+    chain: &[VerifiedMandate],
+    chain_ids: &[MandateId],
+    request: &ActionRequest,
+    facts: &VerifiedFacts,
+    usage: &QuotaSnapshot,
+    now: i64,
+) -> Result<(), String> {
+    verify_chain_runtime(chain, &request.actor_key, now)?;
 
     if !is_valid_concrete_action(&request.action) {
         return Err(format!(
@@ -656,4 +667,94 @@ fn evaluate_quota(
 
 fn is_valid_concrete_action(action: &str) -> bool {
     !action.is_empty() && action.split('.').all(is_valid_ident)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ast::{MAX_RFC3339_TIMESTAMP, MIN_RFC3339_TIMESTAMP};
+    use crate::cnl::parse_mandate;
+
+    fn key(suffix: &str) -> KeyId {
+        KeyId::parse(&format!("ed25519:{suffix}")).unwrap()
+    }
+
+    fn make_vm(text: &str, signer: &str, kind: ActorKind, win: (i64, i64)) -> VerifiedMandate {
+        VerifiedMandate {
+            ast: parse_mandate(text).unwrap(),
+            proof: VerifiedAnchorProof {
+                anchor_id: "test-anchor".into(),
+                assurance: AssuranceLevel::LocalKey,
+                signer_key: key(signer),
+                actor_kind: kind,
+                valid_from: win.0,
+                valid_until: win.1,
+            },
+        }
+    }
+
+    #[test]
+    fn verify_chain_runtime_checks_all_invariants() {
+        let root_text = "HANDFEST v1\n\
+             FROM human \"Root\" (key: ed25519:aaaa)\n\
+             TO agent \"Leaf\" (key: ed25519:bbbb)\n\
+             DELEGATION max 1 hops\n\
+             ALLOW git.pr.*\n\
+             ON repo \"org/*\"\n";
+        let vm = make_vm(root_text, "aaaa", ActorKind::Human, (100, 200));
+        let single = core::slice::from_ref(&vm);
+        let leaf = key("bbbb");
+        let sub = key("cccc");
+
+        assert_eq!(verify_chain_runtime(single, &leaf, 150), Ok(()));
+        assert_eq!(
+            verify_chain_runtime(&[], &leaf, 150),
+            Err("empty mandate chain".into())
+        );
+        for bad_ts in [MIN_RFC3339_TIMESTAMP - 1, MAX_RFC3339_TIMESTAMP + 1] {
+            let err = verify_chain_runtime(single, &leaf, bad_ts).unwrap_err();
+            assert!(err.contains("outside 0000-01-01T00:00:00Z..=9999-12-31T23:59:59Z"));
+        }
+        assert!(verify_chain_runtime(single, &sub, 150)
+            .unwrap_err()
+            .contains("does not match leaf mandate TO key"));
+        assert!(verify_chain_runtime(single, &leaf, 200)
+            .unwrap_err()
+            .contains("outside anchor proof validity window"));
+
+        let bad_signer = make_vm(root_text, "dddd", ActorKind::Human, (100, 200));
+        assert!(verify_chain_runtime(&[bad_signer], &leaf, 150)
+            .unwrap_err()
+            .contains("proof signer key"));
+        let bad_kind = make_vm(root_text, "aaaa", ActorKind::Agent, (100, 200));
+        assert!(verify_chain_runtime(&[bad_kind], &leaf, 150)
+            .unwrap_err()
+            .contains("proof actor kind"));
+        let bad_window = make_vm(root_text, "aaaa", ActorKind::Human, (200, 200));
+        assert!(verify_chain_runtime(&[bad_window], &leaf, 200)
+            .unwrap_err()
+            .contains("invalid anchor proof validity window"));
+
+        let pid = vm.ast.mandate_id();
+        let child_vm = |allow: &str| {
+            let text = format!(
+                "HANDFEST v1\nPARENT {pid}\nFROM agent \"Leaf\" (key: ed25519:bbbb)\n\
+                 TO agent \"Sub\" (key: ed25519:cccc)\nDELEGATION max 0 hops\n\
+                 ALLOW {allow}\nON repo \"org/app\"\n"
+            );
+            make_vm(&text, "bbbb", ActorKind::Agent, (100, 200))
+        };
+        let valid_child = child_vm("git.pr.merge");
+        assert_eq!(
+            verify_chain_runtime(core::slice::from_ref(&valid_child), &sub, 150),
+            Err("root mandate must not declare a PARENT digest".into())
+        );
+        assert_eq!(
+            verify_chain_runtime(&[vm.clone(), valid_child], &sub, 150),
+            Ok(())
+        );
+        assert!(verify_chain_runtime(&[vm, child_vm("git.*")], &sub, 150)
+            .unwrap_err()
+            .contains("attenuation check failed"));
+    }
 }

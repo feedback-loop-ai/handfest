@@ -3,7 +3,7 @@
 use std::fmt;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use handfest_anchors::{AnchorError, AnchorVerifier, Ed25519Verifier, SignedMandate};
+use handfest_anchors::{AnchorError, AnchorRegistry, AnchorVerifier, SignedMandate};
 use handfest_core::ast::MandateId;
 use handfest_core::gate::VerifiedMandate;
 use handfest_core::lattice::subsumes;
@@ -153,9 +153,9 @@ pub fn verify_mandate_chain_with<V: AnchorVerifier + ?Sized>(
     Ok(verified)
 }
 
-/// Convenience wrapper verifying an Ed25519-signed mandate chain via [`Ed25519Verifier`].
+/// Convenience wrapper verifying a mandate chain via [`AnchorRegistry::default_registry`].
 pub fn verify_mandate_chain(signed: &[SignedMandate]) -> Result<Vec<VerifiedMandate>, ProxyError> {
-    verify_mandate_chain_with(&Ed25519Verifier, signed)
+    verify_mandate_chain_with(&AnchorRegistry::default_registry(), signed)
 }
 
 pub(crate) fn validate_verified_chain(

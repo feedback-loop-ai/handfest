@@ -1,5 +1,6 @@
 //! Pluggable cryptographic and regulatory trust-anchor verifiers for `handfest`.
 
+use std::collections::BTreeMap;
 use std::fmt;
 
 use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
@@ -49,6 +50,7 @@ pub enum AnchorError {
         expected: String,
         actual: String,
     },
+    UnsupportedKeyScheme(String),
     EmptyChain,
     ChainHop {
         hop: usize,
@@ -89,6 +91,9 @@ impl fmt::Display for AnchorError {
             ),
             Self::KeyIdMismatch { expected, actual } => {
                 write!(f, "key_id mismatch in key file: derived '{expected}', file has '{actual}'")
+            }
+            Self::UnsupportedKeyScheme(scheme) => {
+                write!(f, "unsupported anchor key scheme '{scheme}'")
             }
             Self::EmptyChain => f.write_str("mandate chain must contain at least one mandate"),
             Self::ChainHop { hop, source } => write!(f, "chain hop {hop}: {source}"),
@@ -266,6 +271,62 @@ pub struct Ed25519Verifier;
 impl AnchorVerifier for Ed25519Verifier {
     fn verify(&self, signed: &SignedMandate) -> Result<VerifiedMandate, AnchorError> {
         verify_ed25519(signed)
+    }
+}
+
+/// Additive registry mapping `KeyId` schemes to pluggable [`AnchorVerifier`] implementations.
+///
+/// Fails closed with [`AnchorError::UnsupportedKeyScheme`] for any unregistered scheme and
+/// [`AnchorError::InvalidPublicKey`] for malformed `signer_key` values.
+#[derive(Default)]
+pub struct AnchorRegistry {
+    verifiers: BTreeMap<String, Box<dyn AnchorVerifier + Send + Sync>>,
+}
+
+impl fmt::Debug for AnchorRegistry {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let schemes: Vec<&str> = self.verifiers.keys().map(String::as_str).collect();
+        f.debug_struct("AnchorRegistry")
+            .field("schemes", &schemes)
+            .finish()
+    }
+}
+
+impl AnchorRegistry {
+    /// Creates an empty, fail-closed [`AnchorRegistry`].
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Creates a registry pre-populated with the built-in trust-anchor verifiers (`ed25519`).
+    #[must_use]
+    pub fn default_registry() -> Self {
+        let mut registry = Self::new();
+        registry.register("ed25519", Ed25519Verifier);
+        registry
+    }
+
+    /// Registers a verifier for `KeyId` `scheme`, replacing any prior verifier for that scheme.
+    pub fn register<V>(&mut self, scheme: impl Into<String>, verifier: V) -> &mut Self
+    where
+        V: AnchorVerifier + Send + Sync + 'static,
+    {
+        self.verifiers.insert(scheme.into(), Box::new(verifier));
+        self
+    }
+}
+
+impl AnchorVerifier for AnchorRegistry {
+    fn verify(&self, signed: &SignedMandate) -> Result<VerifiedMandate, AnchorError> {
+        let key_id = KeyId::parse(&signed.signer_key).map_err(|err| {
+            AnchorError::InvalidPublicKey(format!("invalid KeyId '{}': {err}", signed.signer_key))
+        })?;
+        let verifier = self
+            .verifiers
+            .get(key_id.scheme())
+            .ok_or_else(|| AnchorError::UnsupportedKeyScheme(key_id.scheme().to_string()))?;
+        verifier.verify(signed)
     }
 }
 
@@ -480,4 +541,118 @@ fn decode_lower_hex_fixed<const N: usize>(input: &str) -> Result<[u8; N], String
     let mut out = [0u8; N];
     hex::decode_to_slice(input, &mut out).map_err(|err| err.to_string())?;
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use handfest_core::ast::parse_rfc3339_utc;
+    use handfest_core::cnl::{parse_mandate, try_render_canonical};
+
+    struct StubPasskeyVerifier;
+
+    impl AnchorVerifier for StubPasskeyVerifier {
+        fn verify(&self, signed: &SignedMandate) -> Result<VerifiedMandate, AnchorError> {
+            let ast = parse_canonical(&signed.canonical_words)
+                .map_err(AnchorError::NonCanonicalMandate)?;
+            let signer_key = KeyId::parse(&signed.signer_key)
+                .map_err(|err| AnchorError::InvalidPublicKey(format!("invalid KeyId: {err}")))?;
+            Ok(VerifiedMandate {
+                ast,
+                proof: VerifiedAnchorProof {
+                    anchor_id: signed.anchor_id.clone(),
+                    assurance: AssuranceLevel::Passkey,
+                    signer_key,
+                    actor_kind: ActorKind::Human,
+                    valid_from: signed.valid_from,
+                    valid_until: signed.valid_until,
+                },
+            })
+        }
+    }
+
+    fn sample_signed_ed25519() -> SignedMandate {
+        let root = Ed25519Keypair::generate();
+        let leaf = Ed25519Keypair::generate();
+        let from = parse_rfc3339_utc("2026-01-01T00:00:00Z").unwrap();
+        let until = parse_rfc3339_utc("2027-01-01T00:00:00Z").unwrap();
+        let ast = parse_mandate(&format!(
+            "HANDFEST v1\n\
+             FROM human \"Root\" (key: {root})\n\
+             TO agent \"Leaf\" (key: {leaf})\n\
+             DELEGATION max 0 hops\n\
+             ALLOW git.pr.merge\n\
+             ON repo \"org/*\"\n",
+            root = root.key_id(),
+            leaf = leaf.key_id(),
+        ))
+        .unwrap();
+        let canonical = try_render_canonical(&ast).unwrap();
+        root.sign_mandate(&canonical, "anchor-1", from, until)
+            .unwrap()
+    }
+
+    #[test]
+    fn anchor_registry_dispatches_registered_schemes_and_fails_closed() {
+        let signed = sample_signed_ed25519();
+        let mut registry = AnchorRegistry::default_registry();
+        assert!(format!("{registry:?}").contains("ed25519"));
+
+        let verified = registry
+            .verify(&signed)
+            .expect("default registry verifies ed25519");
+        assert_eq!(verified.proof.assurance, AssuranceLevel::LocalKey);
+
+        let mut tampered = signed.clone();
+        tampered.signature_hex = "00".repeat(64);
+        assert!(matches!(
+            registry.verify(&tampered),
+            Err(AnchorError::InvalidSignature(_))
+        ));
+
+        let empty = AnchorRegistry::new();
+        let err = empty.verify(&signed).unwrap_err();
+        assert_eq!(
+            err,
+            AnchorError::UnsupportedKeyScheme("ed25519".to_string())
+        );
+        assert_eq!(err.to_string(), "unsupported anchor key scheme 'ed25519'");
+
+        let mut bad_key = signed.clone();
+        bad_key.signer_key = "missing-colon".to_string();
+        assert!(matches!(
+            registry.verify(&bad_key),
+            Err(AnchorError::InvalidPublicKey(_))
+        ));
+
+        let passkey_ast = parse_mandate(
+            "HANDFEST v1\n\
+             FROM human \"Root\" (key: passkey:cred1)\n\
+             TO agent \"Leaf\" (key: passkey:agent1)\n\
+             DELEGATION max 0 hops\n\
+             ALLOW git.pr.merge\n\
+             ON repo \"org/*\"\n",
+        )
+        .unwrap();
+        let passkey_signed = SignedMandate {
+            canonical_words: try_render_canonical(&passkey_ast).unwrap(),
+            anchor_id: "passkey-1".to_string(),
+            assurance: "passkey".to_string(),
+            actor_kind: "human".to_string(),
+            signer_key: "passkey:cred1".to_string(),
+            valid_from: signed.valid_from,
+            valid_until: signed.valid_until,
+            signature_hex: "00".repeat(64),
+        };
+        assert_eq!(
+            registry.verify(&passkey_signed),
+            Err(AnchorError::UnsupportedKeyScheme("passkey".to_string()))
+        );
+
+        registry.register("passkey", StubPasskeyVerifier);
+        let verified_pk = registry
+            .verify(&passkey_signed)
+            .expect("registered passkey verifier succeeds");
+        assert_eq!(verified_pk.proof.assurance, AssuranceLevel::Passkey);
+    }
 }

@@ -12,7 +12,10 @@ use handfest_core::ast::{
 use handfest_core::gate::{ActionRequest, VerifiedFacts};
 use serde::{Deserialize, Serialize};
 
-use crate::exact_json::{parse_decimal_str, parse_exact_json, parse_json_decimal, ExactJson};
+use crate::exact_json::{
+    is_canonical_json_int_syntax, parse_canonical_json_int, parse_decimal_str, parse_exact_json,
+    parse_json_decimal, ExactJson,
+};
 use crate::framing::{find_case_colliding_keys, find_non_ascii_key};
 
 /// Expected scalar type for an argument-derived fact.
@@ -528,16 +531,14 @@ fn parse_arg_scalar(
         }
         (FactType::Bool, ExactJson::Bool(b)) => Scalar::Bool(*b),
         (FactType::Int, ExactJson::Number(raw)) => {
-            if raw.contains(['.', 'e', 'E']) {
-                return Err(invalid_arg(
-                    tool_name,
-                    arg_key,
-                    "expected 64-bit signed integer",
-                ));
-            }
-            let parsed = raw
-                .parse::<i64>()
-                .map_err(|_| invalid_arg(tool_name, arg_key, "integer outside 64-bit range"))?;
+            let parsed = parse_canonical_json_int(raw).ok_or_else(|| {
+                let detail = if is_canonical_json_int_syntax(raw) {
+                    "integer outside 64-bit range"
+                } else {
+                    "expected 64-bit signed integer"
+                };
+                invalid_arg(tool_name, arg_key, detail)
+            })?;
             Scalar::Int(parsed)
         }
         (FactType::Decimal, ExactJson::Number(raw)) => {
@@ -679,11 +680,19 @@ mod tests {
         }"#;
         let map = ToolPolicyMap::from_json_str(json).unwrap();
 
-        // Wrong type: float given for int
+        // Wrong type: float and negative zero given for int
         assert!(matches!(
             map.map_call_json(&test_actor(), "pay", Some(r#"{"acct":"a1","count":1.5}"#)),
             Err(MappingError::InvalidArgumentFact { .. })
         ));
+        assert!(matches!(
+            map.map_call_json(&test_actor(), "pay", Some(r#"{"acct":"a1","count":-0}"#)),
+            Err(MappingError::InvalidArgumentFact { .. })
+        ));
+        let (_, zero_facts) = map
+            .map_call_json(&test_actor(), "pay", Some(r#"{"acct":"a1","count":0}"#))
+            .unwrap();
+        assert_eq!(zero_facts.get("resource.count"), Some(&Scalar::Int(0)));
         // Missing arg fact
         assert!(matches!(
             map.map_call_json(&test_actor(), "pay", Some(r#"{"acct":"a1"}"#)),

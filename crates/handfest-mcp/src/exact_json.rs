@@ -90,8 +90,8 @@ pub(crate) enum CanonicalJsonNumber {
 
 /// Normalizes a valid RFC 8259 JSON number token for exact numeric equivalence (no `f64`).
 ///
-/// Both JSON-RPC numeric ID comparison and exact `Decimal` fact parsing share this single
-/// normalization path so exponent/significand semantics can never drift.
+/// Both upstream JSON-RPC numeric response ID matching and exact `Decimal` fact parsing share this
+/// single normalization path so exponent/significand semantics can never drift.
 pub(crate) fn canonicalize_json_number(raw: &str) -> Result<CanonicalJsonNumber, NumberError> {
     let (mant_part, exp_str) = split_exponent(raw)?;
     let (neg, unsigned_mant) = match mant_part.strip_prefix('-') {
@@ -148,9 +148,29 @@ pub(crate) fn canonicalize_json_number(raw: &str) -> Result<CanonicalJsonNumber,
     })
 }
 
-/// Returns `true` when `raw` is a JSON integer literal representable as a signed 64-bit integer.
+/// Returns `true` when `raw` matches strict canonical base-10 integer grammar `^(0|-?[1-9][0-9]*)$`.
+pub(crate) fn is_canonical_json_int_syntax(raw: &str) -> bool {
+    if raw == "0" {
+        return true;
+    }
+    let digits = raw.strip_prefix('-').unwrap_or(raw);
+    matches!(digits.as_bytes(), [first @ b'1'..=b'9', rest @ ..] if rest.iter().all(u8::is_ascii_digit))
+}
+
+/// Parses a strict canonical base-10 JSON integer (`^(0|-?[1-9][0-9]*)$`) into `i64`.
+///
+/// Rejects `"-0"`, `"+1"`, leading zeros (`"00"`, `"-01"`), fractional parts, exponents, and
+/// values outside `i64::MIN..=i64::MAX`.
+pub(crate) fn parse_canonical_json_int(raw: &str) -> Option<i64> {
+    if !is_canonical_json_int_syntax(raw) {
+        return None;
+    }
+    raw.parse::<i64>().ok()
+}
+
+/// Returns `true` when `raw` is a canonical JSON integer literal representable as a signed 64-bit integer.
 pub(crate) fn is_valid_json_int(raw: &str) -> bool {
-    !raw.contains(['.', 'e', 'E']) && raw.parse::<i64>().is_ok()
+    parse_canonical_json_int(raw).is_some()
 }
 
 /// Appends `s` as a valid RFC 8259 single-line JSON string literal (escaping all control chars).
@@ -590,5 +610,52 @@ mod tests {
             parse_exact_json(&depth_129).unwrap_err(),
             "JSON nesting depth exceeded"
         );
+    }
+
+    #[test]
+    fn parse_canonical_json_int_enforces_strict_grammar_and_rejects_negative_zero() {
+        assert_eq!(parse_canonical_json_int("0"), Some(0));
+        assert_eq!(parse_canonical_json_int("1"), Some(1));
+        assert_eq!(parse_canonical_json_int("-1"), Some(-1));
+        assert_eq!(
+            parse_canonical_json_int("9223372036854775807"),
+            Some(i64::MAX)
+        );
+        assert_eq!(
+            parse_canonical_json_int("-9223372036854775808"),
+            Some(i64::MIN)
+        );
+        assert!(is_valid_json_int("0"));
+        assert!(is_valid_json_int("-32601"));
+
+        for invalid in [
+            "-0",
+            "+0",
+            "+1",
+            "00",
+            "01",
+            "-00",
+            "-01",
+            "1.0",
+            "-0.0",
+            "1e0",
+            "1E0",
+            "",
+            "-",
+            " 1",
+            "1 ",
+            "9223372036854775808",
+            "-9223372036854775809",
+        ] {
+            assert_eq!(
+                parse_canonical_json_int(invalid),
+                None,
+                "invalid canonical integer '{invalid}' must be rejected"
+            );
+            assert!(
+                !is_valid_json_int(invalid),
+                "is_valid_json_int must reject '{invalid}'"
+            );
+        }
     }
 }

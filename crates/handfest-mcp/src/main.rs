@@ -8,7 +8,7 @@ use std::thread;
 use std::time::Duration;
 
 use clap::Parser;
-use handfest_anchors::{AnchorVerifier, Ed25519Verifier, SignedMandate};
+use handfest_anchors::{AnchorRegistry, SignedMandate};
 use handfest_core::ast::{parse_rfc3339_utc, KeyId};
 use handfest_ledger::SqliteLedger;
 use handfest_mcp::{
@@ -105,10 +105,6 @@ impl Drop for ChildGuard {
     }
 }
 
-fn default_anchor_verifier() -> impl AnchorVerifier {
-    Ed25519Verifier
-}
-
 fn main() -> ExitCode {
     let cli = Cli::parse();
     match run(cli) {
@@ -130,7 +126,7 @@ fn run(cli: Cli) -> Result<(), String> {
     }
 
     let signed_chain = load_signed_mandates(&cli.chain)?;
-    let verifier = default_anchor_verifier();
+    let verifier = AnchorRegistry::default_registry();
     let verified_chain = verify_mandate_chain_with(&verifier, &signed_chain)
         .map_err(|err| format!("startup mandate chain verification failed: {err}"))?;
 
