@@ -1,21 +1,22 @@
 {
   "tools": {
-    "github_merge_pr": {
+    "merge_pull_request": {
       "action": "git.pr.merge",
       "resource_kind": "repo",
-      "resource_id_arg": "repository",
+      "resource_id_arg": "repo",
       "arg_facts": {
-        "pr_number": {
+        "owner": {
+          "field": "resource.owner",
+          "type": "str"
+        },
+        "pull_number": {
           "field": "resource.pr",
           "type": "int"
         }
       },
       "static_facts": {
-        "resource.author": {
-          "str": "valentin"
-        },
-        "resource.ci_status": {
-          "str": "passing"
+        "resource.environment": {
+          "str": "staging"
         }
       }
     }

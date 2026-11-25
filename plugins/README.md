@@ -2,6 +2,8 @@
 
 Thin, declarative, configuration-over-code integrations for vesting bounded `HANDFEST v1` authority into AI harnesses — **Claude Code**, **Codex**, **`dsh`**, and **Antigravity (`agy`)** — with zero harness-specific Rust code in `crates/`.
 
+> **Binary availability:** The `handfest` CLI (`handfest keygen`, `fmt`, `sign`, `verify`, `check`, `audit`) ships on `main` (`crates/handfest-cli`). The `handfest-mcp` stdio JSON-RPC 2.0 proxy ships with the MCP proxy crate (`crates/handfest-mcp`).
+
 ## Architecture & Trust Boundary
 
 ```text
@@ -19,19 +21,21 @@ Thin, declarative, configuration-over-code integrations for vesting bounded `HAN
       - Inspects canonical HANDFEST v1 text verbatim
       - Signs with `handfest sign` -> SignedMandate JSON
                           |
-                          v  (signed chain + public actor KeyId + ToolPolicyMap)
+                          v  (signed chain + public actor KeyId + ToolPolicyMap
+                              stored outside the agent-writable workspace)
   [3. OUTSIDE THE MODEL — Deterministic Fail-Closed Gate]
     Option A (all 4 harnesses): `handfest-mcp` stdio JSON-RPC 2.0 proxy
       - Filters `tools/list` to granted tools
       - Maps `tools/call` via `ToolPolicyMap` + host clock + static facts
       - Evaluates chain via `handfest-core`, updates atomic quotas & hash-chained
         receipts in `handfest-ledger`, denies with JSON-RPC `-32001`
-    Option B (Claude Code hooks): `plugins/claude-code/hooks/pre-tool-use.sh`
-      - Reads Claude Code `PreToolUse` JSON stdin
+    Option B (Claude Code non-MCP hooks): `plugins/claude-code/hooks/pre-tool-use.sh`
+      - Installed outside the workspace (e.g. `/path/to/handfest-config/hooks/pre-tool-use.sh`)
+      - Reads Claude Code `PreToolUse` JSON stdin for scoped non-MCP tools
       - Maps via the exact same `ToolPolicyMap` schema (`HANDFEST_POLICY_MAP`)
-      - Invokes `handfest check`; exits `0` ONLY on Permit, exits `2` + structured
-        JSON deny payload on stderr for any Deny, unmapped tool, malformed input,
-        or missing configuration
+      - Invokes `handfest check`; exits `0` ONLY on Permit with a valid `sha256:` receipt,
+        exits `2` + structured JSON deny payload on stderr for any Deny, unmapped tool,
+        malformed input, or missing configuration
                           |
                           v
   [4. TAMPER-EVIDENT AUDIT]
@@ -45,32 +49,36 @@ Both `handfest-mcp --policy-map` and `plugins/claude-code/hooks/pre-tool-use.sh`
 - `tools.<tool_name>.action`: concrete `HANDFEST v1` action (e.g. `git.pr.merge`).
 - `tools.<tool_name>.resource_kind`: resource kind identifier (e.g. `repo`).
 - Exactly one of `resource_id_arg` (argument name in tool call) or `static_resource_id`.
-- `arg_facts`: map from tool argument name to `{"field": "<field.path>", "type": "str|int|decimal|bool|timestamp"}`.
-- `static_facts`: operator-supplied typed facts (`{"str": ...}`, `{"int": ...}`, `{"decimal": "..."}`, `{"bool": ...}`, `{"timestamp": "..."}`) that **always override** model-supplied `arg_facts`.
+- `arg_facts`: map from tool argument name to `{"field": "<field.path>", "type": "str|int|decimal|bool|timestamp"}` (or exact PascalCase `Str|Int|Decimal|Bool|Timestamp`).
+- `static_facts`: strictly for **genuinely static operator-pinned constants** (`{"str": ...}`, `{"int": ...}`, `{"decimal": "..."}`, `{"bool": ...}`, `{"timestamp": "..."}`), such as `"resource.environment": {"str": "staging"}`. Operator `static_facts` **always override** model-supplied `arg_facts`.
+  - **Never hardcode dynamic runtime facts** (such as `resource.ci_status` or live PR approval counts) in `static_facts`; dynamic facts must be queried and injected by a trusted broker outside the model.
 - `context.time` is always supplied by the host clock and can never be overridden by tool arguments or static facts.
+
+[`policy-map.example.json`](policy-map.example.json) maps `@modelcontextprotocol/server-github`'s `merge_pull_request` tool (`repo`, `owner`, `pull_number`) to `git.pr.merge` on `repo` with `resource.owner`, `resource.pr`, and operator-pinned `resource.environment: "staging"`. Copy the policy map, hook script, signed mandates, and SQLite ledger to an outside-workspace directory (e.g. `/path/to/handfest-config/`) that the agent cannot modify.
 
 ## Harness Quickstarts
 
 ### Claude Code ([`plugins/claude-code/`](claude-code/))
 
-- **Hook (`PreToolUse`):** Export `HANDFEST_POLICY_MAP`, `HANDFEST_LEDGER`, `HANDFEST_CHAIN` (colon-separated root-to-leaf signed mandates), and `HANDFEST_ACTOR_KEY` (agent public `KeyId`), then merge `hooks` from [`claude-code/settings.example.json`](claude-code/settings.example.json) into `.claude/settings.json`.
-- **MCP proxy:** Merge `mcpServers` from [`claude-code/settings.example.json`](claude-code/settings.example.json) to wrap any upstream MCP server via `handfest-mcp`.
+- **Non-MCP Hook (`PreToolUse`):** Copy [`pre-tool-use.sh`](claude-code/hooks/pre-tool-use.sh) and your non-MCP `ToolPolicyMap` to an outside-workspace location (`/path/to/handfest-config/`), export `HANDFEST_POLICY_MAP`, `HANDFEST_LEDGER`, `HANDFEST_CHAIN` (colon-separated root-to-leaf signed mandates), and `HANDFEST_ACTOR_KEY` (agent public `KeyId`), then merge [`claude-code/settings.example.json`](claude-code/settings.example.json) into `.claude/settings.json`.
+  - Scope `PreToolUse` `matcher` to explicit non-MCP tools (e.g. `"Bash|Write|Edit"`) rather than `".*"` so MCP tools already gated by `handfest-mcp` are never double-gated or double-charged in the SQLite ledger.
+- **MCP proxy (`.mcp.json`):** Copy [`claude-code/mcp.example.json`](claude-code/mcp.example.json) into your project's `.mcp.json` (separate from `.claude/settings.json`) to wrap upstream MCP servers via `handfest-mcp` using outside-workspace config paths.
 - **Drafting & audit skill:** Install [`claude-code/SKILL.md`](claude-code/SKILL.md) as a Claude Code `/handfest` skill.
 
 ### Codex ([`plugins/codex/`](codex/))
 
-- Copy the `[mcp_servers.*]` stanza from [`codex/config.example.toml`](codex/config.example.toml) into `~/.codex/config.toml` or `.codex/config.toml`.
+- Copy the `[mcp_servers.*]` stanza from [`codex/config.example.toml`](codex/config.example.toml) into `~/.codex/config.toml` or `.codex/config.toml` with outside-workspace `/path/to/handfest-config/...` paths.
 - See [`codex/README.md`](codex/README.md) for the full keygen, signing, and audit workflow.
 
 ### `dsh` ([`plugins/dsh/`](dsh/))
 
-- Copy [`dsh/mcp.example.json`](dsh/mcp.example.json) into your `dsh` MCP configuration.
+- Copy [`dsh/mcp.example.json`](dsh/mcp.example.json) into your `dsh` MCP configuration with outside-workspace `/path/to/handfest-config/...` paths.
 - See [`dsh/README.md`](dsh/README.md) for setup and audit commands.
 
 ### Antigravity / `agy` ([`plugins/agy/`](agy/))
 
 - Install [`agy/SKILL.md`](agy/SKILL.md) under `.gemini/antigravity/skills/handfest/SKILL.md` (or `~/.gemini/antigravity/skills/handfest/SKILL.md`) for `/handfest` drafting, `handfest fmt` WYSIWYS handoff, and `handfest audit`.
-- Configure MCP wrapping using [`agy/mcp.example.json`](agy/mcp.example.json).
+- Configure MCP wrapping using [`agy/mcp.example.json`](agy/mcp.example.json) with outside-workspace `/path/to/handfest-config/...` paths.
 
 ## Verification
 

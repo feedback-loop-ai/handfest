@@ -13,7 +13,7 @@ This plugin configures OpenAI Codex to route MCP tool calls through `handfest-mc
 
 ## Setup
 
-1. Ensure `handfest` and `handfest-mcp` are on your `PATH`.
+1. Ensure `handfest` (`crates/handfest-cli` on `main`) and `handfest-mcp` (`crates/handfest-mcp`) are on your `PATH`.
 2. Out-of-band (human terminal), generate keys and sign a mandate:
    ```bash
    handfest keygen --out ~/.handfest/human.key.json
@@ -26,7 +26,7 @@ This plugin configures OpenAI Codex to route MCP tool calls through `handfest-mc
      --valid-until 2026-11-25T01:00:00Z \
      --out /path/to/mandates/root.signed.json
    ```
-3. Copy `plugins/policy-map.example.json` and map each admitted MCP tool to its `HANDFEST v1` `(action, resource_kind, resource_id, facts)`.
+3. Copy `plugins/policy-map.example.json` outside the agent-writable workspace (e.g. `/path/to/handfest-config/policy-map.json`) and map each admitted MCP tool to its `HANDFEST v1` `(action, resource_kind, resource_id, facts)`.
 4. Merge [`config.example.toml`](config.example.toml) into `~/.codex/config.toml` (or project `.codex/config.toml`) with your real `--chain`, `--ledger`, `--actor-key` (public `ed25519:<hex>`), and `--policy-map` paths.
    - For multi-hop delegation chains, pass ordered files after `--chain` (root first, leaf last):
      `"--chain", "/path/to/root.signed.json", "/path/to/leaf.signed.json"`.

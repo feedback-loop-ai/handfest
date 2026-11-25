@@ -9,7 +9,7 @@ This plugin wraps upstream MCP servers in `dsh` behind `handfest-mcp` so every t
 
 ## Setup
 
-1. Ensure `handfest` and `handfest-mcp` are installed and on `PATH`.
+1. Ensure `handfest` (`crates/handfest-cli` on `main`) and `handfest-mcp` (`crates/handfest-mcp`) are installed and on `PATH`.
 2. Out-of-band, create keys and sign a `HANDFEST v1` mandate for your `dsh` agent's public `KeyId`:
    ```bash
    handfest keygen --out ~/.handfest/human.key.json
@@ -22,7 +22,7 @@ This plugin wraps upstream MCP servers in `dsh` behind `handfest-mcp` so every t
      --valid-until 2026-11-25T01:00:00Z \
      --out /path/to/mandates/root.signed.json
    ```
-3. Customize `plugins/policy-map.example.json` to map each admitted upstream MCP tool to `(action, resource_kind, resource_id, facts)`.
+3. Copy `plugins/policy-map.example.json` outside the agent-writable workspace (e.g. `/path/to/handfest-config/policy-map.json`) and map each admitted upstream MCP tool to `(action, resource_kind, resource_id, facts)`.
 4. Copy [`mcp.example.json`](mcp.example.json) into your `dsh` MCP configuration and replace the placeholder paths and public `--actor-key`.
    - For attenuated multi-hop chains, list all signed mandate files after `--chain` in root-to-leaf order.
 

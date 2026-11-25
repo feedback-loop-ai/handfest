@@ -4,14 +4,15 @@
 # Security invariant:
 #   - Only the agent's PUBLIC KeyId (`ed25519:<hex>`) and signed mandate chain are passed here.
 #   - The human principal's private signing key NEVER enters Codex config or workspace.
+#   - Store the policy map, signed mandates, and ledger strictly outside the agent-writable workspace.
 
 [mcp_servers.github_handfest]
 command = "handfest-mcp"
 args = [
-  "--chain", "/path/to/mandates/root.signed.json",
-  "--ledger", "/path/to/state/handfest-ledger.sqlite",
+  "--chain", "/path/to/handfest-config/mandates/root.signed.json",
+  "--ledger", "/path/to/handfest-config/state/handfest-ledger.sqlite",
   "--actor-key", "ed25519:<agent-public-key-hex>",
-  "--policy-map", "/path/to/handfest/plugins/policy-map.example.json",
+  "--policy-map", "/path/to/handfest-config/policy-map.json",
   "--",
   "npx", "-y", "@modelcontextprotocol/server-github"
 ]

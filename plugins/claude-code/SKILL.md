@@ -29,9 +29,11 @@ ON repo "org/repo"
 WHERE context.time >= 2026-11-24T17:00:00Z
   AND context.time < 2026-11-25T01:00:00Z
   AND resource.author == "<principal>"
-  AND resource.ci_status == "passing"
+  AND resource.environment == "staging"
 LIMIT 5 calls
 ```
+
+> Dynamic predicates (such as `resource.ci_status`) must be queried and injected by a trusted broker outside the model — never hardcode dynamic runtime state in `static_facts`.
 
 Ask the human for:
 - Principal name and public `KeyId` (`ed25519:<hex>`)

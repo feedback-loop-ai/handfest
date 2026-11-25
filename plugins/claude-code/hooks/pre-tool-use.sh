@@ -12,7 +12,7 @@
 #   HANDFEST_NOW         Fixed RFC 3339 UTC timestamp (defaults to host UTC clock)
 #
 # Exit codes:
-#   0  ONLY when `handfest check` returns Permit with a valid receipt_hash
+#   0  ONLY when `handfest check` returns Permit with a valid sha256 receipt_hash
 #   2  All denials, unmapped tools, malformed inputs, and config/runtime errors (fail closed)
 
 set -euo pipefail
@@ -23,15 +23,24 @@ if ! command -v python3 >/dev/null 2>&1; then
 fi
 
 PY_CODE="$(cat <<'PY'
-import datetime, decimal, json, os, re, shutil, subprocess, sys, unicodedata
+import datetime, json, os, re, shutil, subprocess, sys, unicodedata
 
-IDENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_-]*$")
-RFC3339_RE = re.compile(r"^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})Z$")
-DECIMAL_RE = re.compile(r"^-?\d+(?:\.\d+)?$")
-DECIMAL_INPUT_RE = re.compile(r"^-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?$")
-I64_MIN, I64_MAX, MAX_DEC_SCALE = -(1 << 63), (1 << 63) - 1, 18
+IDENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_-]*\Z", re.ASCII)
+RFC3339_RE = re.compile(r"^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})Z\Z", re.ASCII)
+DECIMAL_RE = re.compile(r"^-?\d+\.\d+\Z", re.ASCII)
+DECIMAL_INPUT_RE = re.compile(r"^-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?\Z", re.ASCII)
+RECEIPT_HASH_RE = re.compile(r"^sha256:[0-9a-f]{64}\Z", re.ASCII)
+I64_MIN, I64_MAX = -(1 << 63), (1 << 63) - 1
+I128_MIN, I128_MAX = -(1 << 127), (1 << 127) - 1
+MAX_DEC_SCALE = 28
 POLICY_KEYS = {"action", "resource_kind", "resource_id_arg", "static_resource_id", "arg_facts", "static_facts"}
-FACT_TYPES = {"str", "int", "decimal", "bool", "timestamp"}
+FACT_TYPES = {
+    "str": "str", "Str": "str",
+    "int": "int", "Int": "int",
+    "decimal": "decimal", "Decimal": "decimal",
+    "bool": "bool", "Bool": "bool",
+    "timestamp": "timestamp", "Timestamp": "timestamp",
+}
 
 
 class RawNumber(str):
@@ -134,19 +143,52 @@ def parse_i64(raw: RawNumber, code: str, ctx: str) -> int:
 
 
 def parse_decimal(raw: str, code: str, ctx: str) -> str:
-    if len(raw) > 64 or not DECIMAL_INPUT_RE.match(raw):
+    if len(raw) > 128 or not DECIMAL_INPUT_RE.match(raw):
         raise HookError(code, f"{ctx}: invalid decimal '{raw}'")
-    try:
-        d = decimal.Decimal(raw)
-    except decimal.InvalidOperation:
-        raise HookError(code, f"{ctx}: invalid decimal '{raw}'")
-    if not d.is_finite() or d.adjusted() > 38 or d.adjusted() < -MAX_DEC_SCALE:
+    exp = 0
+    mant_part = raw
+    for sep in ("e", "E"):
+        if sep in raw:
+            mant_part, exp_str = raw.split(sep, 1)
+            exp = int(exp_str, 10)
+            break
+    neg = mant_part.startswith("-")
+    unsigned = mant_part[1:] if neg else mant_part
+    if "." in unsigned:
+        int_digits, frac_digits = unsigned.split(".", 1)
+    else:
+        int_digits, frac_digits = unsigned, ""
+    digits = (int_digits + frac_digits).lstrip("0")
+    if not digits:
+        return "0.0"
+    trimmed = digits.rstrip("0")
+    net_exp = exp - len(frac_digits) + (len(digits) - len(trimmed))
+    if net_exp >= 0:
+        if len(trimmed) + net_exp > 39:
+            raise HookError(code, f"{ctx}: decimal out of supported range '{raw}'")
+        acc = int(trimmed, 10) * (10 ** net_exp)
+        scale = 0
+    else:
+        scale = -net_exp
+        if scale > MAX_DEC_SCALE:
+            raise HookError(code, f"{ctx}: decimal scale exceeds {MAX_DEC_SCALE}")
+        if len(trimmed) > 39:
+            raise HookError(code, f"{ctx}: decimal out of supported range '{raw}'")
+        acc = int(trimmed, 10)
+    mantissa = -acc if neg else acc
+    if not (I128_MIN <= mantissa <= I128_MAX):
         raise HookError(code, f"{ctx}: decimal out of supported range '{raw}'")
-    fixed = format(d, "f")
+    sign = "-" if neg else ""
+    s = str(acc)
+    if scale == 0:
+        fixed = f"{sign}{s}.0"
+    elif len(s) <= scale:
+        fixed = f"{sign}0.{'0' * (scale - len(s))}{s}"
+    else:
+        split = len(s) - scale
+        fixed = f"{sign}{s[:split]}.{s[split:]}"
     if not DECIMAL_RE.match(fixed):
         raise HookError(code, f"{ctx}: invalid decimal '{raw}'")
-    if "." in fixed and len(fixed.split(".", 1)[1]) > MAX_DEC_SCALE:
-        raise HookError(code, f"{ctx}: decimal scale exceeds {MAX_DEC_SCALE}")
     return fixed
 
 
@@ -154,7 +196,7 @@ def validate_typed_scalar(field: str, obj, code: str) -> dict:
     if not isinstance(obj, dict) or len(obj) != 1:
         raise HookError(code, f"static fact '{field}': expected single-key typed scalar object")
     tag, val = next(iter(obj.items()))
-    t = tag.lower()
+    t = FACT_TYPES.get(tag)
     if t == "str":
         if type(val) is not str or has_ctrl(val):
             raise HookError(code, f"static fact '{field}': invalid str value")
@@ -216,12 +258,12 @@ def validate_policy(tool: str, pol) -> dict:
         field, ftype = spec["field"], spec["type"]
         if type(field) is not str or not is_dotted_ident(field):
             raise HookError(c, f"tool '{tool}': invalid arg_facts field '{field}'")
-        if type(ftype) is not str or ftype.lower() not in FACT_TYPES:
+        if type(ftype) is not str or ftype not in FACT_TYPES:
             raise HookError(c, f"tool '{tool}': invalid fact type '{ftype}'")
         if field in target_fields:
             raise HookError(c, f"tool '{tool}': duplicate arg_facts target field '{field}'")
         target_fields.add(field)
-        arg_facts[k] = (field, ftype.lower())
+        arg_facts[k] = (field, FACT_TYPES[ftype])
 
     static_raw = pol.get("static_facts", {})
     if not isinstance(static_raw, dict):
@@ -380,14 +422,14 @@ def main() -> None:
 
     cmd = [
         handfest_bin, "check",
-        "--ledger", ledger_path,
-        "--chain", *chain_paths,
-        "--actor-key", actor_key,
-        "--action", pol["action"],
-        "--resource-kind", pol["resource_kind"],
-        "--resource-id", resource_id,
-        "--facts", json.dumps(facts, separators=(",", ":")),
-        "--now", now_utc,
+        f"--ledger={ledger_path}",
+        *(f"--chain={p}" for p in chain_paths),
+        f"--actor-key={actor_key}",
+        f"--action={pol['action']}",
+        f"--resource-kind={pol['resource_kind']}",
+        f"--resource-id={resource_id}",
+        f"--facts={json.dumps(facts, separators=(',', ':'))}",
+        f"--now={now_utc}",
     ]
     try:
         proc = subprocess.run(cmd, stdin=subprocess.DEVNULL, capture_output=True, text=True)
@@ -396,7 +438,12 @@ def main() -> None:
 
     if proc.returncode == 0:
         out = parse_strict_json(proc.stdout, "invalid_gate_output", "handfest check stdout")
-        if isinstance(out, dict) and out.get("verdict") == "permit" and type(out.get("receipt_hash")) is str and out["receipt_hash"]:
+        if (
+            isinstance(out, dict)
+            and out.get("verdict") == "permit"
+            and type(out.get("receipt_hash")) is str
+            and RECEIPT_HASH_RE.match(out["receipt_hash"])
+        ):
             emit_permit(out["receipt_hash"])
         raise HookError("invalid_gate_output", "handfest check exited 0 without valid Permit JSON")
 
@@ -408,7 +455,8 @@ def main() -> None:
         if isinstance(out, dict) and out.get("verdict") == "deny":
             reason = out.get("reason")
             reason_str = reason if isinstance(reason, str) else json.dumps(reason, separators=(",", ":"))
-            rhash = out.get("receipt_hash") if type(out.get("receipt_hash")) is str else None
+            raw_rhash = out.get("receipt_hash")
+            rhash = raw_rhash if type(raw_rhash) is str and RECEIPT_HASH_RE.match(raw_rhash) else None
             raise HookError("mandate_denied", reason_str, receipt_hash=rhash)
 
     detail = (proc.stderr or proc.stdout or f"exit status {proc.returncode}").strip()
@@ -425,7 +473,7 @@ PY
 )"
 
 rc=0
-python3 -c "$PY_CODE" || rc=$?
+python3 -I -c "$PY_CODE" || rc=$?
 if [[ "$rc" -eq 0 ]]; then
   exit 0
 fi
