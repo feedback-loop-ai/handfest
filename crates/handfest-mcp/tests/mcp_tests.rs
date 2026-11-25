@@ -1343,7 +1343,7 @@ fn mapping_failure_receipt_records_mapped_action_and_invalid_empty_object_return
         chain_ids,
         actor_key: agent_kp.key_id(),
         action: "git.pr.merge".to_string(),
-        resource: "repo \"merge_pr\"".to_string(),
+        resource: "repo \"\"".to_string(),
         timestamp: now,
         verdict: Verdict::Deny {
             reason: reason.to_string(),
@@ -1955,7 +1955,7 @@ fn custom_receipt_ledger_and_anchor_verifier_work_without_sqlite_or_ed25519() {
     ));
     let mapping_receipt = &proxy.ledger().receipts[2];
     assert_eq!(mapping_receipt.action, "git.pr.merge");
-    assert_eq!(mapping_receipt.resource, "repo \"merge_pr\"");
+    assert_eq!(mapping_receipt.resource, "repo \"\"");
     assert_eq!(
         mapping_receipt.verdict,
         Verdict::Deny {

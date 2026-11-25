@@ -345,40 +345,80 @@ impl ToolPolicyMap {
     }
 }
 
+pub(crate) enum ResourceIdResolution<'a> {
+    Resolved(&'a str),
+    ControlChars { arg: &'a str, raw: &'a str },
+    NotAString { arg: &'a str },
+    Missing { arg: &'a str },
+    Unconfigured,
+}
+
+pub(crate) fn inspect_resource_id<'a>(
+    policy: &'a ToolPolicy,
+    args_map: Option<&'a BTreeMap<String, ExactJson>>,
+) -> ResourceIdResolution<'a> {
+    if let Some(static_id) = &policy.static_resource_id {
+        return ResourceIdResolution::Resolved(static_id.as_str());
+    }
+    let Some(arg_key) = policy.resource_id_arg.as_deref() else {
+        return ResourceIdResolution::Unconfigured;
+    };
+    let Some(val) = args_map.and_then(|map| map.get(arg_key)) else {
+        return ResourceIdResolution::Missing { arg: arg_key };
+    };
+    let Some(s) = val.as_str() else {
+        return ResourceIdResolution::NotAString { arg: arg_key };
+    };
+    if !is_valid_quoted_str(s) {
+        return ResourceIdResolution::ControlChars {
+            arg: arg_key,
+            raw: s,
+        };
+    }
+    ResourceIdResolution::Resolved(s)
+}
+
+/// Resolves the honest `resource_id` for a pre-gate denial receipt on a mapped tool.
+///
+/// Static IDs and supplied string arguments (including strings containing control characters,
+/// which `build_denial_receipt` safely escapes) are preserved verbatim. Missing or non-string
+/// `resource_id_arg` values record `""` rather than fabricating the tool name.
+pub(crate) fn denial_resource_id(policy: &ToolPolicy, arguments: Option<&ExactJson>) -> String {
+    match inspect_resource_id(policy, arguments.and_then(ExactJson::as_object)) {
+        ResourceIdResolution::Resolved(id) | ResourceIdResolution::ControlChars { raw: id, .. } => {
+            id.to_string()
+        }
+        ResourceIdResolution::NotAString { .. }
+        | ResourceIdResolution::Missing { .. }
+        | ResourceIdResolution::Unconfigured => String::new(),
+    }
+}
+
 fn resolve_resource_id(
     tool_name: &str,
     policy: &ToolPolicy,
     args_map: &BTreeMap<String, ExactJson>,
 ) -> Result<String, MappingError> {
-    if let Some(static_id) = &policy.static_resource_id {
-        return Ok(static_id.clone());
-    }
-    let Some(arg_key) = &policy.resource_id_arg else {
-        return Err(MappingError::InvalidPolicy(format!(
-            "tool '{tool_name}': missing resource_id configuration"
-        )));
-    };
-    let Some(val) = args_map.get(arg_key) else {
-        return Err(MappingError::MissingResourceId {
+    match inspect_resource_id(policy, Some(args_map)) {
+        ResourceIdResolution::Resolved(id) => Ok(id.to_string()),
+        ResourceIdResolution::ControlChars { arg, .. } => Err(MappingError::InvalidResourceId {
             tool: tool_name.to_string(),
-            arg: arg_key.clone(),
-        });
-    };
-    let Some(s) = val.as_str() else {
-        return Err(MappingError::InvalidResourceId {
-            tool: tool_name.to_string(),
-            arg: arg_key.clone(),
-            detail: "expected JSON string".to_string(),
-        });
-    };
-    if !is_valid_quoted_str(s) {
-        return Err(MappingError::InvalidResourceId {
-            tool: tool_name.to_string(),
-            arg: arg_key.clone(),
+            arg: arg.to_string(),
             detail: "must not contain control characters".to_string(),
-        });
+        }),
+        ResourceIdResolution::NotAString { arg } => Err(MappingError::InvalidResourceId {
+            tool: tool_name.to_string(),
+            arg: arg.to_string(),
+            detail: "expected JSON string".to_string(),
+        }),
+        ResourceIdResolution::Missing { arg } => Err(MappingError::MissingResourceId {
+            tool: tool_name.to_string(),
+            arg: arg.to_string(),
+        }),
+        ResourceIdResolution::Unconfigured => Err(MappingError::InvalidPolicy(format!(
+            "tool '{tool_name}': missing resource_id configuration"
+        ))),
     }
-    Ok(s.to_string())
 }
 
 fn build_verified_facts(
@@ -610,6 +650,54 @@ mod tests {
                 r#"{"tools":{"a":{"action":"x.*","resource_kind":"r","static_resource_id":"1"}}}"#
             ),
             Err(MappingError::InvalidPolicy(msg)) if msg.contains("invalid concrete action")
+        ));
+    }
+
+    #[test]
+    fn denial_resource_id_preserves_supplied_strings_and_uses_empty_when_missing() {
+        let arg_policy = ToolPolicy {
+            action: "git.pr.merge".to_string(),
+            resource_kind: "repo".to_string(),
+            resource_id_arg: Some("repo".to_string()),
+            static_resource_id: None,
+            arg_facts: BTreeMap::new(),
+            static_facts: BTreeMap::new(),
+        };
+        assert_eq!(denial_resource_id(&arg_policy, None), "");
+        let missing = parse_exact_json(r#"{}"#).unwrap();
+        assert_eq!(denial_resource_id(&arg_policy, Some(&missing)), "");
+        let non_str = parse_exact_json(r#"{"repo":42}"#).unwrap();
+        assert_eq!(denial_resource_id(&arg_policy, Some(&non_str)), "");
+        let valid = parse_exact_json(r#"{"repo":"acme/app"}"#).unwrap();
+        assert_eq!(denial_resource_id(&arg_policy, Some(&valid)), "acme/app");
+        let ctrl = parse_exact_json(r#"{"repo":"acme/app\ninjected"}"#).unwrap();
+        assert_eq!(
+            denial_resource_id(&arg_policy, Some(&ctrl)),
+            "acme/app\ninjected"
+        );
+
+        let static_policy = ToolPolicy {
+            action: "git.pr.merge".to_string(),
+            resource_kind: "repo".to_string(),
+            resource_id_arg: None,
+            static_resource_id: Some("prod-main".to_string()),
+            arg_facts: BTreeMap::new(),
+            static_facts: BTreeMap::new(),
+        };
+        assert_eq!(denial_resource_id(&static_policy, None), "prod-main");
+
+        let unconfigured = ToolPolicy {
+            action: "git.pr.merge".to_string(),
+            resource_kind: "repo".to_string(),
+            resource_id_arg: None,
+            static_resource_id: None,
+            arg_facts: BTreeMap::new(),
+            static_facts: BTreeMap::new(),
+        };
+        assert_eq!(denial_resource_id(&unconfigured, None), "");
+        assert!(matches!(
+            resolve_resource_id("merge_pr", &unconfigured, &BTreeMap::new()),
+            Err(MappingError::InvalidPolicy(msg)) if msg.contains("missing resource_id configuration")
         ));
     }
 }

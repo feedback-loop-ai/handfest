@@ -5,7 +5,7 @@ use std::fmt;
 use std::io::Write;
 use std::time::Duration;
 
-use handfest_core::ast::{is_valid_quoted_str, is_valid_timestamp, KeyId, MandateId};
+use handfest_core::ast::{is_valid_timestamp, KeyId, MandateId};
 use handfest_core::gate::{ActionRequest, VerifiedMandate};
 use handfest_core::Verdict;
 pub use handfest_ledger::ReceiptLedger;
@@ -20,8 +20,8 @@ use crate::framing::{
     fail_upstream_protocol, write_denied_response, write_jsonrpc_error, write_raw_line, JsonRpcId,
     JSONRPC_INTERNAL_ERROR,
 };
-use crate::mapping::{ToolPolicy, ToolPolicyMap};
-use crate::session::{dispatch_to_upstream, DispatchCtx, PendingKind};
+use crate::mapping::{denial_resource_id, ToolPolicyMap};
+use crate::session::{dispatch_to_upstream, emit_upstream_eof, DispatchCtx, PendingKind};
 
 /// Default maximum JSON-RPC line length in bytes (1 MiB).
 pub const DEFAULT_MAX_LINE_BYTES: usize = 1024 * 1024;
@@ -167,6 +167,10 @@ impl<C: Clock, L: ReceiptLedger> McpProxy<C, L> {
                     );
                 }
             };
+
+        if ctx.state.upstream_eof {
+            return emit_upstream_eof(ctx.client_out, Some(&req_id));
+        }
 
         let (verdict, receipt) =
             match self
@@ -344,7 +348,7 @@ fn build_mapping_denial_request(
             actor_key: actor_key.clone(),
             action: policy.action.clone(),
             resource_kind: policy.resource_kind.clone(),
-            resource_id: best_effort_resource_id(tool_name, policy, arguments),
+            resource_id: denial_resource_id(policy, arguments),
         },
         None => ActionRequest {
             actor_key: actor_key.clone(),
@@ -353,28 +357,6 @@ fn build_mapping_denial_request(
             resource_id: tool_name.to_string(),
         },
     }
-}
-
-fn best_effort_resource_id(
-    tool_name: &str,
-    policy: &ToolPolicy,
-    arguments: Option<&ExactJson>,
-) -> String {
-    if let Some(static_id) = &policy.static_resource_id {
-        return static_id.clone();
-    }
-    if let Some(arg_key) = &policy.resource_id_arg {
-        if let Some(val) = arguments
-            .and_then(ExactJson::as_object)
-            .and_then(|map| map.get(arg_key))
-            .and_then(ExactJson::as_str)
-        {
-            if is_valid_quoted_str(val) {
-                return val.to_string();
-            }
-        }
-    }
-    tool_name.to_string()
 }
 
 fn extract_tool_call_params(

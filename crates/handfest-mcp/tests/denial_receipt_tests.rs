@@ -2,8 +2,11 @@
 //! pre-gate mapping-denial receipt fidelity.
 
 use std::collections::BTreeSet;
-use std::io::{self, BufReader, Cursor, Write};
-use std::sync::{Arc, Mutex};
+use std::io::{self, BufRead, BufReader, Cursor, Read, Write};
+use std::path::Path;
+use std::process::Command;
+use std::sync::{mpsc, Arc, Mutex};
+use std::thread;
 
 use handfest_anchors::{Ed25519Keypair, SignedMandate};
 use handfest_core::ast::{parse_rfc3339_utc, KeyId, MandateId};
@@ -19,6 +22,7 @@ use handfest_mcp::{
     HANDFEST_DENIED_ERROR_CODE,
 };
 use serde_json::{json, Value};
+use tempfile::tempdir;
 
 #[derive(Default)]
 struct RecordingLedger {
@@ -182,6 +186,99 @@ fn single_hop_chain(
     (verified, agent_kp)
 }
 
+struct PipeWriter {
+    tx: mpsc::Sender<Vec<u8>>,
+}
+
+impl Write for PipeWriter {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.tx
+            .send(buf.to_vec())
+            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "pipe reader closed"))?;
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+struct PipeReader {
+    rx: mpsc::Receiver<Vec<u8>>,
+    buf: Vec<u8>,
+    pos: usize,
+}
+
+impl Read for PipeReader {
+    fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
+        while self.pos >= self.buf.len() {
+            match self.rx.recv() {
+                Ok(chunk) if chunk.is_empty() => continue,
+                Ok(chunk) => {
+                    self.buf = chunk;
+                    self.pos = 0;
+                }
+                Err(_) => return Ok(0),
+            }
+        }
+        let n = (self.buf.len() - self.pos).min(out.len());
+        out[..n].copy_from_slice(&self.buf[self.pos..self.pos + n]);
+        self.pos += n;
+        Ok(n)
+    }
+}
+
+fn mem_pipe() -> (PipeWriter, BufReader<PipeReader>) {
+    let (tx, rx) = mpsc::channel();
+    (
+        PipeWriter { tx },
+        BufReader::new(PipeReader {
+            rx,
+            buf: Vec::new(),
+            pos: 0,
+        }),
+    )
+}
+
+fn run_scripted<L: ReceiptLedger>(
+    proxy: &mut McpProxy<FixedClock, L>,
+    client_bytes: &[u8],
+    upstream_replies: &[&str],
+) -> (Result<(), ProxyError>, Vec<Value>, Vec<String>) {
+    let (up_in_w, mut up_in_r) = mem_pipe();
+    let (mut up_out_w, up_out_r) = mem_pipe();
+    let replies: Vec<String> = upstream_replies.iter().map(|s| (*s).to_string()).collect();
+
+    let upstream_thread = thread::spawn(move || {
+        let mut received = Vec::new();
+        for reply in replies {
+            let mut line = String::new();
+            if up_in_r.read_line(&mut line).unwrap_or(0) == 0 {
+                break;
+            }
+            received.push(line);
+            writeln!(up_out_w, "{reply}").unwrap();
+            up_out_w.flush().unwrap();
+        }
+        received
+    });
+
+    let mut client_out = Vec::new();
+    let res = proxy.run(
+        BufReader::new(Cursor::new(client_bytes.to_vec())),
+        &mut client_out,
+        up_in_w,
+        up_out_r,
+    );
+    let captured = upstream_thread.join().unwrap();
+    let responses: Vec<Value> = String::from_utf8(client_out)
+        .unwrap()
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    (res, responses, captured)
+}
+
 fn run_raw<L: ReceiptLedger>(
     proxy: &mut McpProxy<FixedClock, L>,
     client_bytes: &[u8],
@@ -204,6 +301,28 @@ fn run_raw<L: ReceiptLedger>(
     (res, responses, captured)
 }
 
+fn query_sqlite_receipts(db_path: &Path) -> Vec<Value> {
+    let output = Command::new("sqlite3")
+        .args([
+            "-readonly",
+            "-json",
+            db_path.to_str().expect("utf-8 sqlite path"),
+            "SELECT seq, receipt_hash, action, resource_kind, resource_id, verdict, deny_reason              FROM receipts ORDER BY seq ASC",
+        ])
+        .output()
+        .expect("invoke sqlite3 to inspect persisted receipts");
+    assert!(
+        output.status.success(),
+        "sqlite3 query failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).expect("utf-8 sqlite3 json");
+    if stdout.trim().is_empty() {
+        return Vec::new();
+    }
+    serde_json::from_str(&stdout).expect("valid sqlite3 json array")
+}
+
 #[test]
 fn merge_pr_missing_repo_records_exact_receipt_in_sqlite_and_custom_ledger_without_upstream() {
     let now = parse_rfc3339_utc("2026-06-01T00:00:00Z").unwrap();
@@ -212,11 +331,13 @@ fn merge_pr_missing_repo_records_exact_receipt_in_sqlite_and_custom_ledger_witho
     let call = b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"merge_pr\",\"arguments\":{}}}\n";
     let expected_reason = "tool 'merge_pr': missing required resource_id argument 'repo'";
 
+    let dir = tempdir().unwrap();
+    let db_path = dir.path().join("denial.sqlite");
     let mut sqlite_proxy = McpProxy::new(
         verified.clone(),
         agent_kp.key_id(),
         merge_pr_policy_map(),
-        SqliteLedger::open_in_memory().unwrap(),
+        SqliteLedger::open(&db_path).unwrap(),
         FixedClock::new(now),
     )
     .unwrap();
@@ -242,7 +363,7 @@ fn merge_pr_missing_repo_records_exact_receipt_in_sqlite_and_custom_ledger_witho
         agent_kp.key_id(),
         "git.pr.merge".to_string(),
         "repo".to_string(),
-        "merge_pr".to_string(),
+        String::new(),
         now,
         expected_reason.to_string(),
         None,
@@ -261,6 +382,18 @@ fn merge_pr_missing_repo_records_exact_receipt_in_sqlite_and_custom_ledger_witho
     assert_eq!(tr.permits, 0);
     assert_eq!(tr.denies, 1);
 
+    let rows = query_sqlite_receipts(&db_path);
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["action"], json!("git.pr.merge"));
+    assert_eq!(rows[0]["resource_kind"], json!("repo"));
+    assert_eq!(rows[0]["resource_id"], json!(""));
+    assert_eq!(rows[0]["verdict"], json!("deny"));
+    assert_eq!(rows[0]["deny_reason"], json!(expected_reason));
+    assert_eq!(
+        rows[0]["receipt_hash"],
+        json!(expected_receipt.receipt_hash.to_string())
+    );
+
     let mut custom_proxy = McpProxy::new(
         verified,
         agent_kp.key_id(),
@@ -278,7 +411,7 @@ fn merge_pr_missing_repo_records_exact_receipt_in_sqlite_and_custom_ledger_witho
     assert_eq!(stored.chain_ids, chain_ids);
     assert_eq!(stored.actor_key, agent_kp.key_id());
     assert_eq!(stored.action, "git.pr.merge");
-    assert_eq!(stored.resource, "repo \"merge_pr\"");
+    assert_eq!(stored.resource, "repo \"\"");
     assert_eq!(
         stored.verdict,
         Verdict::Deny {
@@ -355,11 +488,13 @@ fn mapping_denials_chain_with_permits_preserve_quotas_and_exact_reasons() {
         "LIMIT 2 calls\n  AND 100.00 USD sum(resource.amount)\n",
     );
     let chain_ids = vec![verified[0].ast.try_mandate_id().unwrap()];
+    let dir = tempdir().unwrap();
+    let db_path = dir.path().join("mixed.sqlite");
     let mut proxy = McpProxy::new(
         verified,
         agent_kp.key_id(),
         transfer_policy_map(),
-        SqliteLedger::open_in_memory().unwrap(),
+        SqliteLedger::open(&db_path).unwrap(),
         FixedClock::new(now),
     )
     .unwrap();
@@ -371,22 +506,16 @@ fn mapping_denials_chain_with_permits_preserve_quotas_and_exact_reasons() {
         "{\"jsonrpc\":\"2.0\",\"id\":4,\"method\":\"tools/call\",\"params\":{}}\n",
         "{\"jsonrpc\":\"2.0\",\"id\":5,\"method\":\"tools/call\",\"params\":{\"name\":\"transfer\",\"arguments\":{\"account\":\"acct-1\",\"amount\":90.00}}}\n"
     );
-    let upstream_frames = concat!(
-        "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"ok\":1}}\n",
-        "{\"jsonrpc\":\"2.0\",\"id\":5,\"result\":{\"ok\":5}}\n"
-    );
+    let upstream_replies = [
+        r#"{"jsonrpc":"2.0","id":1,"result":{"ok":1}}"#,
+        r#"{"jsonrpc":"2.0","id":5,"result":{"ok":5}}"#,
+    ];
 
-    let (res, responses, upstream_in) = run_raw(
-        &mut proxy,
-        client_frames.as_bytes(),
-        upstream_frames.as_bytes(),
-    );
+    let (res, responses, upstream_in) =
+        run_scripted(&mut proxy, client_frames.as_bytes(), &upstream_replies);
     res.expect("mixed permit and mapping denial session succeeded");
     assert_eq!(responses.len(), 5);
-    assert_eq!(
-        std::str::from_utf8(&upstream_in).unwrap().lines().count(),
-        2
-    );
+    assert_eq!(upstream_in.len(), 2);
     assert_eq!(responses[0]["result"]["ok"], json!(1));
     assert_eq!(responses[4]["result"]["ok"], json!(5));
 
@@ -416,8 +545,7 @@ fn mapping_denials_chain_with_permits_preserve_quotas_and_exact_reasons() {
             prev: Some(r1),
         },
     );
-    let wrong_type_reason = responses[2]["error"]["data"]["reason"].as_str().unwrap();
-    assert!(wrong_type_reason.starts_with("tool 'transfer': invalid argument fact 'amount':"));
+    let wrong_type_reason = "tool 'transfer': invalid argument fact 'amount': expected Decimal";
     let r3 = assert_chained_denial(
         &responses[2],
         &ExpectedDenial {
@@ -431,7 +559,7 @@ fn mapping_denials_chain_with_permits_preserve_quotas_and_exact_reasons() {
             prev: Some(r2),
         },
     );
-    let _r4 = assert_chained_denial(
+    let r4 = assert_chained_denial(
         &responses[3],
         &ExpectedDenial {
             chain_ids: &chain_ids,
@@ -450,58 +578,95 @@ fn mapping_denials_chain_with_permits_preserve_quotas_and_exact_reasons() {
     assert_eq!(tr.total_decisions, 5);
     assert_eq!(tr.permits, 2);
     assert_eq!(tr.denies, 3);
+
+    assert_mixed_session_sqlite_rows(&db_path, r2, r3, r4, wrong_type_reason);
+}
+
+fn assert_mixed_session_sqlite_rows(
+    db_path: &Path,
+    r2: MandateId,
+    r3: MandateId,
+    r4: MandateId,
+    wrong_type_reason: &str,
+) {
+    let rows = query_sqlite_receipts(db_path);
+    assert_eq!(rows.len(), 5);
+    assert_eq!(rows[0]["action"], json!("finance.transfer"));
+    assert_eq!(rows[0]["verdict"], json!("permit"));
+    assert_eq!(rows[0]["deny_reason"], Value::Null);
+    assert_eq!(rows[1]["action"], json!("mcp.unmapped:unmapped_tool"));
+    assert_eq!(
+        rows[1]["deny_reason"],
+        json!("unmapped MCP tool 'unmapped_tool'")
+    );
+    assert_eq!(rows[1]["receipt_hash"], json!(r2.to_string()));
+    assert_eq!(rows[2]["action"], json!("finance.transfer"));
+    assert_eq!(rows[2]["resource_id"], json!("acct-1"));
+    assert_eq!(rows[2]["deny_reason"], json!(wrong_type_reason));
+    assert_eq!(rows[2]["receipt_hash"], json!(r3.to_string()));
+    assert_eq!(rows[3]["action"], json!("mcp.invalid_params"));
+    assert_eq!(
+        rows[3]["deny_reason"],
+        json!("tools/call params.name must be a string")
+    );
+    assert_eq!(rows[3]["receipt_hash"], json!(r4.to_string()));
+    assert_eq!(rows[4]["action"], json!("finance.transfer"));
+    assert_eq!(rows[4]["verdict"], json!("permit"));
 }
 
 fn assert_chain_denial_reason(
     chain: Vec<VerifiedMandate>,
     actor_key: KeyId,
     now: i64,
-    expected_substring: &str,
+    expected_reason: &str,
 ) {
     let call = b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"merge_pr\",\"arguments\":{}}}\n";
     let chain_ids: Vec<MandateId> = chain
         .iter()
         .map(|vm| vm.ast.try_mandate_id().unwrap())
         .collect();
+    let dir = tempdir().unwrap();
+    let db_path = dir.path().join("chain_denial.sqlite");
     let mut proxy = McpProxy::new(
         chain,
         actor_key.clone(),
         merge_pr_policy_map(),
-        SqliteLedger::open_in_memory().unwrap(),
+        SqliteLedger::open(&db_path).unwrap(),
         FixedClock::new(now),
     )
     .unwrap();
     let (res, responses, upstream_in) = run_raw(&mut proxy, call, b"");
     res.expect("chain denial handled cleanly");
     assert!(upstream_in.is_empty(), "upstream must never be called");
-    let reason = responses[0]["error"]["data"]["reason"].as_str().unwrap();
-    assert!(
-        reason.contains(expected_substring),
-        "expected reason containing '{expected_substring}', got: {reason}"
-    );
-    assert!(
-        !reason.contains("missing required resource_id"),
-        "chain failure must not be masked by mapping error; got: {reason}"
-    );
-    let _ = assert_chained_denial(
+    let hash = assert_chained_denial(
         &responses[0],
         &ExpectedDenial {
             chain_ids: &chain_ids,
             actor_key: &actor_key,
             action: "git.pr.merge",
             resource_kind: "repo",
-            resource_id: "merge_pr",
+            resource_id: "",
             now,
-            reason,
+            reason: expected_reason,
             prev: None,
         },
     );
     assert_eq!(proxy.ledger().verify_integrity().unwrap(), 1);
+    let rows = query_sqlite_receipts(&db_path);
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["action"], json!("git.pr.merge"));
+    assert_eq!(rows[0]["resource_kind"], json!("repo"));
+    assert_eq!(rows[0]["resource_id"], json!(""));
+    assert_eq!(rows[0]["deny_reason"], json!(expected_reason));
+    assert_eq!(rows[0]["receipt_hash"], json!(hash.to_string()));
 }
 
 #[test]
 fn mapping_failure_never_masks_expired_not_yet_valid_or_unbound_chain() {
     let (verified, agent_kp) = single_hop_chain("git.*", "repo", "*", "");
+    let valid_from = verified[0].proof.valid_from;
+    let valid_until = verified[0].proof.valid_until;
+    let from_key = verified[0].ast.from().key().clone();
     let expired_now = parse_rfc3339_utc("2027-01-01T00:00:00Z").unwrap();
     let early_now = parse_rfc3339_utc("2025-12-31T23:59:59Z").unwrap();
     let valid_now = parse_rfc3339_utc("2026-06-01T00:00:00Z").unwrap();
@@ -511,28 +676,49 @@ fn mapping_failure_never_masks_expired_not_yet_valid_or_unbound_chain() {
         verified.clone(),
         agent_kp.key_id(),
         expired_now,
-        "outside anchor proof validity window",
+        &format!(
+            "hop 0: timestamp {expired_now} outside anchor proof validity window [{valid_from}..{valid_until})"
+        ),
     );
     assert_chain_denial_reason(
         verified.clone(),
         agent_kp.key_id(),
         early_now,
-        "outside anchor proof validity window",
+        &format!(
+            "hop 0: timestamp {early_now} outside anchor proof validity window [{valid_from}..{valid_until})"
+        ),
     );
     assert_chain_denial_reason(
         verified.clone(),
         rogue_actor.key_id(),
         valid_now,
-        "does not match leaf mandate TO key",
+        &format!(
+            "request actor key {} does not match leaf mandate TO key {}",
+            rogue_actor.key_id(),
+            agent_kp.key_id()
+        ),
     );
 
     let mut bad_signer = verified.clone();
     bad_signer[0].proof.signer_key = rogue_actor.key_id();
-    assert_chain_denial_reason(bad_signer, agent_kp.key_id(), valid_now, "proof signer key");
+    assert_chain_denial_reason(
+        bad_signer,
+        agent_kp.key_id(),
+        valid_now,
+        &format!(
+            "hop 0: proof signer key {} does not match mandate FROM key {from_key}",
+            rogue_actor.key_id()
+        ),
+    );
 
     let mut bad_kind = verified.clone();
     bad_kind[0].proof.actor_kind = ActorKind::Service;
-    assert_chain_denial_reason(bad_kind, agent_kp.key_id(), valid_now, "proof actor kind");
+    assert_chain_denial_reason(
+        bad_kind,
+        agent_kp.key_id(),
+        valid_now,
+        "hop 0: proof actor kind Service does not match mandate FROM kind Human",
+    );
 
     let mut bad_window = verified;
     bad_window[0].proof.valid_until = bad_window[0].proof.valid_from;
@@ -540,7 +726,144 @@ fn mapping_failure_never_masks_expired_not_yet_valid_or_unbound_chain() {
         bad_window,
         agent_kp.key_id(),
         valid_now,
-        "invalid anchor proof validity window",
+        &format!("hop 0: invalid anchor proof validity window [{valid_from}..{valid_from})"),
+    );
+}
+
+#[test]
+fn denial_receipt_preserves_control_char_resource_id_and_uses_empty_for_non_string_resource_id() {
+    let now = parse_rfc3339_utc("2026-06-01T00:00:00Z").unwrap();
+    let (verified, agent_kp) = single_hop_chain("git.*", "repo", "*", "");
+    let chain_ids = vec![verified[0].ast.try_mandate_id().unwrap()];
+    let calls = concat!(
+        "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"merge_pr\",\"arguments\":{\"repo\":\"org/repo\\ninjected\"}}}\n",
+        "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\",\"params\":{\"name\":\"merge_pr\",\"arguments\":{\"repo\":123}}}\n"
+    );
+
+    let dir = tempdir().unwrap();
+    let db_path = dir.path().join("ctrl_denial.sqlite");
+    let mut proxy = McpProxy::new(
+        verified.clone(),
+        agent_kp.key_id(),
+        merge_pr_policy_map(),
+        SqliteLedger::open(&db_path).unwrap(),
+        FixedClock::new(now),
+    )
+    .unwrap();
+    let (res, responses, upstream_in) = run_raw(&mut proxy, calls.as_bytes(), b"");
+    res.expect("control-char and non-string resource_id denials handled cleanly");
+    assert!(upstream_in.is_empty());
+    assert_eq!(responses.len(), 2);
+
+    let ctrl_reason =
+        "tool 'merge_pr': invalid resource_id argument 'repo': must not contain control characters";
+    let non_str_reason =
+        "tool 'merge_pr': invalid resource_id argument 'repo': expected JSON string";
+
+    let actor_key = agent_kp.key_id();
+    let r1 = assert_chained_denial(
+        &responses[0],
+        &ExpectedDenial {
+            chain_ids: &chain_ids,
+            actor_key: &actor_key,
+            action: "git.pr.merge",
+            resource_kind: "repo",
+            resource_id: "org/repo\ninjected",
+            now,
+            reason: ctrl_reason,
+            prev: None,
+        },
+    );
+    let r2 = assert_chained_denial(
+        &responses[1],
+        &ExpectedDenial {
+            chain_ids: &chain_ids,
+            actor_key: &actor_key,
+            action: "git.pr.merge",
+            resource_kind: "repo",
+            resource_id: "",
+            now,
+            reason: non_str_reason,
+            prev: Some(r1),
+        },
+    );
+    assert_eq!(proxy.ledger().verify_integrity().unwrap(), 2);
+
+    let rows = query_sqlite_receipts(&db_path);
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0]["action"], json!("git.pr.merge"));
+    assert_eq!(rows[0]["resource_kind"], json!("repo"));
+    assert_eq!(rows[0]["resource_id"], json!("org/repo\ninjected"));
+    assert_eq!(rows[0]["deny_reason"], json!(ctrl_reason));
+    assert_eq!(rows[0]["receipt_hash"], json!(r1.to_string()));
+    assert_eq!(rows[1]["action"], json!("git.pr.merge"));
+    assert_eq!(rows[1]["resource_kind"], json!("repo"));
+    assert_eq!(rows[1]["resource_id"], json!(""));
+    assert_eq!(rows[1]["deny_reason"], json!(non_str_reason));
+    assert_eq!(rows[1]["receipt_hash"], json!(r2.to_string()));
+
+    let mut custom_proxy = McpProxy::new(
+        verified,
+        actor_key,
+        merge_pr_policy_map(),
+        RecordingLedger::default(),
+        FixedClock::new(now),
+    )
+    .unwrap();
+    let (res2, _, _) = run_raw(&mut custom_proxy, calls.as_bytes(), b"");
+    res2.unwrap();
+    assert_eq!(
+        custom_proxy.ledger().receipts[0].resource,
+        "repo \"org/repo\\ninjected\""
+    );
+    assert_eq!(custom_proxy.ledger().receipts[1].resource, "repo \"\"");
+}
+
+#[test]
+fn tools_list_hides_tools_when_clock_is_outside_rfc3339_range_even_if_proof_window_covers_it() {
+    let (mut verified, agent_kp) = single_hop_chain("git.*", "repo", "*", "");
+    // Widen proof window to cover every i64 except i64::MAX so only `is_valid_timestamp(now)`
+    // can reject out-of-range timestamps.
+    verified[0].proof.valid_from = i64::MIN;
+    verified[0].proof.valid_until = i64::MAX;
+
+    let req = b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/list\",\"params\":{}}\n";
+    let upstream_reply = r#"{"jsonrpc":"2.0","id":1,"result":{"tools":[{"name":"merge_pr"}]}}"#;
+
+    // One second past 9999-12-31T23:59:59Z and one second before 0000-01-01T00:00:00Z.
+    for out_of_range in [253_402_300_800_i64, -62_167_219_201_i64] {
+        let mut proxy = McpProxy::new(
+            verified.clone(),
+            agent_kp.key_id(),
+            merge_pr_policy_map(),
+            SqliteLedger::open_in_memory().unwrap(),
+            FixedClock::new(out_of_range),
+        )
+        .unwrap();
+        let (res, responses, _) = run_scripted(&mut proxy, req, &[upstream_reply]);
+        res.expect("out-of-range tools/list completes cleanly");
+        assert_eq!(responses.len(), 1);
+        assert_eq!(
+            responses[0]["result"]["tools"],
+            json!([]),
+            "tools/list must hide tools at out-of-range timestamp {out_of_range}"
+        );
+    }
+
+    let in_range = parse_rfc3339_utc("2026-06-01T00:00:00Z").unwrap();
+    let mut ok_proxy = McpProxy::new(
+        verified,
+        agent_kp.key_id(),
+        merge_pr_policy_map(),
+        SqliteLedger::open_in_memory().unwrap(),
+        FixedClock::new(in_range),
+    )
+    .unwrap();
+    let (res, responses, _) = run_scripted(&mut ok_proxy, req, &[upstream_reply]);
+    res.expect("in-range tools/list completes cleanly");
+    assert_eq!(
+        responses[0]["result"]["tools"],
+        json!([{"name": "merge_pr"}])
     );
 }
 

@@ -2,7 +2,7 @@
 
 use std::collections::{BTreeMap, VecDeque};
 use std::io::{BufRead, Write};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use crate::exact_json::{parse_exact_json, ExactJson};
 use crate::framing::{
@@ -15,7 +15,7 @@ use crate::proxy::{Clock, McpProxy, ProxyError, ReceiptLedger, HANDFEST_DENIED_E
 use crate::transport::{DuplexTransport, IoEvent, RecvOutcome};
 
 const MAX_UPSTREAM_INTERLEAVED_MESSAGES: usize = 1024;
-const MAX_QUEUED_CLIENT_FRAMES: usize = 1024;
+pub(crate) const MAX_QUEUED_CLIENT_FRAMES: usize = 1024;
 const MAX_CANCELLED_IN_FLIGHT: usize = 1024;
 
 const ALLOWED_NOTIFICATION_METHODS: &[&str] = &[
@@ -62,19 +62,9 @@ impl SessionState {
         self.active_request.as_ref().map(|req| &req.id)
     }
 
-    fn cancel_active_if_matches(&mut self, cancel_id: &JsonRpcId) {
-        if self
-            .active_request
-            .as_ref()
-            .is_some_and(|req| &req.id == cancel_id)
-        {
-            if let Some(cancelled) = self.active_request.take() {
-                if self.cancelled_requests.len() >= MAX_CANCELLED_IN_FLIGHT {
-                    self.cancelled_requests.remove(0);
-                }
-                self.cancelled_requests.push(cancelled);
-                self.interleaved_count = 0;
-            }
+    fn set_shutdown_timeout(&mut self, timeout: Duration) {
+        if self.shutdown_deadline.is_none() {
+            self.shutdown_deadline = Instant::now().checked_add(timeout);
         }
     }
 
@@ -108,7 +98,7 @@ impl<C: Clock, L: ReceiptLedger> McpProxy<C, L> {
         UR: BufRead + Send + 'static,
         UW: Write + Send + 'static,
     {
-        let mut transport =
+        let transport =
             DuplexTransport::start(client_in, upstream_in, upstream_out, self.max_line_bytes);
         let mut state = SessionState::default();
 
@@ -121,9 +111,7 @@ impl<C: Clock, L: ReceiptLedger> McpProxy<C, L> {
                 if state.upstream_eof {
                     return emit_upstream_eof(client_out, state.active_id());
                 }
-                if state.shutdown_deadline.is_none() {
-                    state.shutdown_deadline = Some(Instant::now() + self.shutdown_timeout);
-                }
+                state.set_shutdown_timeout(self.shutdown_timeout);
             }
 
             match transport.recv_event(state.shutdown_deadline) {
@@ -190,10 +178,8 @@ impl<C: Clock, L: ReceiptLedger> McpProxy<C, L> {
                 client_out,
             ),
             Ok(Some(raw_line)) => {
-                if state.active_request.is_some()
-                    && try_handle_active_cancellation(&raw_line, state, transport)?
-                {
-                    return Ok(());
+                if matches_active_cancellation(&raw_line, state) {
+                    return cancel_active_request(&raw_line, state, transport, client_out);
                 }
                 self.enqueue_or_process_client(
                     QueuedClientItem::Line(raw_line),
@@ -237,7 +223,22 @@ impl<C: Clock, L: ReceiptLedger> McpProxy<C, L> {
         transport: &DuplexTransport,
         client_out: &mut CW,
     ) -> Result<(), ProxyError> {
-        while state.active_request.is_none() {
+        loop {
+            if state.active_request.is_some() {
+                let cancel_pos = state.queued_client.iter().position(|item| {
+                    matches!(
+                        item,
+                        QueuedClientItem::Line(line) if matches_active_cancellation(line, state)
+                    )
+                });
+                let Some(pos) = cancel_pos else {
+                    break;
+                };
+                if let Some(QueuedClientItem::Line(raw_line)) = state.queued_client.remove(pos) {
+                    cancel_active_request(&raw_line, state, transport, client_out)?;
+                }
+                continue;
+            }
             let Some(item) = state.queued_client.pop_front() else {
                 break;
             };
@@ -525,30 +526,50 @@ pub(crate) fn dispatch_to_upstream<CW: Write>(
     Ok(())
 }
 
-fn try_handle_active_cancellation(
-    raw_line: &str,
-    state: &mut SessionState,
-    transport: &DuplexTransport,
-) -> Result<bool, ProxyError> {
+fn matches_active_cancellation(raw_line: &str, state: &SessionState) -> bool {
+    let Some(active_id) = state.active_id() else {
+        return false;
+    };
     let Ok(ExactJson::Object(obj)) = parse_exact_json(raw_line) else {
-        return Ok(false);
+        return false;
     };
     let Ok(env) = validate_client_envelope(&obj) else {
-        return Ok(false);
+        return false;
     };
     if env.id.is_some() || env.method != "notifications/cancelled" {
-        return Ok(false);
+        return false;
     }
-    transport.send_upstream(raw_line.to_string())?;
-    if let Some(cancel_id) = obj
-        .get("params")
+    obj.get("params")
         .and_then(ExactJson::as_object)
         .and_then(|params| params.get("requestId"))
         .and_then(|val| extract_id_value(val).ok())
-    {
-        state.cancel_active_if_matches(&cancel_id);
+        .is_some_and(|cancel_id| &cancel_id == active_id)
+}
+
+fn cancel_active_request<CW: Write>(
+    raw_line: &str,
+    state: &mut SessionState,
+    transport: &DuplexTransport,
+    client_out: &mut CW,
+) -> Result<(), ProxyError> {
+    if state.cancelled_requests.len() >= MAX_CANCELLED_IN_FLIGHT {
+        let _ = write_jsonrpc_error(
+            client_out,
+            None,
+            JSONRPC_INVALID_REQUEST,
+            "client exceeded maximum in-flight cancelled JSON-RPC requests",
+            None,
+        );
+        return Err(ProxyError::UpstreamProtocol(
+            "client exceeded maximum in-flight cancelled JSON-RPC requests".to_string(),
+        ));
     }
-    Ok(true)
+    transport.send_upstream(raw_line.to_string())?;
+    if let Some(cancelled) = state.active_request.take() {
+        state.cancelled_requests.push(cancelled);
+        state.interleaved_count = 0;
+    }
+    Ok(())
 }
 
 fn check_interleaved_budget<CW: Write>(
@@ -568,7 +589,7 @@ fn check_interleaved_budget<CW: Write>(
     Ok(())
 }
 
-fn emit_upstream_eof<CW: Write>(
+pub(crate) fn emit_upstream_eof<CW: Write>(
     client_out: &mut CW,
     expected_id: Option<&JsonRpcId>,
 ) -> Result<(), ProxyError> {
