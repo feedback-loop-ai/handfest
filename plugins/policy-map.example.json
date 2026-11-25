@@ -1,0 +1,23 @@
+{
+  "tools": {
+    "github_merge_pr": {
+      "action": "git.pr.merge",
+      "resource_kind": "repo",
+      "resource_id_arg": "repository",
+      "arg_facts": {
+        "pr_number": {
+          "field": "resource.pr",
+          "type": "int"
+        }
+      },
+      "static_facts": {
+        "resource.author": {
+          "str": "valentin"
+        },
+        "resource.ci_status": {
+          "str": "passing"
+        }
+      }
+    }
+  }
+}

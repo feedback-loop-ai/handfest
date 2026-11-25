@@ -1,0 +1,21 @@
+{
+  "mcpServers": {
+    "github-handfest": {
+      "command": "handfest-mcp",
+      "args": [
+        "--chain",
+        "/path/to/mandates/root.signed.json",
+        "--ledger",
+        "/path/to/state/handfest-ledger.sqlite",
+        "--actor-key",
+        "ed25519:<agent-public-key-hex>",
+        "--policy-map",
+        "/path/to/handfest/plugins/policy-map.example.json",
+        "--",
+        "npx",
+        "-y",
+        "@modelcontextprotocol/server-github"
+      ]
+    }
+  }
+}

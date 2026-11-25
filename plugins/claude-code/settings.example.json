@@ -1,0 +1,34 @@
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": ".*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "./plugins/claude-code/hooks/pre-tool-use.sh"
+          }
+        ]
+      }
+    ]
+  },
+  "mcpServers": {
+    "github-handfest": {
+      "command": "handfest-mcp",
+      "args": [
+        "--chain",
+        "/path/to/mandates/root.signed.json",
+        "--ledger",
+        "/path/to/state/handfest-ledger.sqlite",
+        "--actor-key",
+        "ed25519:<agent-public-key-hex>",
+        "--policy-map",
+        "./plugins/policy-map.example.json",
+        "--",
+        "npx",
+        "-y",
+        "@modelcontextprotocol/server-github"
+      ]
+    }
+  }
+}
