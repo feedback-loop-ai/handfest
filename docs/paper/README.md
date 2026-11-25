@@ -14,7 +14,7 @@ All architectural claims, `HANDFEST v1` grammar rules, lattice attenuation laws,
 
 ## Prerequisites
 
-Any standard TeX Live installation (`texlive-latex-base`, `texlive-latex-recommended`, `texlive-latex-extra`, `texlive-fonts-recommended`, and `latexmk` or `pdflatex` + `bibtex`). No custom class files (`acmart`, `IEEEtran`, etc.) are required.
+Any standard TeX Live installation (`texlive-latex-base`, `texlive-latex-recommended`, `texlive-latex-extra`, `texlive-fonts-recommended`, the `lmodern` package on Debian/Ubuntu, and `latexmk` or `pdflatex` + `bibtex`). No custom class files (`acmart`, `IEEEtran`, etc.) are required.
 
 ## Building the PDF
 
