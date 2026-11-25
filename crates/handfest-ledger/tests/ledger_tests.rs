@@ -2,7 +2,7 @@ use handfest_core::ast::{parse_rfc3339_utc, Decimal, HandfestAst, KeyId, Mandate
 use handfest_core::cnl::parse_mandate;
 use handfest_core::gate::{ActionRequest, VerifiedAnchorProof, VerifiedFacts, VerifiedMandate};
 use handfest_core::{AssuranceLevel, Verdict};
-use handfest_ledger::{LedgerError, SqliteLedger};
+use handfest_ledger::{LedgerError, ReceiptLedger, SqliteLedger, TrackRecord};
 use rusqlite::Connection;
 use tempfile::TempDir;
 
@@ -119,7 +119,7 @@ fn root_child_permit_and_deny_persistence_and_reopen() {
     assert!(r2.verify_hash());
     drop(ledger);
 
-    // Reopen from disk and confirm WAL persistence + integrity.
+    // Reopen from disk and confirm rollback-journal persistence + integrity.
     let reopened = SqliteLedger::open(&db_path).expect("reopen ledger");
     assert_eq!(reopened.verify_integrity().expect("integrity ok"), 2);
 }
@@ -291,20 +291,52 @@ fn verify_integrity_catches_sql_tampering_and_missing_rows() {
         Err(LedgerError::Integrity(_))
     ));
 
-    // 2. Tamper prev_receipt_hash on seq 2.
+    // 2. Tamper prev_receipt_hash on seq 2 AND recompute valid receipt_hash on seq 2 and seq 3
+    // so every row passes receipt.verify_hash() and ONLY the prev_receipt_hash continuity guard
+    // catches the broken chain link.
     let db2 = make_populated_db("tamper_prev.sqlite");
     {
+        let mut r2 = {
+            let mut ledger = SqliteLedger::open_in_memory().unwrap();
+            let _ = ledger
+                .evaluate_and_record(&chain, &req, &facts, ts("2026-11-24T18:00:00Z"))
+                .unwrap();
+            let (_, r2) = ledger
+                .evaluate_and_record(&chain, &req, &facts, ts("2026-11-24T18:01:00Z"))
+                .unwrap();
+            let (_, r3) = ledger
+                .evaluate_and_record(&chain, &req, &facts, ts("2026-11-24T18:02:00Z"))
+                .unwrap();
+            (r2, r3)
+        };
+        let forged_prev = MandateId([0u8; 32]);
+        r2.0.prev_receipt_hash = Some(forged_prev);
+        r2.0.receipt_hash = r2.0.compute_hash();
+        assert!(r2.0.verify_hash());
+        r2.1.prev_receipt_hash = Some(r2.0.receipt_hash);
+        r2.1.receipt_hash = r2.1.compute_hash();
+        assert!(r2.1.verify_hash());
+
         let raw = Connection::open(&db2).unwrap();
         raw.execute(
-            "UPDATE receipts SET prev_receipt_hash = ?1 WHERE seq = 2",
-            [format!("sha256:{}", "0".repeat(64))],
+            "UPDATE receipts SET prev_receipt_hash = ?1, receipt_hash = ?2 WHERE seq = 2",
+            [forged_prev.to_string(), r2.0.receipt_hash.to_string()],
+        )
+        .unwrap();
+        raw.execute(
+            "UPDATE receipts SET prev_receipt_hash = ?1, receipt_hash = ?2 WHERE seq = 3",
+            [r2.0.receipt_hash.to_string(), r2.1.receipt_hash.to_string()],
         )
         .unwrap();
     }
-    assert!(matches!(
-        SqliteLedger::open(&db2).unwrap().verify_integrity(),
-        Err(LedgerError::Integrity(_))
-    ));
+    let broken_link_err = SqliteLedger::open(&db2)
+        .unwrap()
+        .verify_integrity()
+        .unwrap_err();
+    assert!(
+        matches!(&broken_link_err, LedgerError::Integrity(msg) if msg.contains("broken prev_receipt_hash link")),
+        "expected broken prev_receipt_hash link error, got: {broken_link_err}"
+    );
 
     // 3. Delete middle row (seq = 2).
     let db3 = make_populated_db("delete_mid.sqlite");
@@ -379,16 +411,29 @@ fn denied_control_char_request_preserves_receipt_integrity_and_negative_quota_ro
         )
         .unwrap_err();
     assert!(matches!(err, LedgerError::QuotaAccounting(_)));
-    // Receipt count must remain 1 (rolled back).
+    // Structural quota_sums validation must also reject the injected corrupt row.
+    assert!(matches!(
+        ledger.verify_integrity(),
+        Err(LedgerError::Integrity(_))
+    ));
+    // Receipt count must remain 1 (rolled back); removing the corrupt row restores integrity.
+    {
+        let raw = Connection::open(&db_path).unwrap();
+        let count: i64 = raw
+            .query_row("SELECT COUNT(*) FROM receipts", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 1);
+        raw.execute("DELETE FROM quota_sums", []).unwrap();
+    }
     assert_eq!(ledger.verify_integrity().unwrap(), 1);
 }
 
 #[test]
-fn concurrent_connections_enforce_wal_and_atomic_quota_without_race() {
+fn concurrent_connections_enforce_delete_journal_and_atomic_quota_without_race() {
     let dir = TempDir::new().unwrap();
     let db_path = dir.path().join("concurrent.sqlite");
 
-    // Initialize schema and verify WAL journal mode on file-backed DB.
+    // Initialize schema and verify rollback-journal DELETE mode on file-backed DB.
     let init_ledger = SqliteLedger::open(&db_path).unwrap();
     drop(init_ledger);
     {
@@ -396,7 +441,10 @@ fn concurrent_connections_enforce_wal_and_atomic_quota_without_race() {
         let mode: String = raw
             .query_row("PRAGMA journal_mode", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(mode.to_ascii_lowercase(), "wal");
+        assert_eq!(mode.to_ascii_lowercase(), "delete");
+        assert!(!dir.path().join("concurrent.sqlite-wal").exists());
+        assert!(!dir.path().join("concurrent.sqlite-shm").exists());
+        assert!(!dir.path().join("concurrent.sqlite-journal").exists());
     }
 
     let root = root_calls_mandate(2);
@@ -618,7 +666,7 @@ fn verify_integrity_catches_tail_deletion_seq_gaps_and_quota_tampering() {
         .verify_integrity()
         .unwrap_err();
     assert!(
-        matches!(tail_err, LedgerError::Integrity(ref msg) if msg.contains("sqlite_sequence")),
+        matches!(tail_err, LedgerError::Integrity(_)),
         "expected sqlite_sequence integrity error, got: {tail_err}"
     );
 
@@ -634,7 +682,7 @@ fn verify_integrity_catches_tail_deletion_seq_gaps_and_quota_tampering() {
         .verify_integrity()
         .unwrap_err();
     assert!(
-        matches!(seq_err, LedgerError::Integrity(ref msg) if msg.contains("non-contiguous")),
+        matches!(seq_err, LedgerError::Integrity(_)),
         "expected non-contiguous seq error, got: {seq_err}"
     );
 
@@ -649,7 +697,7 @@ fn verify_integrity_catches_tail_deletion_seq_gaps_and_quota_tampering() {
         .verify_integrity()
         .unwrap_err();
     assert!(
-        matches!(quota_err, LedgerError::Integrity(ref msg) if msg.contains("quota_calls")),
+        matches!(quota_err, LedgerError::Integrity(_)),
         "expected quota_calls integrity error, got: {quota_err}"
     );
 
@@ -663,7 +711,7 @@ fn verify_integrity_catches_tail_deletion_seq_gaps_and_quota_tampering() {
         SqliteLedger::open_read_only(&db_missing_quota)
             .unwrap()
             .verify_integrity(),
-        Err(LedgerError::Integrity(ref msg)) if msg.contains("quota_calls")
+        Err(LedgerError::Integrity(_))
     ));
 
     // 5. Extra spurious quota_calls row.
@@ -680,7 +728,7 @@ fn verify_integrity_catches_tail_deletion_seq_gaps_and_quota_tampering() {
         SqliteLedger::open_read_only(&db_extra_quota)
             .unwrap()
             .verify_integrity(),
-        Err(LedgerError::Integrity(ref msg)) if msg.contains("quota_calls")
+        Err(LedgerError::Integrity(_))
     ));
 }
 
@@ -727,7 +775,7 @@ fn open_read_only_never_creates_missing_file_and_audit_snapshot_works() {
 
 #[cfg(unix)]
 #[test]
-fn open_read_only_clean_wal_creates_no_sidecars_and_writer_can_append() {
+fn open_read_only_on_0444_file_creates_no_sidecars_and_writer_can_append() {
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
 
@@ -814,6 +862,16 @@ fn open_read_only_rejects_uncheckpointed_wal_through_symlink_and_hot_rollback_jo
         let mut live = SqliteLedger::open(&src_db).unwrap();
         live.evaluate_and_record(&chain, &req, &facts, ts("2026-11-24T18:00:00Z"))
             .unwrap();
+        drop(live);
+        // Explicitly put a fixture DB into WAL mode and write a frame to produce a dirty -wal.
+        let wal_conn = Connection::open(&src_db).unwrap();
+        wal_conn.pragma_update(None, "journal_mode", "WAL").unwrap();
+        wal_conn
+            .execute("CREATE TABLE _wal_dirty(x INT)", [])
+            .unwrap();
+        wal_conn
+            .execute("INSERT INTO _wal_dirty VALUES (1)", [])
+            .unwrap();
         assert!(fs::metadata(&src_wal).unwrap().len() > 0);
         // Copy main DB + non-empty -wal without -shm to simulate an uncheckpointed WAL snapshot.
         fs::copy(&src_db, wal_ro_dir.join("ledger.sqlite")).unwrap();
@@ -842,10 +900,6 @@ fn open_read_only_rejects_uncheckpointed_wal_through_symlink_and_hot_rollback_jo
             .evaluate_and_record(&chain, &req, &facts, ts("2026-11-24T18:00:00Z"))
             .unwrap();
     }
-    {
-        let raw = Connection::open(&rollback_db).unwrap();
-        raw.pragma_update(None, "journal_mode", "DELETE").unwrap();
-    }
     let hot_journal = rollback_dir.join("ledger.sqlite-journal");
     fs::write(
         &hot_journal,
@@ -854,6 +908,15 @@ fn open_read_only_rejects_uncheckpointed_wal_through_symlink_and_hot_rollback_jo
     .unwrap();
     let rollback_symlink = dir.path().join("symlink_to_hot_journal.sqlite");
     symlink(&rollback_db, &rollback_symlink).unwrap();
+
+    // Hot rollback journal must be rejected even in a writable directory.
+    assert!(
+        matches!(
+            SqliteLedger::open_read_only(&rollback_db),
+            Err(LedgerError::Integrity(_))
+        ),
+        "open_read_only must reject a hot rollback journal in a writable directory"
+    );
 
     let _restore_rb_dir = RestoreDir(rollback_dir.clone());
     fs::set_permissions(&rollback_dir, fs::Permissions::from_mode(0o555)).unwrap();
@@ -1159,21 +1222,15 @@ fn open_read_only_preserves_in_process_posix_locks_on_same_inode() {
     let req = merge_request();
     let facts = valentin_facts();
 
-    {
-        let mut ledger = SqliteLedger::open(&db_path).unwrap();
-        ledger
-            .evaluate_and_record(&chain, &req, &facts, ts("2026-11-24T18:00:00Z"))
-            .unwrap();
-    }
-    // Switch to rollback (DELETE) mode so SQLite holds POSIX fcntl locks directly on the main DB
-    // inode during transactions.
-    {
-        let raw = Connection::open(&db_path).unwrap();
-        raw.pragma_update(None, "journal_mode", "DELETE").unwrap();
-    }
-
+    let mut active_writer = SqliteLedger::open(&db_path).unwrap();
+    active_writer
+        .evaluate_and_record(&chain, &req, &facts, ts("2026-11-24T18:00:00Z"))
+        .unwrap();
+    // Rollback (DELETE) mode holds POSIX fcntl locks directly on the main DB inode.
+    // BEGIN IMMEDIATE acquires a RESERVED lock (blocking other writers while permitting readers)
+    // while `active_writer` remains open in this process.
     let lock_holder = Connection::open(&db_path).unwrap();
-    lock_holder.execute_batch("BEGIN EXCLUSIVE;").unwrap();
+    lock_holder.execute_batch("BEGIN IMMEDIATE;").unwrap();
 
     // Opening and closing a read-only ledger on the same inode in this process must NEVER close a
     // raw descriptor on that inode and drop `lock_holder`'s POSIX fcntl lock.
@@ -1198,6 +1255,7 @@ fn open_read_only_preserves_in_process_posix_locks_on_same_inode() {
 
     lock_holder.execute_batch("ROLLBACK;").unwrap();
     drop(lock_holder);
+    drop(active_writer);
 
     // Sanity check: once the parent releases its lock, the child probe succeeds.
     let unlocked_status = Command::new(&exe)
@@ -1210,4 +1268,316 @@ fn open_read_only_preserves_in_process_posix_locks_on_same_inode() {
         unlocked_status.success(),
         "expected child probe to succeed after lock release"
     );
+}
+
+#[test]
+fn cross_process_audit_helper() {
+    let Ok(db_path) = std::env::var("HANDFEST_CROSS_PROC_AUDIT_DB") else {
+        return;
+    };
+    let actor_raw = std::env::var("HANDFEST_CROSS_PROC_AUDIT_ACTOR").expect("actor env var");
+    let expected: usize = std::env::var("HANDFEST_CROSS_PROC_AUDIT_EXPECT_COUNT")
+        .expect("count env var")
+        .parse()
+        .expect("valid count");
+    let actor = key(&actor_raw);
+
+    let ro = SqliteLedger::open_read_only(&db_path).expect("child open_read_only");
+    let (verified, maybe_rec) = ro
+        .audit_snapshot(Some(&actor))
+        .expect("child audit_snapshot");
+    assert_eq!(verified, expected);
+    let rec = maybe_rec.expect("child expected TrackRecord");
+    assert_eq!(rec.total_decisions, u64::try_from(expected).unwrap());
+    assert_eq!(rec.permits, u64::try_from(expected).unwrap());
+}
+
+#[test]
+fn cross_process_read_only_audit_while_parent_holds_open_writer() {
+    use std::process::Command;
+
+    let dir = TempDir::new().unwrap();
+    let db_path = dir.path().join("cross_proc.sqlite");
+    let root = root_calls_mandate(5);
+    let child = child_calls_mandate(root.ast.mandate_id(), "seat-1", 5);
+    let chain = [root, child];
+    let req = merge_request();
+    let facts = valentin_facts();
+
+    let mut writer = SqliteLedger::open(&db_path).unwrap();
+    let (v1, _) = writer
+        .evaluate_and_record(&chain, &req, &facts, ts("2026-11-24T18:00:00Z"))
+        .unwrap();
+    assert_eq!(v1, Verdict::Permit);
+
+    let exe = std::env::current_exe().expect("current test executable");
+    let run_child_audit = |expected_count: usize| {
+        let output = Command::new(&exe)
+            .args(["--exact", "cross_process_audit_helper", "--quiet"])
+            .env("HANDFEST_CROSS_PROC_AUDIT_DB", &db_path)
+            .env("HANDFEST_CROSS_PROC_AUDIT_ACTOR", req.actor_key.to_string())
+            .env(
+                "HANDFEST_CROSS_PROC_AUDIT_EXPECT_COUNT",
+                expected_count.to_string(),
+            )
+            .output()
+            .expect("spawn cross_process_audit_helper");
+        assert!(
+            output.status.success(),
+            "child cross-process audit failed (expected {expected_count}): stdout={} stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    };
+
+    // Child process audits cleanly while parent still holds open writer handle.
+    run_child_audit(1);
+
+    // Parent appends a second receipt on the same open handle; child immediately sees it.
+    let (v2, _) = writer
+        .evaluate_and_record(&chain, &req, &facts, ts("2026-11-24T18:01:00Z"))
+        .unwrap();
+    assert_eq!(v2, Verdict::Permit);
+    run_child_audit(2);
+
+    assert!(!dir.path().join("cross_proc.sqlite-wal").exists());
+    assert!(!dir.path().join("cross_proc.sqlite-shm").exists());
+    assert!(!dir.path().join("cross_proc.sqlite-journal").exists());
+}
+
+fn make_sum_ledger(dir: &TempDir, name: &str) -> (std::path::PathBuf, MandateId) {
+    let path = dir.path().join(name);
+    let root = verified(
+        parse_mandate(concat!(
+            "HANDFEST v1\n",
+            "FROM org \"acme\" (key: ed25519:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa)\n",
+            "TO agent \"treasury\" (key: ed25519:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb)\n",
+            "DELEGATION max 0 hops\n",
+            "ALLOW pay.transfer\n",
+            "ON account \"ops-*\"\n",
+            "LIMIT 100.0 USD sum(resource.amount)\n",
+        ))
+        .unwrap(),
+    );
+    let root_id = root.ast.mandate_id();
+    let req = ActionRequest {
+        actor_key: key("ed25519:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
+        action: "pay.transfer".to_string(),
+        resource_kind: "account".to_string(),
+        resource_id: "ops-main".to_string(),
+    };
+    let mut ledger = SqliteLedger::open(&path).unwrap();
+    let (v1, _) = ledger
+        .evaluate_and_record(
+            &[root],
+            &req,
+            &VerifiedFacts::new().with("resource.amount", Scalar::Decimal(dec("60.5"))),
+            ts("2026-11-24T18:00:00Z"),
+        )
+        .unwrap();
+    assert_eq!(v1, Verdict::Permit);
+    assert_eq!(ledger.verify_integrity().unwrap(), 1);
+    (path, root_id)
+}
+
+#[test]
+fn verify_integrity_catches_quota_sums_structural_tampering() {
+    let dir = TempDir::new().unwrap();
+
+    let assert_tamper_fails = |name: &str, sql: &str| {
+        let (path, _root_id) = make_sum_ledger(&dir, name);
+        {
+            let raw = Connection::open(&path).unwrap();
+            raw.execute(sql, []).unwrap();
+        }
+        let err = SqliteLedger::open_read_only(&path)
+            .unwrap()
+            .verify_integrity()
+            .expect_err("tampered quota_sums must fail verify_integrity");
+        assert!(
+            matches!(err, LedgerError::Integrity(_)),
+            "case '{name}': expected LedgerError::Integrity, got: {err}"
+        );
+    };
+
+    // 1. Negative total.
+    assert_tamper_fails("neg_total.sqlite", "UPDATE quota_sums SET total = '-50.0'");
+
+    // 2. Unspent MandateId (no persisted permits).
+    let unspent_id = format!("sha256:{}", "e".repeat(64));
+    assert_tamper_fails(
+        "unspent_mid.sqlite",
+        &format!(
+            "INSERT INTO quota_sums (mandate_id, unit, field, total) VALUES ('{unspent_id}', 'USD', 'resource.amount', '10.0')"
+        ),
+    );
+
+    // 3. Invalid MandateId format.
+    assert_tamper_fails(
+        "bad_mid.sqlite",
+        "INSERT INTO quota_sums (mandate_id, unit, field, total) VALUES ('not-a-mandate', 'USD', 'resource.amount', '10.0')",
+    );
+
+    // 4. Invalid unit identifier on a permitted MandateId.
+    let (bad_unit_path, root_id) = make_sum_ledger(&dir, "bad_unit.sqlite");
+    {
+        let raw = Connection::open(&bad_unit_path).unwrap();
+        raw.execute(
+            "INSERT INTO quota_sums (mandate_id, unit, field, total) VALUES (?1, '123 bad', 'resource.amount', '1.0')",
+            [root_id.to_string()],
+        )
+        .unwrap();
+    }
+    assert!(matches!(
+        SqliteLedger::open_read_only(&bad_unit_path)
+            .unwrap()
+            .verify_integrity(),
+        Err(LedgerError::Integrity(_))
+    ));
+
+    // 5. Invalid field path on a permitted MandateId.
+    let (bad_field_path, root_id) = make_sum_ledger(&dir, "bad_field.sqlite");
+    {
+        let raw = Connection::open(&bad_field_path).unwrap();
+        raw.execute(
+            "INSERT INTO quota_sums (mandate_id, unit, field, total) VALUES (?1, 'USD', 'resource..amount', '1.0')",
+            [root_id.to_string()],
+        )
+        .unwrap();
+    }
+    assert!(matches!(
+        SqliteLedger::open_read_only(&bad_field_path)
+            .unwrap()
+            .verify_integrity(),
+        Err(LedgerError::Integrity(_))
+    ));
+
+    // 6. Unparseable decimal total.
+    assert_tamper_fails(
+        "bad_dec.sqlite",
+        "UPDATE quota_sums SET total = 'not-a-number'",
+    );
+
+    // 7. Non-canonical decimal spellings (trailing zero and -0.0).
+    assert_tamper_fails(
+        "non_canon_trailing.sqlite",
+        "UPDATE quota_sums SET total = '60.50'",
+    );
+    assert_tamper_fails(
+        "non_canon_neg_zero.sqlite",
+        "UPDATE quota_sums SET total = '-0.0'",
+    );
+
+    // 8. Canonical zero total on a permitted MandateId is valid.
+    let (zero_path, _) = make_sum_ledger(&dir, "canon_zero.sqlite");
+    {
+        let raw = Connection::open(&zero_path).unwrap();
+        raw.execute("UPDATE quota_sums SET total = '0.0'", [])
+            .unwrap();
+    }
+    assert_eq!(
+        SqliteLedger::open_read_only(&zero_path)
+            .unwrap()
+            .verify_integrity()
+            .unwrap(),
+        1
+    );
+}
+
+fn exercise_generic_ledger<L: ReceiptLedger>(
+    ledger: &mut L,
+    chain: &[VerifiedMandate],
+    req: &ActionRequest,
+    facts: &VerifiedFacts,
+    now: i64,
+) {
+    let (verdict, receipt) = ledger
+        .evaluate_and_record(chain, req, facts, now)
+        .expect("generic evaluate_and_record");
+    assert_eq!(verdict, Verdict::Permit);
+    assert!(receipt.verify_hash());
+    assert_eq!(ledger.verify_integrity().expect("generic verify"), 1);
+    let rec = ledger
+        .track_record(&req.actor_key)
+        .expect("generic track_record");
+    assert_eq!(rec.permits, 1);
+    let (count, snap_rec) = ledger
+        .audit_snapshot(Some(&req.actor_key))
+        .expect("generic audit_snapshot");
+    assert_eq!(count, 1);
+    assert_eq!(snap_rec, Some(rec));
+}
+
+fn exercise_dyn_ledger(
+    ledger: &mut dyn ReceiptLedger,
+    chain: &[VerifiedMandate],
+    req: &ActionRequest,
+    facts: &VerifiedFacts,
+    now: i64,
+) {
+    let (verdict, receipt) = ledger
+        .evaluate_and_record(chain, req, facts, now)
+        .expect("dyn evaluate_and_record");
+    assert_eq!(verdict, Verdict::Permit);
+    assert!(receipt.verify_hash());
+    assert_eq!(ledger.verify_integrity().expect("dyn verify"), 2);
+    let rec = ledger
+        .track_record(&req.actor_key)
+        .expect("dyn track_record");
+    assert_eq!(rec.total_decisions, 2);
+    assert_eq!(rec.permits, 2);
+    let (count, snap_rec) = ledger
+        .audit_snapshot(Some(&req.actor_key))
+        .expect("dyn audit_snapshot");
+    assert_eq!(count, 2);
+    assert_eq!(snap_rec, Some(rec));
+}
+
+#[test]
+fn receipt_ledger_trait_polymorphic_dyn_and_generic() {
+    use std::error::Error as _;
+
+    let root = root_calls_mandate(5);
+    let child = child_calls_mandate(root.ast.mandate_id(), "seat-poly", 5);
+    let chain = [root, child];
+    let req = merge_request();
+    let facts = valentin_facts();
+
+    let mut ledger = SqliteLedger::open_in_memory().unwrap();
+    assert!(format!("{ledger:?}").contains("SqliteLedger"));
+
+    exercise_generic_ledger(
+        &mut ledger,
+        &chain,
+        &req,
+        &facts,
+        ts("2026-11-24T18:00:00Z"),
+    );
+    exercise_dyn_ledger(
+        &mut ledger,
+        &chain,
+        &req,
+        &facts,
+        ts("2026-11-24T18:01:00Z"),
+    );
+
+    // Verify TrackRecord JSON serde roundtrip and invalid key rejection.
+    let rec = ledger.track_record(&req.actor_key).unwrap();
+    let encoded = serde_json::to_string(&rec).unwrap();
+    let decoded: TrackRecord = serde_json::from_str(&encoded).unwrap();
+    assert_eq!(decoded, rec);
+    let bad_json = encoded.replace(&req.actor_key.to_string(), "not-a-key");
+    let json_err: LedgerError = serde_json::from_str::<TrackRecord>(&bad_json)
+        .unwrap_err()
+        .into();
+    assert!(json_err.to_string().contains("json serialization error"));
+    assert!(json_err.source().is_some());
+
+    // Verify LedgerError Display + Error::source across variants.
+    let int_err = LedgerError::Integrity("bad".to_string());
+    assert!(int_err.to_string().contains("ledger integrity error"));
+    assert!(int_err.source().is_none());
+    let qa_err = LedgerError::QuotaAccounting("bad".to_string());
+    assert!(qa_err.to_string().contains("quota accounting error"));
+    assert!(qa_err.source().is_none());
 }

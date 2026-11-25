@@ -146,17 +146,11 @@ fn add_non_negative_sum(
             "negative prior sum total for ({mid}, {unit}, {field})"
         )));
     }
-    let next = prior.checked_add(delta).ok_or_else(|| {
+    prior.checked_add(delta).ok_or_else(|| {
         LedgerError::QuotaAccounting(format!(
             "decimal overflow adding {delta} to {prior} for ({mid}, {unit}, {field})"
         ))
-    })?;
-    if next.is_negative() {
-        return Err(LedgerError::QuotaAccounting(format!(
-            "negative resulting sum total for ({mid}, {unit}, {field})"
-        )));
-    }
-    Ok(next)
+    })
 }
 
 fn extract_non_negative_decimal(
@@ -180,4 +174,184 @@ fn extract_non_negative_decimal(
         )));
     }
     Ok(*delta)
+}
+
+#[cfg(test)]
+mod tests {
+    use handfest_core::ast::parse_rfc3339_utc;
+    use handfest_core::cnl::parse_mandate;
+    use handfest_core::gate::VerifiedAnchorProof;
+    use handfest_core::AssuranceLevel;
+    use rusqlite::Connection;
+
+    use super::*;
+
+    fn sum_mandate() -> VerifiedMandate {
+        let ast = parse_mandate(concat!(
+            "HANDFEST v1\n",
+            "FROM org \"acme\" (key: ed25519:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa)\n",
+            "TO agent \"bot\" (key: ed25519:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb)\n",
+            "DELEGATION max 0 hops\n",
+            "ALLOW pay.transfer\n",
+            "ON account \"ops-*\"\n",
+            "LIMIT 100.0 USD sum(resource.amount)\n",
+        ))
+        .unwrap();
+        let proof = VerifiedAnchorProof {
+            anchor_id: "test".to_string(),
+            assurance: AssuranceLevel::LocalKey,
+            signer_key: ast.from().key().clone(),
+            actor_kind: ast.from().kind(),
+            valid_from: parse_rfc3339_utc("2026-11-24T00:00:00Z").unwrap(),
+            valid_until: parse_rfc3339_utc("2026-11-26T00:00:00Z").unwrap(),
+        };
+        VerifiedMandate { ast, proof }
+    }
+
+    #[test]
+    fn load_quota_snapshot_rejects_negative_calls_and_corrupt_sum() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE quota_calls (mandate_id TEXT PRIMARY KEY, calls INTEGER NOT NULL);
+             CREATE TABLE quota_sums (mandate_id TEXT NOT NULL, unit TEXT NOT NULL, field TEXT NOT NULL, total TEXT NOT NULL, PRIMARY KEY (mandate_id, unit, field));",
+        )
+        .unwrap();
+        let mid = MandateId::sha256(b"q1");
+        conn.execute(
+            "INSERT INTO quota_calls (mandate_id, calls) VALUES (?1, -1)",
+            params![mid.to_string()],
+        )
+        .unwrap();
+        {
+            let tx = conn.transaction().unwrap();
+            assert!(matches!(
+                load_quota_snapshot(&tx, &[mid]),
+                Err(LedgerError::QuotaAccounting(_))
+            ));
+        }
+
+        conn.execute("UPDATE quota_calls SET calls = 1", [])
+            .unwrap();
+        conn.execute(
+            "INSERT INTO quota_sums (mandate_id, unit, field, total) VALUES (?1, 'USD', 'resource.amount', 'not-a-decimal')",
+            params![mid.to_string()],
+        )
+        .unwrap();
+        {
+            let tx = conn.transaction().unwrap();
+            assert!(matches!(
+                load_quota_snapshot(&tx, &[mid]),
+                Err(LedgerError::QuotaAccounting(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn compute_quota_updates_covers_all_guard_and_dedup_paths() {
+        let vm = sum_mandate();
+        let mid = vm.ast.mandate_id();
+        let ok_facts = VerifiedFacts::new().with(
+            "resource.amount",
+            Scalar::Decimal(Decimal::parse("10.0").unwrap()),
+        );
+
+        // Mismatched chain/chain_ids length.
+        assert!(matches!(
+            compute_quota_updates(
+                std::slice::from_ref(&vm),
+                &[],
+                &ok_facts,
+                &QuotaSnapshot::new()
+            ),
+            Err(LedgerError::QuotaAccounting(_))
+        ));
+
+        // Duplicate MandateId in chain is deduplicated (charged once).
+        let dup_updates = compute_quota_updates(
+            &[vm.clone(), vm.clone()],
+            &[mid, mid],
+            &ok_facts,
+            &QuotaSnapshot::new(),
+        )
+        .unwrap();
+        assert_eq!(dup_updates.calls.len(), 1);
+        assert_eq!(dup_updates.calls[0].1, 1);
+
+        // Call counter overflow past i64::MAX.
+        let mut overflow_usage = QuotaSnapshot::new();
+        overflow_usage.set_calls(mid, u64::try_from(i64::MAX).unwrap());
+        assert!(matches!(
+            compute_quota_updates(
+                std::slice::from_ref(&vm),
+                &[mid],
+                &ok_facts,
+                &overflow_usage
+            ),
+            Err(LedgerError::QuotaAccounting(_))
+        ));
+
+        // Missing fact.
+        assert!(matches!(
+            compute_quota_updates(
+                std::slice::from_ref(&vm),
+                &[mid],
+                &VerifiedFacts::new(),
+                &QuotaSnapshot::new()
+            ),
+            Err(LedgerError::QuotaAccounting(_))
+        ));
+
+        // Wrong fact type.
+        let wrong_type = VerifiedFacts::new().with("resource.amount", Scalar::Int(5));
+        assert!(matches!(
+            compute_quota_updates(
+                std::slice::from_ref(&vm),
+                &[mid],
+                &wrong_type,
+                &QuotaSnapshot::new()
+            ),
+            Err(LedgerError::QuotaAccounting(_))
+        ));
+
+        // Negative delta fact.
+        let neg_delta = VerifiedFacts::new().with(
+            "resource.amount",
+            Scalar::Decimal(Decimal::parse("-1.0").unwrap()),
+        );
+        assert!(matches!(
+            compute_quota_updates(
+                std::slice::from_ref(&vm),
+                &[mid],
+                &neg_delta,
+                &QuotaSnapshot::new()
+            ),
+            Err(LedgerError::QuotaAccounting(_))
+        ));
+
+        // Negative prior sum in QuotaSnapshot.
+        let mut neg_prior = QuotaSnapshot::new();
+        neg_prior.set_sum(
+            mid,
+            "USD",
+            "resource.amount",
+            Decimal::parse("-1.0").unwrap(),
+        );
+        assert!(matches!(
+            compute_quota_updates(std::slice::from_ref(&vm), &[mid], &ok_facts, &neg_prior),
+            Err(LedgerError::QuotaAccounting(_))
+        ));
+
+        // Decimal addition overflow in prior + delta.
+        let mut max_prior = QuotaSnapshot::new();
+        max_prior.set_sum(
+            mid,
+            "USD",
+            "resource.amount",
+            Decimal::new(i128::MAX, 0).unwrap(),
+        );
+        assert!(matches!(
+            compute_quota_updates(&[vm], &[mid], &ok_facts, &max_prior),
+            Err(LedgerError::QuotaAccounting(_))
+        ));
+    }
 }

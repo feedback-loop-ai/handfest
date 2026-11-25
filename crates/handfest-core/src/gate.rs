@@ -8,8 +8,8 @@ use alloc::vec::Vec;
 use sha2::{Digest, Sha256};
 
 use crate::ast::{
-    is_valid_ident, is_valid_quoted_str, is_valid_timestamp, try_format_rfc3339_utc, Decimal,
-    HandfestAst, KeyId, MandateId, Predicate, PredicateOp, Quota, Scalar,
+    is_valid_ident, is_valid_quoted_str, is_valid_timestamp, try_format_rfc3339_utc, AstError,
+    Decimal, HandfestAst, KeyId, MandateId, Predicate, PredicateOp, Quota, Scalar,
 };
 use crate::lattice::{scalar_satisfies, subsumes};
 use crate::{ActorKind, AssuranceLevel, Verdict};
@@ -297,19 +297,72 @@ pub fn authorize(
         },
     };
 
+    let receipt = build_receipt(
+        chain_ids,
+        request.actor_key.clone(),
+        &request.action,
+        (&request.resource_kind, &request.resource_id),
+        now,
+        verdict.clone(),
+        prev_receipt_hash,
+    );
+
+    (verdict, receipt)
+}
+
+/// Builds a hash-chained denial [`DecisionReceipt`] for pre-gate refusals using the exact same
+/// canonical formatting and SHA-256 hash function as [`authorize`].
+#[expect(
+    clippy::too_many_arguments,
+    reason = "public signature specified for pre-gate denial receipt construction"
+)]
+pub fn build_denial_receipt(
+    chain_ids: Vec<MandateId>,
+    actor_key: KeyId,
+    action: String,
+    resource_kind: String,
+    resource_id: String,
+    timestamp: i64,
+    reason: String,
+    prev_receipt_hash: Option<MandateId>,
+) -> Result<DecisionReceipt, AstError> {
+    if !is_valid_timestamp(timestamp) {
+        return Err(AstError::InvalidTimestamp(format!(
+            "timestamp {timestamp} outside 0000-01-01T00:00:00Z..=9999-12-31T23:59:59Z"
+        )));
+    }
+    Ok(build_receipt(
+        chain_ids,
+        actor_key,
+        &action,
+        (&resource_kind, &resource_id),
+        timestamp,
+        Verdict::Deny { reason },
+        prev_receipt_hash,
+    ))
+}
+
+fn build_receipt(
+    chain_ids: Vec<MandateId>,
+    actor_key: KeyId,
+    action: &str,
+    resource: (&str, &str),
+    timestamp: i64,
+    verdict: Verdict,
+    prev_receipt_hash: Option<MandateId>,
+) -> DecisionReceipt {
     let mut receipt = DecisionReceipt {
         chain_ids,
-        actor_key: request.actor_key.clone(),
-        action: format_action(&request.action),
-        resource: format_resource(&request.resource_kind, &request.resource_id),
-        timestamp: now,
-        verdict: verdict.clone(),
+        actor_key,
+        action: format_action(action),
+        resource: format_resource(resource.0, resource.1),
+        timestamp,
+        verdict,
         receipt_hash: MandateId([0u8; 32]),
         prev_receipt_hash,
     };
     receipt.receipt_hash = receipt.compute_hash();
-
-    (verdict, receipt)
+    receipt
 }
 
 fn evaluate_chain(

@@ -1,10 +1,11 @@
 use handfest_core::ast::{
-    parse_rfc3339_utc, Decimal, HandfestAst, KeyId, MandateId, Quota, ResourceSel, Scalar,
-    MAX_RFC3339_TIMESTAMP, MIN_RFC3339_TIMESTAMP,
+    parse_rfc3339_utc, AstError, Decimal, HandfestAst, KeyId, MandateId, Quota, ResourceSel,
+    Scalar, MAX_RFC3339_TIMESTAMP, MIN_RFC3339_TIMESTAMP,
 };
 use handfest_core::cnl::{parse_canonical, parse_mandate, render_canonical};
 use handfest_core::gate::{
-    authorize, ActionRequest, QuotaSnapshot, VerifiedAnchorProof, VerifiedFacts, VerifiedMandate,
+    authorize, build_denial_receipt, ActionRequest, QuotaSnapshot, VerifiedAnchorProof,
+    VerifiedFacts, VerifiedMandate,
 };
 use handfest_core::{AssuranceLevel, Verdict};
 
@@ -999,4 +1000,124 @@ fn gate_permits_bounded_discrete_interval_attenuated_from_parent_in_set() {
         Verdict::Deny { ref reason } if reason.contains("attenuation check failed")
     ));
     assert!(r_wide.verify_hash());
+}
+
+#[test]
+fn build_denial_receipt_matches_authorize_hash_and_escapes_fields() {
+    let actor = k("ed25519:7f01aa99");
+    let now = ts("2026-11-24T18:01:30Z");
+
+    let req = ActionRequest {
+        actor_key: actor.clone(),
+        action: "mcp.tool.unknown".into(),
+        resource_kind: "tool".into(),
+        resource_id: "exec\"\n\x07".into(),
+    };
+    let (auth_verdict, auth_receipt) = authorize(
+        &[],
+        &req,
+        &VerifiedFacts::new(),
+        &QuotaSnapshot::new(),
+        now,
+        None,
+    );
+    let Verdict::Deny { reason } = auth_verdict else {
+        panic!("expected empty-chain denial");
+    };
+
+    let built = build_denial_receipt(
+        vec![],
+        actor.clone(),
+        req.action.clone(),
+        req.resource_kind.clone(),
+        req.resource_id.clone(),
+        now,
+        reason,
+        None,
+    )
+    .expect("valid timestamp must build denial receipt");
+    assert!(built.verify_hash());
+    assert_eq!(built, auth_receipt);
+
+    let mid = valentin_root().mandate_id();
+    let chained = build_denial_receipt(
+        vec![mid],
+        actor,
+        "tool.run\n\\bad".into(),
+        "repo\\x\x07".into(),
+        "org/\"repo\"\n".into(),
+        now + 10,
+        "unknown tool".into(),
+        Some(built.receipt_hash),
+    )
+    .expect("chained denial receipt");
+    assert!(chained.verify_hash());
+    assert_eq!(chained.prev_receipt_hash, Some(built.receipt_hash));
+    assert_eq!(chained.chain_ids, vec![mid]);
+    assert_eq!(
+        chained.verdict,
+        Verdict::Deny {
+            reason: "unknown tool".into()
+        }
+    );
+    assert_eq!(chained.action, "tool.run\\n\\\\bad");
+    assert_eq!(chained.resource, "repo\\\\x\\u{7} \"org/\\\"repo\\\"\\n\"");
+}
+
+#[test]
+fn build_denial_receipt_enforces_rfc3339_timestamp_bounds() {
+    let actor = k("ed25519:7f01aa99");
+
+    let min_ok = build_denial_receipt(
+        vec![],
+        actor.clone(),
+        "a.b".into(),
+        "repo".into(),
+        "id".into(),
+        MIN_RFC3339_TIMESTAMP,
+        "min".into(),
+        None,
+    )
+    .expect("MIN_RFC3339_TIMESTAMP must be accepted");
+    assert!(min_ok.verify_hash());
+
+    let max_ok = build_denial_receipt(
+        vec![],
+        actor.clone(),
+        "a.b".into(),
+        "repo".into(),
+        "id".into(),
+        MAX_RFC3339_TIMESTAMP,
+        "max".into(),
+        Some(min_ok.receipt_hash),
+    )
+    .expect("MAX_RFC3339_TIMESTAMP must be accepted");
+    assert!(max_ok.verify_hash());
+
+    assert!(matches!(
+        build_denial_receipt(
+            vec![],
+            actor.clone(),
+            "a.b".into(),
+            "repo".into(),
+            "id".into(),
+            MIN_RFC3339_TIMESTAMP - 1,
+            "too early".into(),
+            None,
+        ),
+        Err(AstError::InvalidTimestamp(_))
+    ));
+    assert!(matches!(
+        build_denial_receipt(
+            vec![],
+            actor,
+            "a.b".into(),
+            "repo".into(),
+            "id".into(),
+            MAX_RFC3339_TIMESTAMP + 1,
+            "too late".into(),
+            None,
+        ),
+        Err(AstError::InvalidTimestamp(_))
+    ));
 }
