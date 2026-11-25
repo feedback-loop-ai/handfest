@@ -17,8 +17,8 @@ pub use crate::adapters::{
 };
 use crate::exact_json::ExactJson;
 use crate::framing::{
-    fail_upstream_protocol, write_denied_response, write_jsonrpc_error, write_raw_line, JsonRpcId,
-    JSONRPC_INTERNAL_ERROR,
+    fail_upstream_protocol, reject_unknown_keys, write_denied_response, write_jsonrpc_error,
+    write_raw_line, JsonRpcId, JSONRPC_INTERNAL_ERROR,
 };
 use crate::mapping::{denial_resource_id, ToolPolicyMap};
 use crate::session::{dispatch_to_upstream, emit_upstream_eof, DispatchCtx, PendingKind};
@@ -168,7 +168,8 @@ impl<C: Clock, L: ReceiptLedger> McpProxy<C, L> {
                 }
             };
 
-        if ctx.state.upstream_eof {
+        if ctx.state.upstream_eof || ctx.transport.poll_upstream_eof() {
+            ctx.state.upstream_eof = true;
             return emit_upstream_eof(ctx.client_out, Some(&req_id));
         }
 
@@ -365,6 +366,7 @@ fn extract_tool_call_params(
     let Some(params) = obj.get("params").and_then(ExactJson::as_object) else {
         return Err("tools/call params must be a JSON object".to_string());
     };
+    reject_unknown_keys(params, &["name", "arguments", "_meta"], "tools/call params")?;
     let Some(name) = params.get("name").and_then(ExactJson::as_str) else {
         return Err("tools/call params.name must be a string".to_string());
     };

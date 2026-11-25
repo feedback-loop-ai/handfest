@@ -223,6 +223,11 @@ pub enum MappingError {
         arg: String,
         detail: String,
     },
+    CaseCollidingArgumentKey {
+        tool: String,
+        key: String,
+        collides_with: String,
+    },
 }
 
 impl fmt::Display for MappingError {
@@ -253,6 +258,14 @@ impl fmt::Display for MappingError {
             Self::InvalidArgumentFact { tool, arg, detail } => {
                 write!(f, "tool '{tool}': invalid argument fact '{arg}': {detail}")
             }
+            Self::CaseCollidingArgumentKey {
+                tool,
+                key,
+                collides_with,
+            } => write!(
+                f,
+                "tool '{tool}': argument key '{key}' collides case-insensitively with '{collides_with}'"
+            ),
         }
     }
 }
@@ -329,6 +342,10 @@ impl ToolPolicyMap {
                 });
             }
         };
+
+        if let Some(args_val) = arguments {
+            check_argument_case_collisions(tool_name, policy, args_val, args_map)?;
+        }
 
         let resource_id = resolve_resource_id(tool_name, policy, args_map)?;
         let facts = build_verified_facts(tool_name, policy, args_map)?;
@@ -527,6 +544,77 @@ fn invalid_arg(tool_name: &str, arg_key: &str, detail: &str) -> MappingError {
         arg: arg_key.to_string(),
         detail: detail.to_string(),
     }
+}
+
+fn check_argument_case_collisions(
+    tool_name: &str,
+    policy: &ToolPolicy,
+    args_val: &ExactJson,
+    args_map: &BTreeMap<String, ExactJson>,
+) -> Result<(), MappingError> {
+    check_json_case_collisions(tool_name, args_val)?;
+    if let Some(configured) = policy.resource_id_arg.as_deref() {
+        reject_configured_case_collision(tool_name, args_map, configured)?;
+    }
+    for configured in policy.arg_facts.keys() {
+        reject_configured_case_collision(tool_name, args_map, configured)?;
+    }
+    Ok(())
+}
+
+fn reject_configured_case_collision(
+    tool_name: &str,
+    args_map: &BTreeMap<String, ExactJson>,
+    configured: &str,
+) -> Result<(), MappingError> {
+    if let Some(key) = args_map
+        .keys()
+        .find(|k| k.as_str() != configured && k.eq_ignore_ascii_case(configured))
+    {
+        return Err(MappingError::CaseCollidingArgumentKey {
+            tool: tool_name.to_string(),
+            key: key.clone(),
+            collides_with: configured.to_string(),
+        });
+    }
+    Ok(())
+}
+
+fn check_json_case_collisions(tool_name: &str, val: &ExactJson) -> Result<(), MappingError> {
+    match val {
+        ExactJson::Object(map) => {
+            if let Some((a, b)) = find_case_colliding_keys(map) {
+                return Err(MappingError::CaseCollidingArgumentKey {
+                    tool: tool_name.to_string(),
+                    key: b.to_string(),
+                    collides_with: a.to_string(),
+                });
+            }
+            for child in map.values() {
+                check_json_case_collisions(tool_name, child)?;
+            }
+            Ok(())
+        }
+        ExactJson::Array(items) => {
+            for item in items {
+                check_json_case_collisions(tool_name, item)?;
+            }
+            Ok(())
+        }
+        ExactJson::Null | ExactJson::Bool(_) | ExactJson::Number(_) | ExactJson::Str(_) => Ok(()),
+    }
+}
+
+fn find_case_colliding_keys(map: &BTreeMap<String, ExactJson>) -> Option<(&str, &str)> {
+    let mut seen: BTreeMap<String, &str> = BTreeMap::new();
+    for key in map.keys() {
+        let folded = key.to_ascii_lowercase();
+        if let Some(&prev) = seen.get(&folded) {
+            return Some((prev, key.as_str()));
+        }
+        seen.insert(folded, key.as_str());
+    }
+    None
 }
 
 fn is_valid_concrete_action(action: &str) -> bool {

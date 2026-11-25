@@ -31,6 +31,7 @@ pub(crate) enum RecvOutcome {
 
 pub(crate) struct DuplexTransport {
     event_rx: Receiver<IoEvent>,
+    buffered_events: VecDeque<IoEvent>,
     upstream_tx: Option<SyncSender<String>>,
     pending_upstream: VecDeque<String>,
     writer_wakeup_armed: Arc<AtomicBool>,
@@ -106,6 +107,7 @@ impl DuplexTransport {
 
         Self {
             event_rx,
+            buffered_events: VecDeque::new(),
             upstream_tx: Some(upstream_tx),
             pending_upstream: VecDeque::new(),
             writer_wakeup_armed,
@@ -113,26 +115,63 @@ impl DuplexTransport {
         }
     }
 
-    pub(crate) fn recv_event(&self, deadline: Option<Instant>) -> RecvOutcome {
-        let Some(limit) = deadline else {
-            return match self.event_rx.recv() {
+    pub(crate) fn recv_event(&mut self, deadline: Option<Instant>) -> RecvOutcome {
+        let remaining = match deadline {
+            None => None,
+            Some(limit) => {
+                let rem = limit.saturating_duration_since(Instant::now());
+                if rem.is_zero() {
+                    return RecvOutcome::Timeout;
+                }
+                Some(rem)
+            }
+        };
+        if let Some(ev) = self.buffered_events.pop_front() {
+            return RecvOutcome::Event(ev);
+        }
+        match remaining {
+            None => match self.event_rx.recv() {
                 Ok(ev) => RecvOutcome::Event(ev),
                 Err(_) => RecvOutcome::Disconnected,
-            };
-        };
-        let remaining = limit.saturating_duration_since(Instant::now());
-        if remaining.is_zero() {
-            return match self.event_rx.try_recv() {
+            },
+            Some(rem) => match self.event_rx.recv_timeout(rem) {
                 Ok(ev) => RecvOutcome::Event(ev),
-                Err(TryRecvError::Empty) => RecvOutcome::Timeout,
-                Err(TryRecvError::Disconnected) => RecvOutcome::Disconnected,
-            };
+                Err(RecvTimeoutError::Timeout) => RecvOutcome::Timeout,
+                Err(RecvTimeoutError::Disconnected) => RecvOutcome::Disconnected,
+            },
         }
-        match self.event_rx.recv_timeout(remaining) {
-            Ok(ev) => RecvOutcome::Event(ev),
-            Err(RecvTimeoutError::Timeout) => RecvOutcome::Timeout,
-            Err(RecvTimeoutError::Disconnected) => RecvOutcome::Disconnected,
+    }
+
+    /// Non-blockingly drains up to `EVENT_CHANNEL_BOUND` queued transport events into the
+    /// FIFO buffer and reports whether the next unread upstream event is EOF (`Ok(None)`).
+    ///
+    /// Stops at the first `UpstreamLine` so an unread upstream response sitting ahead of EOF is
+    /// never mistaken for premature EOF.
+    pub(crate) fn poll_upstream_eof(&mut self) -> bool {
+        for ev in &self.buffered_events {
+            if let IoEvent::UpstreamLine(res) = ev {
+                return matches!(res, Ok(None));
+            }
         }
+        while self.buffered_events.len() < EVENT_CHANNEL_BOUND {
+            match self.event_rx.try_recv() {
+                Ok(ev) => {
+                    let outcome = match &ev {
+                        IoEvent::UpstreamLine(Ok(None)) => Some(true),
+                        IoEvent::UpstreamLine(_) => Some(false),
+                        IoEvent::ClientLine(_)
+                        | IoEvent::UpstreamWriteReady
+                        | IoEvent::UpstreamWriteFailed => None,
+                    };
+                    self.buffered_events.push_back(ev);
+                    if let Some(is_eof) = outcome {
+                        return is_eof;
+                    }
+                }
+                Err(TryRecvError::Empty | TryRecvError::Disconnected) => break,
+            }
+        }
+        false
     }
 
     pub(crate) fn has_pending_upstream(&self) -> bool {
@@ -511,6 +550,47 @@ mod tests {
             overflow,
             Err(ProxyError::UpstreamProtocol(ref msg))
                 if msg == "upstream writer queue exceeded maximum pending frames"
+        ));
+    }
+
+    #[test]
+    fn recv_event_enforces_expired_deadline_before_popping_buffered_or_queued_events() {
+        let (ready_tx, ready_rx) = mpsc::sync_channel(1);
+        let (_client_hold_tx, client_hold_rx) = mpsc::sync_channel(1);
+        let mut transport = DuplexTransport::start(
+            BufReader::new(BlockingEofReader(client_hold_rx)),
+            Vec::<u8>::new(),
+            BufReader::new(BurstLineReader::new(4, ready_tx)),
+            1024,
+        );
+        ready_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("upstream notifications queued in event_rx");
+
+        // Even with events ready in `event_rx` (and also when buffered via `poll_upstream_eof`),
+        // an already-expired deadline MUST return `Timeout` immediately.
+        let expired = Instant::now();
+        assert!(matches!(
+            transport.recv_event(Some(expired)),
+            RecvOutcome::Timeout
+        ));
+        // Unread notification sits ahead of EOF, so `poll_upstream_eof` buffers it and returns false.
+        assert!(!transport.poll_upstream_eof());
+        assert!(matches!(
+            transport.recv_event(Some(expired)),
+            RecvOutcome::Timeout
+        ));
+        // Drain all 4 notifications; now EOF is the next upstream event.
+        for _ in 0..4 {
+            assert!(matches!(
+                transport.recv_event(Some(Instant::now() + Duration::from_secs(2))),
+                RecvOutcome::Event(IoEvent::UpstreamLine(Ok(Some(_))))
+            ));
+        }
+        assert!(transport.poll_upstream_eof());
+        assert!(matches!(
+            transport.recv_event(Some(expired)),
+            RecvOutcome::Timeout
         ));
     }
 }

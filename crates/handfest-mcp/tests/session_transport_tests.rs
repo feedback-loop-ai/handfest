@@ -1004,3 +1004,528 @@ fn full_waiting_queue_with_interleaved_upstream_notifications_does_not_reparse_q
     proxy_thread.join().unwrap().unwrap();
     responder.join().unwrap();
 }
+
+#[test]
+fn upstream_eof_with_pending_upstream_and_no_active_request_aborts_queued_request_without_deadlock()
+{
+    use std::time::Instant;
+
+    let now = parse_rfc3339_utc("2026-06-01T00:00:00Z").unwrap();
+    let (verified, agent_kp) = single_hop_chain("");
+    let mut proxy = McpProxy::new(
+        verified,
+        agent_kp.key_id(),
+        merge_pr_policy_map(),
+        SqliteLedger::open_in_memory().unwrap(),
+        FixedClock::new(now),
+    )
+    .unwrap();
+
+    // Fill the writer queue with notifications (so `active_request == None` and
+    // `transport.has_pending_upstream() == true`), then queue `ping (id: 2)` behind backpressure.
+    let mut prefix = Vec::new();
+    for _ in 0..1026 {
+        prefix
+            .extend_from_slice(b"{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}\n");
+    }
+    prefix.extend_from_slice(b"{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"ping\"}\n");
+
+    let (drained_tx, drained_rx) = mpsc::sync_channel(1);
+    let (_close_tx, close_rx) = mpsc::sync_channel(1);
+    let client_in_r = BufReader::new(SignalAfterPrefixReader {
+        prefix,
+        pos: 0,
+        drained_tx: Some(drained_tx),
+        close_rx,
+    });
+    let (mut client_out_w, mut client_out_r) = mem_pipe();
+    let (_gate_tx, gate_rx) = mpsc::sync_channel(1);
+    let (entered_tx, entered_rx) = mpsc::sync_channel(1);
+    let (up_out_w, up_out_r) = mem_pipe();
+
+    let proxy_thread = thread::spawn(move || {
+        proxy.run(
+            client_in_r,
+            &mut client_out_w,
+            GateWriter {
+                gate_rx: Some(gate_rx),
+                entered_tx: Some(entered_tx),
+            },
+            up_out_r,
+        )
+    });
+
+    entered_rx
+        .recv_timeout(Duration::from_secs(2))
+        .expect("writer stalled on GateWriter");
+    drained_rx
+        .recv_timeout(Duration::from_secs(2))
+        .expect("notifications spilled into pending_upstream and ping id: 2 queued");
+
+    // Close upstream stdout while client stdin remains open (shutdown_deadline is None) and
+    // `active_request` is None: proxy MUST abort queued `id: 2` with -32603 / UpstreamEof
+    // immediately instead of deadlocking on `recv_event(None)`.
+    let started = Instant::now();
+    drop(up_out_w);
+
+    let mut err_line = String::new();
+    client_out_r.read_line(&mut err_line).unwrap();
+    let err_resp: Value = serde_json::from_str(err_line.trim_end()).unwrap();
+    assert_eq!(err_resp["id"], json!(2));
+    assert_eq!(err_resp["error"]["code"], json!(-32603));
+
+    let res = proxy_thread.join().unwrap();
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "upstream_eof deadlocked with has_pending_upstream()==true and active_request==None"
+    );
+    assert!(
+        matches!(res, Err(ProxyError::UpstreamEof)),
+        "expected ProxyError::UpstreamEof, got {res:?}"
+    );
+}
+
+#[test]
+fn queued_tools_call_drains_pending_upstream_eof_before_consuming_sqlite_quota() {
+    struct GatedRespThenEofReader {
+        release_rx: Option<mpsc::Receiver<()>>,
+        payload: Cursor<Vec<u8>>,
+        dropped_tx: Option<mpsc::SyncSender<()>>,
+    }
+
+    impl Read for GatedRespThenEofReader {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            if let Some(rx) = self.release_rx.take() {
+                let _ = rx.recv();
+            }
+            self.payload.read(buf)
+        }
+    }
+
+    impl Drop for GatedRespThenEofReader {
+        fn drop(&mut self) {
+            if let Some(tx) = self.dropped_tx.take() {
+                let _ = tx.send(());
+            }
+        }
+    }
+
+    let now = parse_rfc3339_utc("2026-06-01T00:00:00Z").unwrap();
+    let (verified, agent_kp) = single_hop_chain("LIMIT 1 calls\n");
+    let mut proxy = McpProxy::new(
+        verified,
+        agent_kp.key_id(),
+        merge_pr_policy_map(),
+        SqliteLedger::open_in_memory().unwrap(),
+        FixedClock::new(now),
+    )
+    .unwrap();
+
+    // Upstream writes the reply to `ping (id: 1)` and immediately hits EOF, so BOTH
+    // `UpstreamLine(Ok(Some(resp_1)))` and `UpstreamLine(Ok(None))` are already queued in
+    // `event_rx` when `id: 1` finishes and `tools/call (id: 2)` is dequeued.
+    let (mut client_in_w, client_in_r) = mem_pipe();
+    let (mut client_out_w, mut client_out_r) = mem_pipe();
+    let (up_in_w, mut up_in_r) = mem_pipe();
+    let (eof_tx, eof_rx) = mpsc::sync_channel(1);
+    let (release_tx, release_rx) = mpsc::sync_channel(1);
+
+    let up_out_r = BufReader::new(GatedRespThenEofReader {
+        release_rx: Some(release_rx),
+        payload: Cursor::new(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"pong\":1}}\n".to_vec()),
+        dropped_tx: Some(eof_tx),
+    });
+
+    let proxy_thread = thread::spawn(move || {
+        let res = proxy.run(client_in_r, &mut client_out_w, up_in_w, up_out_r);
+        (proxy, res)
+    });
+
+    writeln!(client_in_w, r#"{{"jsonrpc":"2.0","id":1,"method":"ping"}}"#).unwrap();
+    let mut seen_ping = String::new();
+    up_in_r.read_line(&mut seen_ping).unwrap();
+    assert!(seen_ping.contains("\"id\":1"));
+
+    writeln!(
+        client_in_w,
+        r#"{{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{{"name":"merge_pr","arguments":{{"repo":"org/app"}}}}}}"#
+    )
+    .unwrap();
+    thread::sleep(Duration::from_millis(30));
+
+    release_tx.send(()).unwrap();
+    eof_rx
+        .recv_timeout(Duration::from_secs(2))
+        .expect("upstream emitted resp 1 + EOF into event_rx");
+
+    let mut line1 = String::new();
+    client_out_r.read_line(&mut line1).unwrap();
+    let resp1: Value = serde_json::from_str(line1.trim_end()).unwrap();
+    assert_eq!(resp1["id"], json!(1));
+    assert_eq!(resp1["result"]["pong"], json!(1));
+
+    let mut line2 = String::new();
+    client_out_r.read_line(&mut line2).unwrap();
+    let resp2: Value = serde_json::from_str(line2.trim_end()).unwrap();
+    assert_eq!(resp2["id"], json!(2));
+    assert_eq!(resp2["error"]["code"], json!(-32603));
+
+    drop(client_in_w);
+    let (proxy, res) = proxy_thread.join().unwrap();
+    assert!(
+        matches!(res, Err(ProxyError::UpstreamEof)),
+        "expected ProxyError::UpstreamEof, got {res:?}"
+    );
+    assert_eq!(
+        proxy.ledger().verify_integrity().unwrap(),
+        0,
+        "queued tools/call must not consume SQLite quota when UpstreamEof is already in event_rx"
+    );
+}
+
+#[test]
+fn queued_cancellation_trapped_behind_intervening_request_delivers_when_target_activates() {
+    let now = parse_rfc3339_utc("2026-06-01T00:00:00Z").unwrap();
+    let (verified, agent_kp) = single_hop_chain("");
+    let mut proxy = McpProxy::new(
+        verified,
+        agent_kp.key_id(),
+        merge_pr_policy_map(),
+        SqliteLedger::open_in_memory().unwrap(),
+        FixedClock::new(now),
+    )
+    .unwrap();
+
+    let (mut client_in_w, client_in_r) = mem_pipe();
+    let (mut client_out_w, mut client_out_r) = mem_pipe();
+    let (up_in_tx, up_in_rx) = mpsc::channel::<Vec<u8>>();
+    let up_in_w = PipeWriter { tx: up_in_tx };
+    let (mut up_out_w, up_out_r) = mem_pipe();
+
+    let proxy_thread =
+        thread::spawn(move || proxy.run(client_in_r, &mut client_out_w, up_in_w, up_out_r));
+
+    writeln!(client_in_w, r#"{{"jsonrpc":"2.0","id":1,"method":"ping"}}"#).unwrap();
+    let f1 = String::from_utf8(up_in_rx.recv_timeout(Duration::from_secs(2)).unwrap()).unwrap();
+    assert_eq!(
+        serde_json::from_str::<Value>(f1.trim_end()).unwrap()["id"],
+        json!(1)
+    );
+
+    // While id: 1 is active, pipeline:
+    //   1. tools/call (id: 2)
+    //   2. ping (id: 3)   <-- intervening queued request
+    //   3. notifications/cancelled (requestId: 2) <-- trapped behind id: 3
+    writeln!(
+        client_in_w,
+        r#"{{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{{"name":"merge_pr","arguments":{{"repo":"org/app"}}}}}}"#
+    )
+    .unwrap();
+    writeln!(client_in_w, r#"{{"jsonrpc":"2.0","id":3,"method":"ping"}}"#).unwrap();
+    writeln!(
+        client_in_w,
+        r#"{{"jsonrpc":"2.0","method":"notifications/cancelled","params":{{"requestId":2}}}}"#
+    )
+    .unwrap();
+    thread::sleep(Duration::from_millis(30));
+
+    // Complete id: 1 -> id: 2 activates, its trapped cancellation MUST fire immediately without
+    // waiting for id: 2 to respond, and then id: 3 activates immediately after.
+    writeln!(
+        up_out_w,
+        r#"{{"jsonrpc":"2.0","id":1,"result":{{"pong":1}}}}"#
+    )
+    .unwrap();
+    let mut resp1 = String::new();
+    client_out_r.read_line(&mut resp1).unwrap();
+
+    let f2 = String::from_utf8(up_in_rx.recv_timeout(Duration::from_secs(2)).unwrap()).unwrap();
+    let p2: Value = serde_json::from_str(f2.trim_end()).unwrap();
+    assert_eq!(p2["id"], json!(2));
+    assert_eq!(p2["method"], json!("tools/call"));
+
+    let f3 = String::from_utf8(up_in_rx.recv_timeout(Duration::from_secs(2)).unwrap()).unwrap();
+    let p3: Value = serde_json::from_str(f3.trim_end()).unwrap();
+    assert_eq!(p3["method"], json!("notifications/cancelled"));
+    assert_eq!(p3["params"]["requestId"], json!(2));
+
+    let f4 = String::from_utf8(up_in_rx.recv_timeout(Duration::from_secs(2)).unwrap()).unwrap();
+    let p4: Value = serde_json::from_str(f4.trim_end()).unwrap();
+    assert_eq!(p4["id"], json!(3));
+    assert_eq!(p4["method"], json!("ping"));
+
+    writeln!(
+        up_out_w,
+        r#"{{"jsonrpc":"2.0","id":3,"result":{{"pong":3}}}}"#
+    )
+    .unwrap();
+    let mut resp3 = String::new();
+    client_out_r.read_line(&mut resp3).unwrap();
+    assert_eq!(
+        serde_json::from_str::<Value>(resp3.trim_end()).unwrap()["id"],
+        json!(3)
+    );
+
+    drop(client_in_w);
+    drop(up_out_w);
+    proxy_thread.join().unwrap().unwrap();
+}
+
+struct GatedPipeWriter {
+    gate_rx: Option<mpsc::Receiver<()>>,
+    entered_tx: Option<mpsc::SyncSender<()>>,
+    tx: mpsc::Sender<Vec<u8>>,
+}
+
+impl Write for GatedPipeWriter {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        if let Some(tx) = self.entered_tx.take() {
+            let _ = tx.send(());
+        }
+        if let Some(rx) = self.gate_rx.take() {
+            let _ = rx.recv();
+        }
+        self.tx
+            .send(buf.to_vec())
+            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "closed"))?;
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+#[test]
+fn queued_cancellation_trapped_behind_request_under_backpressure_delivers_when_writer_clears() {
+    let now = parse_rfc3339_utc("2026-06-01T00:00:00Z").unwrap();
+    let (verified, agent_kp) = single_hop_chain("");
+    let mut proxy = McpProxy::new(
+        verified,
+        agent_kp.key_id(),
+        merge_pr_policy_map(),
+        SqliteLedger::open_in_memory().unwrap(),
+        FixedClock::new(now),
+    )
+    .unwrap();
+
+    // Activate id: 1, fill the writer queue so `has_pending_upstream() == true`, then queue
+    // `ping (id: 2)` followed by `notifications/cancelled (requestId: 1)` behind it.
+    let mut prefix = Vec::new();
+    prefix.extend_from_slice(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"ping\"}\n");
+    for _ in 0..1026 {
+        prefix
+            .extend_from_slice(b"{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}\n");
+    }
+    prefix.extend_from_slice(b"{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"ping\"}\n");
+    prefix.extend_from_slice(
+        b"{\"jsonrpc\":\"2.0\",\"method\":\"notifications/cancelled\",\"params\":{\"requestId\":1}}\n",
+    );
+    // Append > EVENT_CHANNEL_BOUND (64) trailing notifications so `drained_rx` cannot fire until
+    // the proxy loop has already moved `id: 2` and `cancel(1)` into `state.queued_client`.
+    for _ in 0..70 {
+        prefix
+            .extend_from_slice(b"{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}\n");
+    }
+
+    let (drained_tx, drained_rx) = mpsc::sync_channel(1);
+    let (close_tx, close_rx) = mpsc::sync_channel(1);
+    let client_in_r = BufReader::new(SignalAfterPrefixReader {
+        prefix,
+        pos: 0,
+        drained_tx: Some(drained_tx),
+        close_rx,
+    });
+    let (mut client_out_w, mut client_out_r) = mem_pipe();
+    let (gate_tx, gate_rx) = mpsc::sync_channel(1);
+    let (entered_tx, entered_rx) = mpsc::sync_channel(1);
+    let (up_in_tx, up_in_rx) = mpsc::channel::<Vec<u8>>();
+    let (mut up_out_w, up_out_r) = mem_pipe();
+
+    let proxy_thread = thread::spawn(move || {
+        proxy.run(
+            client_in_r,
+            &mut client_out_w,
+            GatedPipeWriter {
+                gate_rx: Some(gate_rx),
+                entered_tx: Some(entered_tx),
+                tx: up_in_tx,
+            },
+            up_out_r,
+        )
+    });
+
+    entered_rx
+        .recv_timeout(Duration::from_secs(2))
+        .expect("writer blocked on id: 1");
+    drained_rx
+        .recv_timeout(Duration::from_secs(2))
+        .expect("backpressure queued id: 2 and cancel(1)");
+
+    // Release writer backpressure -> id: 1 cancellation trapped behind id: 2 MUST be delivered
+    // immediately without waiting for id: 1 to respond, followed by id: 2.
+    gate_tx.send(()).unwrap();
+
+    let mut saw_cancel_1 = false;
+    let mut saw_ping_2 = false;
+    while !(saw_cancel_1 && saw_ping_2) {
+        let frame = String::from_utf8(
+            up_in_rx
+                .recv_timeout(Duration::from_secs(2))
+                .expect("expected cancel(1) and ping(2) after writer backpressure cleared"),
+        )
+        .unwrap();
+        let parsed: Value = serde_json::from_str(frame.trim_end()).unwrap();
+        if parsed["method"] == json!("notifications/cancelled")
+            && parsed["params"]["requestId"] == json!(1)
+        {
+            assert!(
+                !saw_ping_2,
+                "cancel(1) must be delivered before ping(2) activates"
+            );
+            saw_cancel_1 = true;
+        } else if parsed["id"] == json!(2) && parsed["method"] == json!("ping") {
+            saw_ping_2 = true;
+        }
+    }
+
+    writeln!(
+        up_out_w,
+        r#"{{"jsonrpc":"2.0","id":2,"result":{{"pong":2}}}}"#
+    )
+    .unwrap();
+    let mut resp2 = String::new();
+    client_out_r.read_line(&mut resp2).unwrap();
+    assert_eq!(
+        serde_json::from_str::<Value>(resp2.trim_end()).unwrap()["id"],
+        json!(2)
+    );
+
+    drop(close_tx);
+    drop(up_out_w);
+    proxy_thread.join().unwrap().unwrap();
+}
+
+struct ContinuousNotificationReader {
+    start_rx: Option<mpsc::Receiver<()>>,
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    pos: usize,
+}
+
+impl Read for ContinuousNotificationReader {
+    fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
+        const LINE: &[u8] =
+            b"{\"jsonrpc\":\"2.0\",\"method\":\"notifications/progress\",\"params\":{}}\n";
+        if let Some(rx) = self.start_rx.take() {
+            let _ = rx.recv();
+        }
+        if self.stop.load(std::sync::atomic::Ordering::Relaxed) {
+            return Ok(0);
+        }
+        let mut written = 0;
+        while written < out.len() {
+            let n = (LINE.len() - self.pos).min(out.len() - written);
+            out[written..written + n].copy_from_slice(&LINE[self.pos..self.pos + n]);
+            written += n;
+            self.pos = (self.pos + n) % LINE.len();
+        }
+        Ok(written)
+    }
+}
+
+struct PacedSinkWriter;
+
+impl Write for PacedSinkWriter {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        // Pace client writes so the upstream reader thread keeps `event_rx` saturated across the
+        // entire shutdown deadline window.
+        thread::sleep(Duration::from_millis(5));
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+#[test]
+fn shutdown_deadline_fires_even_while_chatty_upstream_continuously_emits_notifications() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+    use std::time::Instant;
+
+    let now = parse_rfc3339_utc("2026-06-01T00:00:00Z").unwrap();
+    let (verified, agent_kp) = single_hop_chain("");
+    let mut proxy = McpProxy::new(
+        verified,
+        agent_kp.key_id(),
+        merge_pr_policy_map(),
+        SqliteLedger::open_in_memory().unwrap(),
+        FixedClock::new(now),
+    )
+    .unwrap()
+    .with_shutdown_timeout(Duration::from_millis(80));
+
+    // Stall the upstream writer so `has_pending_upstream() == true` and `active_request == None`
+    // (meaning `check_interleaved_budget` does NOT cap notifications, so only the shutdown deadline
+    // can terminate the session).
+    let mut client_prefix = Vec::new();
+    for _ in 0..1026 {
+        client_prefix
+            .extend_from_slice(b"{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}\n");
+    }
+
+    let (drained_tx, drained_rx) = mpsc::sync_channel(1);
+    let (close_tx, close_rx) = mpsc::sync_channel(1);
+    let client_in_r = BufReader::new(SignalAfterPrefixReader {
+        prefix: client_prefix,
+        pos: 0,
+        drained_tx: Some(drained_tx),
+        close_rx,
+    });
+    let (_gate_tx, gate_rx) = mpsc::sync_channel(1);
+    let (entered_tx, entered_rx) = mpsc::sync_channel(1);
+
+    let (start_tx, start_rx) = mpsc::sync_channel(1);
+    let stop = Arc::new(AtomicBool::new(false));
+    let up_out_r = BufReader::new(ContinuousNotificationReader {
+        start_rx: Some(start_rx),
+        stop: Arc::clone(&stop),
+        pos: 0,
+    });
+
+    let proxy_thread = thread::spawn(move || {
+        let mut sink = PacedSinkWriter;
+        proxy.run(
+            client_in_r,
+            &mut sink,
+            GateWriter {
+                gate_rx: Some(gate_rx),
+                entered_tx: Some(entered_tx),
+            },
+            up_out_r,
+        )
+    });
+
+    entered_rx
+        .recv_timeout(Duration::from_secs(2))
+        .expect("writer stalled");
+    drained_rx
+        .recv_timeout(Duration::from_secs(2))
+        .expect("writer queue filled");
+
+    // Start the continuous notification flood only after writer backpressure is established,
+    // then close client stdin so the shutdown deadline must fire despite saturated `event_rx`.
+    start_tx.send(()).unwrap();
+    let started = Instant::now();
+    drop(close_tx);
+    let res = proxy_thread.join().unwrap();
+    let elapsed = started.elapsed();
+    stop.store(true, Ordering::Relaxed);
+
+    res.expect("shutdown deadline must terminate chatty-upstream session cleanly");
+    assert!(
+        elapsed < Duration::from_secs(1),
+        "chatty upstream defeated shutdown timeout (took {elapsed:?})"
+    );
+}

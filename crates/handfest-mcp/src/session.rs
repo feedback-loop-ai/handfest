@@ -65,6 +65,7 @@ pub(crate) struct SessionState {
     pub(crate) active_request: Option<PendingRequest>,
     cancelled_requests: Vec<PendingRequest>,
     queued_client: VecDeque<QueuedClientItem>,
+    queued_cancellations: usize,
     client_eof: bool,
     pub(crate) upstream_eof: bool,
     shutdown_deadline: Option<Instant>,
@@ -94,6 +95,44 @@ impl SessionState {
         self.active_request.as_ref().is_some_and(|r| &r.id == id)
             || self.cancelled_requests.iter().any(|r| &r.id == id)
     }
+
+    fn push_queued_client(&mut self, item: QueuedClientItem) {
+        if is_cancellation_item(&item) {
+            self.queued_cancellations += 1;
+        }
+        self.queued_client.push_back(item);
+    }
+
+    fn pop_queued_client(&mut self) -> Option<QueuedClientItem> {
+        let item = self.queued_client.pop_front()?;
+        if is_cancellation_item(&item) {
+            self.queued_cancellations -= 1;
+        }
+        Some(item)
+    }
+
+    fn first_queued_request_id(&self) -> Option<&JsonRpcId> {
+        self.queued_client.iter().find_map(|item| match item {
+            QueuedClientItem::Request { id, .. } => Some(id),
+            _ => None,
+        })
+    }
+
+    fn take_queued_active_cancellation(&mut self) -> Option<String> {
+        if self.queued_cancellations == 0 {
+            return None;
+        }
+        let pos = self
+            .queued_client
+            .iter()
+            .position(|item| is_active_cancellation(item, self))?;
+        let item = self.queued_client.remove(pos)?;
+        self.queued_cancellations -= 1;
+        match item {
+            QueuedClientItem::Notification { raw_frame, .. } => Some(raw_frame),
+            _ => None,
+        }
+    }
 }
 
 impl<C: Clock, L: ReceiptLedger> McpProxy<C, L> {
@@ -122,15 +161,17 @@ impl<C: Clock, L: ReceiptLedger> McpProxy<C, L> {
                 return Err(err);
             }
             self.drain_queued_client(&mut state, &mut transport, client_out)?;
+            if state.upstream_eof {
+                if let Some(req_id) = state.first_queued_request_id() {
+                    return emit_upstream_eof(client_out, Some(req_id));
+                }
+            }
             if state.client_eof {
                 if state.queued_client.is_empty()
                     && !transport.has_pending_upstream()
                     && state.active_request.is_none()
                 {
                     return transport.finish_writer(self.shutdown_timeout);
-                }
-                if state.upstream_eof && state.active_request.is_some() {
-                    return emit_upstream_eof(client_out, state.active_id());
                 }
                 state.set_shutdown_timeout(self.shutdown_timeout);
             }
@@ -240,7 +281,7 @@ impl<C: Clock, L: ReceiptLedger> McpProxy<C, L> {
                 "client exceeded maximum queued JSON-RPC frames".to_string(),
             ));
         }
-        state.queued_client.push_back(item);
+        state.push_queued_client(item);
         Ok(())
     }
 
@@ -260,12 +301,13 @@ impl<C: Clock, L: ReceiptLedger> McpProxy<C, L> {
                     Some(QueuedClientItem::Notification { .. })
                 )
             {
-                // Strict FIFO head-of-queue draining: only a notification at the front advances
-                // while a request is active, preventing later cancellations from overtaking earlier
-                // queued notifications and avoiding any scan/reparse of queued frames.
+                if let Some(raw_frame) = state.take_queued_active_cancellation() {
+                    cancel_active_request(&raw_frame, state, transport, client_out)?;
+                    continue;
+                }
                 break;
             }
-            let Some(item) = state.queued_client.pop_front() else {
+            let Some(item) = state.pop_queued_client() else {
                 break;
             };
             self.process_client_item(item, state, transport, client_out)?;
@@ -519,7 +561,8 @@ pub(crate) fn dispatch_to_upstream<CW: Write>(
     raw_frame: &str,
     ctx: &mut DispatchCtx<'_, CW>,
 ) -> Result<(), ProxyError> {
-    if ctx.state.upstream_eof {
+    if ctx.state.upstream_eof || ctx.transport.poll_upstream_eof() {
+        ctx.state.upstream_eof = true;
         return emit_upstream_eof(ctx.client_out, Some(&req_id));
     }
     ctx.transport.send_upstream(raw_frame.to_string())?;
@@ -575,6 +618,17 @@ fn extract_cancel_request_id(obj: &BTreeMap<String, ExactJson>) -> Option<JsonRp
         .and_then(ExactJson::as_object)
         .and_then(|params| params.get("requestId"))
         .and_then(|val| extract_id_value(val).ok())
+}
+
+fn is_cancellation_item(item: &QueuedClientItem) -> bool {
+    matches!(
+        item,
+        QueuedClientItem::Notification {
+            method,
+            cancel_request_id: Some(_),
+            ..
+        } if method == "notifications/cancelled"
+    )
 }
 
 fn is_active_cancellation(item: &QueuedClientItem, state: &SessionState) -> bool {

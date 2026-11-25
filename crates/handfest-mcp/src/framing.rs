@@ -87,6 +87,17 @@ pub(crate) fn extract_id_value(val: &ExactJson) -> Result<JsonRpcId, String> {
     }
 }
 
+pub(crate) fn reject_unknown_keys(
+    obj: &BTreeMap<String, ExactJson>,
+    allowed: &[&str],
+    context: &str,
+) -> Result<(), String> {
+    if let Some(key) = obj.keys().find(|k| !allowed.contains(&k.as_str())) {
+        return Err(format!("unexpected {context} key '{key}'"));
+    }
+    Ok(())
+}
+
 pub(crate) fn extract_request_id(
     obj: &BTreeMap<String, ExactJson>,
 ) -> Result<Option<JsonRpcId>, String> {
@@ -115,6 +126,14 @@ pub(crate) fn validate_client_envelope(
             id,
             message: "client request/notification must not contain result or error".to_string(),
         });
+    }
+
+    if let Err(message) = reject_unknown_keys(
+        obj,
+        &["jsonrpc", "id", "method", "params"],
+        "JSON-RPC client envelope",
+    ) {
+        return Err(ClientEnvelopeError { id, message });
     }
 
     let Some(method) = obj.get("method").and_then(ExactJson::as_str) else {
@@ -164,6 +183,11 @@ pub(crate) fn classify_upstream_frame(
                 "upstream request/notification must not contain result or error".to_string(),
             );
         }
+        reject_unknown_keys(
+            obj,
+            &["jsonrpc", "id", "method", "params"],
+            "upstream JSON-RPC request/notification",
+        )?;
         if let Some(params) = obj.get("params") {
             if !matches!(params, ExactJson::Object(_) | ExactJson::Array(_)) {
                 return Err(
@@ -197,11 +221,22 @@ fn validate_response_body(
         (false, false) => {
             Err("upstream JSON-RPC response must contain either result or error".to_string())
         }
-        (true, false) => Ok(()),
-        (false, true) => match obj.get("error") {
-            Some(err_val) if is_valid_jsonrpc_error_object(err_val) => Ok(()),
-            _ => Err("malformed JSON-RPC error object in upstream response".to_string()),
-        },
+        (true, false) => reject_unknown_keys(
+            obj,
+            &["jsonrpc", "id", "result"],
+            "upstream JSON-RPC response",
+        ),
+        (false, true) => {
+            reject_unknown_keys(
+                obj,
+                &["jsonrpc", "id", "error"],
+                "upstream JSON-RPC response",
+            )?;
+            match obj.get("error") {
+                Some(err_val) if is_valid_jsonrpc_error_object(err_val) => Ok(()),
+                _ => Err("malformed JSON-RPC error object in upstream response".to_string()),
+            }
+        }
     }
 }
 
@@ -550,5 +585,62 @@ mod tests {
         let valid_arr =
             parse_exact_json(r#"{"jsonrpc":"2.0","id":1,"method":"ping","params":[1]}"#).unwrap();
         assert!(validate_client_envelope(valid_arr.as_object().unwrap()).is_ok());
+    }
+
+    #[test]
+    fn closed_envelope_keys_reject_case_colliding_and_unknown_top_level_fields() {
+        let bad_client = [
+            (
+                r#"{"jsonrpc":"2.0","id":1,"method":"ping","METHOD":"tools/call"}"#,
+                "unexpected JSON-RPC client envelope key 'METHOD'",
+            ),
+            (
+                r#"{"jsonrpc":"2.0","id":1,"method":"ping","ID":2}"#,
+                "unexpected JSON-RPC client envelope key 'ID'",
+            ),
+            (
+                r#"{"jsonrpc":"2.0","id":1,"method":"ping","RESULT":{}}"#,
+                "unexpected JSON-RPC client envelope key 'RESULT'",
+            ),
+            (
+                r#"{"jsonrpc":"2.0","method":"notifications/initialized","ERROR":{}}"#,
+                "unexpected JSON-RPC client envelope key 'ERROR'",
+            ),
+        ];
+        for (raw, expected) in bad_client {
+            let parsed = parse_exact_json(raw).unwrap();
+            let err = validate_client_envelope(parsed.as_object().unwrap()).unwrap_err();
+            assert_eq!(err.message, expected, "client input: {raw}");
+        }
+
+        let bad_upstream = [
+            (
+                r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32603,"message":"fail"},"RESULT":{"tools":[]}}"#,
+                "unexpected upstream JSON-RPC response key 'RESULT'",
+            ),
+            (
+                r#"{"jsonrpc":"2.0","id":1,"result":{"ok":true},"ERROR":{"code":-1,"message":"x"}}"#,
+                "unexpected upstream JSON-RPC response key 'ERROR'",
+            ),
+            (
+                r#"{"jsonrpc":"2.0","id":1,"result":{"ok":true},"extra":1}"#,
+                "unexpected upstream JSON-RPC response key 'extra'",
+            ),
+            (
+                r#"{"jsonrpc":"2.0","method":"notifications/progress","RESULT":{}}"#,
+                "unexpected upstream JSON-RPC request/notification key 'RESULT'",
+            ),
+            (
+                r#"{"jsonrpc":"2.0","id":5,"method":"sampling/createMessage","METHOD":"ping"}"#,
+                "unexpected upstream JSON-RPC request/notification key 'METHOD'",
+            ),
+        ];
+        for (raw, expected) in bad_upstream {
+            let parsed = parse_exact_json(raw).unwrap();
+            let err = classify_upstream_frame(parsed.as_object().unwrap())
+                .err()
+                .expect("malformed upstream envelope must fail");
+            assert_eq!(err, expected, "upstream input: {raw}");
+        }
     }
 }
