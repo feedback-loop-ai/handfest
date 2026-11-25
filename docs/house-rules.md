@@ -54,6 +54,21 @@ High cyclomatic complexity paired with thin test coverage is a design defect:
 * `handfest-core` is strictly `#![no_std]` + `alloc`: **zero I/O, zero system clock, zero RNG, zero network.** Timestamps, verified anchor proofs, verified facts, and quota snapshots enter as pure arguments so every ruling replays byte-for-byte.
 * **Fail closed everywhere:** Ambiguous wire frames (e.g. bare `\r`, `result` + `error` together), missing facts, unknown tools, negative/corrupt quotas, unauthenticated metadata, or non-canonical mandate text must always refuse cleanly.
 
+### 8. AI-Native Implementation
+
+* **First-class actors everywhere:** Humans, organizations, services, and AI agents (`ActorKind::Agent`) are native, equal peers across every crate — never model AI agents as a hacky subtype of human sessions or ambient API keys.
+* **Machine-first, human-legible surfaces:** Every CLI response, JSON-RPC refusal, error payload, and receipt must be structured, typed, and unambiguously parseable so both autonomous agents and human auditors can consume it deterministically without scraping prose.
+
+### 9. Deterministic Over Stochastic — Everywhere Possible
+
+* Never put an LLM, heuristic, fuzzy matcher, or stochastic classifier in parsing, canonicalization, signature verification, lattice narrowing, policy evaluation, quota accounting, wire framing, or audit replay.
+* Any optional natural-language drafting helper lives strictly *outside* the trust boundary and *before* WYSIWYS signing — once signed, **100% deterministic code** decides every ruling, byte-for-byte replayable offline.
+
+### 10. 100% Test Coverage (On All Levels)
+
+* Hold **100% line and branch coverage across all levels**: unit tests, boundary/property tests, integration tests, adversarial/negative security tests, and end-to-end binary/wire tests.
+* Every production guard, error path, and refusal branch must be bound by a test that fails when the guard is mutated or removed. Prefer making invalid states unrepresentable in the type system over leaving unreachable defensive branches; any genuinely unreachable branch must be explicitly justified.
+
 ---
 
 ## Reviewer Severity Table
@@ -61,6 +76,6 @@ High cyclomatic complexity paired with thin test coverage is a design defect:
 Judges (`correctness`, `adversarial`, `chief`) rate findings against these rules using this table:
 
 * **`info`:** Minor style or clarity suggestion already covered by a deterministic gate, or a non-blocking documentation note.
-* **`low`:** Function/file over complexity ceiling, unused `pub` item, minor DRY duplication within one module, or a weak test assertion that doesn't hide a bug.
-* **`medium`:** Violation of architectural decoupling (hardcoding concrete `Ed25519`/SQLite/harness logic into a consumer instead of using the abstraction seam), cross-crate DRY duplication (copy-pasting parsers/codecs), untyped `Value` crossing a crate boundary, error matched by message string, or a correctness/determinism bug without security bypass.
+* **`low`:** Function/file over complexity ceiling, unused `pub` item, minor DRY duplication within one module, or a non-security branch lacking a dedicated coverage test.
+* **`medium`:** Violation of architectural decoupling (hardcoding concrete `Ed25519`/SQLite/harness logic into a consumer instead of using the abstraction seam), cross-crate DRY duplication (copy-pasting parsers/codecs), untyped `Value` crossing a crate boundary, error matched by message string, stochastic/heuristic logic where a deterministic rule belongs, or an untested security/error branch or test that cannot fail.
 * **`high` or `critical` (security-hold):** Any fail-open path, signature/metadata bypass, frame smuggling, quota bypass, tampering undetected by audit, secret permission leak, or weakened refusal boundary.
