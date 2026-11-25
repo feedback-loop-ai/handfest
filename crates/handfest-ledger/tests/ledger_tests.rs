@@ -291,20 +291,52 @@ fn verify_integrity_catches_sql_tampering_and_missing_rows() {
         Err(LedgerError::Integrity(_))
     ));
 
-    // 2. Tamper prev_receipt_hash on seq 2.
+    // 2. Tamper prev_receipt_hash on seq 2 AND recompute valid receipt_hash on seq 2 and seq 3
+    // so every row passes receipt.verify_hash() and ONLY the prev_receipt_hash continuity guard
+    // catches the broken chain link.
     let db2 = make_populated_db("tamper_prev.sqlite");
     {
+        let mut r2 = {
+            let mut ledger = SqliteLedger::open_in_memory().unwrap();
+            let _ = ledger
+                .evaluate_and_record(&chain, &req, &facts, ts("2026-11-24T18:00:00Z"))
+                .unwrap();
+            let (_, r2) = ledger
+                .evaluate_and_record(&chain, &req, &facts, ts("2026-11-24T18:01:00Z"))
+                .unwrap();
+            let (_, r3) = ledger
+                .evaluate_and_record(&chain, &req, &facts, ts("2026-11-24T18:02:00Z"))
+                .unwrap();
+            (r2, r3)
+        };
+        let forged_prev = MandateId([0u8; 32]);
+        r2.0.prev_receipt_hash = Some(forged_prev);
+        r2.0.receipt_hash = r2.0.compute_hash();
+        assert!(r2.0.verify_hash());
+        r2.1.prev_receipt_hash = Some(r2.0.receipt_hash);
+        r2.1.receipt_hash = r2.1.compute_hash();
+        assert!(r2.1.verify_hash());
+
         let raw = Connection::open(&db2).unwrap();
         raw.execute(
-            "UPDATE receipts SET prev_receipt_hash = ?1 WHERE seq = 2",
-            [format!("sha256:{}", "0".repeat(64))],
+            "UPDATE receipts SET prev_receipt_hash = ?1, receipt_hash = ?2 WHERE seq = 2",
+            [forged_prev.to_string(), r2.0.receipt_hash.to_string()],
+        )
+        .unwrap();
+        raw.execute(
+            "UPDATE receipts SET prev_receipt_hash = ?1, receipt_hash = ?2 WHERE seq = 3",
+            [r2.0.receipt_hash.to_string(), r2.1.receipt_hash.to_string()],
         )
         .unwrap();
     }
-    assert!(matches!(
-        SqliteLedger::open(&db2).unwrap().verify_integrity(),
-        Err(LedgerError::Integrity(_))
-    ));
+    let broken_link_err = SqliteLedger::open(&db2)
+        .unwrap()
+        .verify_integrity()
+        .unwrap_err();
+    assert!(
+        matches!(&broken_link_err, LedgerError::Integrity(msg) if msg.contains("broken prev_receipt_hash link")),
+        "expected broken prev_receipt_hash link error, got: {broken_link_err}"
+    );
 
     // 3. Delete middle row (seq = 2).
     let db3 = make_populated_db("delete_mid.sqlite");
@@ -1190,14 +1222,13 @@ fn open_read_only_preserves_in_process_posix_locks_on_same_inode() {
     let req = merge_request();
     let facts = valentin_facts();
 
-    {
-        let mut ledger = SqliteLedger::open(&db_path).unwrap();
-        ledger
-            .evaluate_and_record(&chain, &req, &facts, ts("2026-11-24T18:00:00Z"))
-            .unwrap();
-    }
+    let mut active_writer = SqliteLedger::open(&db_path).unwrap();
+    active_writer
+        .evaluate_and_record(&chain, &req, &facts, ts("2026-11-24T18:00:00Z"))
+        .unwrap();
     // Rollback (DELETE) mode holds POSIX fcntl locks directly on the main DB inode.
-    // BEGIN IMMEDIATE acquires a RESERVED lock (blocking other writers while permitting readers).
+    // BEGIN IMMEDIATE acquires a RESERVED lock (blocking other writers while permitting readers)
+    // while `active_writer` remains open in this process.
     let lock_holder = Connection::open(&db_path).unwrap();
     lock_holder.execute_batch("BEGIN IMMEDIATE;").unwrap();
 
@@ -1224,6 +1255,7 @@ fn open_read_only_preserves_in_process_posix_locks_on_same_inode() {
 
     lock_holder.execute_batch("ROLLBACK;").unwrap();
     drop(lock_holder);
+    drop(active_writer);
 
     // Sanity check: once the parent releases its lock, the child probe succeeds.
     let unlocked_status = Command::new(&exe)

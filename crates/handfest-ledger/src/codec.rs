@@ -2,6 +2,7 @@
 
 use handfest_core::ast::MandateId;
 use handfest_core::Verdict;
+use rusqlite::Row;
 
 use crate::LedgerError;
 
@@ -112,6 +113,36 @@ fn write_escaped_receipt_quoted(out: &mut String, value: &str) {
         }
     }
     out.push('"');
+}
+
+pub(crate) fn col_text(row: &Row<'_>, idx: usize, label: &str) -> Result<String, LedgerError> {
+    row.get::<_, String>(idx)
+        .map_err(|err| LedgerError::Integrity(format!("invalid TEXT value in {label}: {err}")))
+}
+
+pub(crate) fn col_opt_text(
+    row: &Row<'_>,
+    idx: usize,
+    label: &str,
+) -> Result<Option<String>, LedgerError> {
+    row.get::<_, Option<String>>(idx).map_err(|err| {
+        LedgerError::Integrity(format!("invalid nullable TEXT value in {label}: {err}"))
+    })
+}
+
+pub(crate) fn col_i64(row: &Row<'_>, idx: usize, label: &str) -> Result<i64, LedgerError> {
+    row.get::<_, i64>(idx)
+        .map_err(|err| LedgerError::Integrity(format!("invalid INTEGER value in {label}: {err}")))
+}
+
+pub(crate) fn col_opt_i64(
+    row: &Row<'_>,
+    idx: usize,
+    label: &str,
+) -> Result<Option<i64>, LedgerError> {
+    row.get::<_, Option<i64>>(idx).map_err(|err| {
+        LedgerError::Integrity(format!("invalid nullable INTEGER value in {label}: {err}"))
+    })
 }
 
 #[cfg(test)]

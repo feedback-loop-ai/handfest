@@ -5,50 +5,98 @@ use std::collections::{BTreeMap, BTreeSet};
 use handfest_core::ast::{is_valid_field_path, is_valid_ident, Decimal, KeyId, MandateId};
 use handfest_core::gate::DecisionReceipt;
 use handfest_core::Verdict;
-use rusqlite::{params, Connection, OptionalExtension, Row};
+use rusqlite::{Connection, OptionalExtension, Row};
 
 use crate::codec::{
-    format_resource, parse_chain_ids_json, parse_optional_mandate_id, parse_verdict,
+    col_i64, col_opt_i64, col_opt_text, col_text, format_resource, parse_chain_ids_json,
+    parse_optional_mandate_id, parse_verdict,
 };
+use crate::schema::verify_schema_integrity;
 use crate::{LedgerError, TrackRecord};
 
 pub(crate) fn run_audit_tx<F: FnOnce()>(
     conn: &Connection,
     actor_key: Option<&KeyId>,
-    after_verify: F,
+    after_receipts_scan: F,
 ) -> Result<(usize, Option<TrackRecord>), LedgerError> {
-    run_audit_tx_with(conn, after_verify, |tx| match actor_key {
-        Some(key) => track_record_in_conn(tx, key).map(Some),
-        None => Ok(None),
-    })
+    let tx = conn.unchecked_transaction()?;
+    let mut builder = actor_key.cloned().map(TrackRecordBuilder::new);
+    let verified_receipts = verify_and_project_in_conn(&tx, builder.as_mut(), after_receipts_scan)?;
+    tx.commit()?;
+    Ok((verified_receipts, builder.map(TrackRecordBuilder::finish)))
 }
 
 pub(crate) fn run_verified_track_record(
     conn: &Connection,
     actor_key: &KeyId,
 ) -> Result<TrackRecord, LedgerError> {
-    run_audit_tx_with(conn, || {}, |tx| track_record_in_conn(tx, actor_key))
-        .map(|(_, record)| record)
-}
-
-fn run_audit_tx_with<T, F, P>(
-    conn: &Connection,
-    after_verify: F,
-    project: P,
-) -> Result<(usize, T), LedgerError>
-where
-    F: FnOnce(),
-    P: FnOnce(&Connection) -> Result<T, LedgerError>,
-{
     let tx = conn.unchecked_transaction()?;
-    let verified_receipts = verify_integrity_in_conn(&tx)?;
-    after_verify();
-    let projected = project(&tx)?;
+    let mut builder = TrackRecordBuilder::new(actor_key.clone());
+    verify_and_project_in_conn(&tx, Some(&mut builder), || {})?;
     tx.commit()?;
-    Ok((verified_receipts, projected))
+    Ok(builder.finish())
 }
 
-pub(crate) fn verify_integrity_in_conn(conn: &Connection) -> Result<usize, LedgerError> {
+struct TrackRecordBuilder {
+    actor_key: KeyId,
+    total_decisions: u64,
+    permits: u64,
+    denies: u64,
+    distinct_leaves: BTreeSet<MandateId>,
+    first_timestamp: Option<i64>,
+    last_timestamp: Option<i64>,
+}
+
+impl TrackRecordBuilder {
+    fn new(actor_key: KeyId) -> Self {
+        Self {
+            actor_key,
+            total_decisions: 0,
+            permits: 0,
+            denies: 0,
+            distinct_leaves: BTreeSet::new(),
+            first_timestamp: None,
+            last_timestamp: None,
+        }
+    }
+
+    fn record(&mut self, receipt: &DecisionReceipt) {
+        self.total_decisions += 1;
+        match receipt.verdict {
+            Verdict::Permit => self.permits += 1,
+            Verdict::Deny { .. } => self.denies += 1,
+        }
+        if let Some(leaf_id) = receipt.chain_ids.last() {
+            self.distinct_leaves.insert(*leaf_id);
+        }
+        self.first_timestamp = Some(
+            self.first_timestamp
+                .map_or(receipt.timestamp, |cur| cur.min(receipt.timestamp)),
+        );
+        self.last_timestamp = Some(
+            self.last_timestamp
+                .map_or(receipt.timestamp, |cur| cur.max(receipt.timestamp)),
+        );
+    }
+
+    fn finish(self) -> TrackRecord {
+        TrackRecord {
+            actor_key: self.actor_key,
+            total_decisions: self.total_decisions,
+            permits: self.permits,
+            denies: self.denies,
+            distinct_mandates: u64::try_from(self.distinct_leaves.len()).unwrap_or(u64::MAX),
+            first_timestamp: self.first_timestamp,
+            last_timestamp: self.last_timestamp,
+        }
+    }
+}
+
+fn verify_and_project_in_conn<F: FnOnce()>(
+    conn: &Connection,
+    mut track_record: Option<&mut TrackRecordBuilder>,
+    after_receipts_scan: F,
+) -> Result<usize, LedgerError> {
     verify_schema_integrity(conn)?;
 
     let mut stmt = conn.prepare(
@@ -87,109 +135,21 @@ pub(crate) fn verify_integrity_in_conn(conn: &Connection) -> Result<usize, Ledge
             }
             record_expected_permit_calls(&mut expected_calls, &receipt.chain_ids)?;
         }
+        if let Some(builder) = track_record.as_deref_mut() {
+            if receipt.actor_key == builder.actor_key {
+                builder.record(&receipt);
+            }
+        }
         expected_prev = Some(receipt.receipt_hash);
         expected_seq += 1;
         count += 1;
     }
 
+    after_receipts_scan();
     verify_sqlite_sequence_hwm(conn, expected_seq - 1)?;
     verify_quota_calls_consistency(conn, &expected_calls)?;
     verify_quota_sums_consistency(conn, &expected_calls)?;
     Ok(count)
-}
-
-fn verify_schema_integrity(conn: &Connection) -> Result<(), LedgerError> {
-    let mut stmt = conn.prepare("SELECT type, name FROM sqlite_master")?;
-    let mut rows = stmt.query([])?;
-
-    while let Some(row) = rows.next()? {
-        let obj_type = col_text(row, 0, "sqlite_master.type")?;
-        let name = col_text(row, 1, "sqlite_master.name")?;
-        match obj_type.as_str() {
-            "table" => {
-                if !matches!(
-                    name.as_str(),
-                    "receipts" | "quota_calls" | "quota_sums" | "sqlite_sequence"
-                ) {
-                    return Err(LedgerError::Integrity(format!(
-                        "unexpected table '{name}' in ledger schema"
-                    )));
-                }
-            }
-            "index" => {
-                if !matches!(
-                    name.as_str(),
-                    "idx_receipts_actor_key"
-                        | "sqlite_autoindex_receipts_1"
-                        | "sqlite_autoindex_quota_calls_1"
-                        | "sqlite_autoindex_quota_sums_1"
-                ) {
-                    return Err(LedgerError::Integrity(format!(
-                        "unexpected index '{name}' in ledger schema"
-                    )));
-                }
-            }
-            other => {
-                return Err(LedgerError::Integrity(format!(
-                    "unexpected {other} '{name}' in ledger schema"
-                )));
-            }
-        }
-    }
-    Ok(())
-}
-
-pub(crate) fn track_record_in_conn(
-    conn: &Connection,
-    actor_key: &KeyId,
-) -> Result<TrackRecord, LedgerError> {
-    let actor_str = actor_key.to_string();
-    let mut stmt = conn.prepare(
-        "SELECT seq, chain_ids_json, timestamp, verdict, deny_reason
-         FROM receipts
-         WHERE actor_key = ?1
-         ORDER BY seq ASC",
-    )?;
-
-    let mut rows = stmt.query(params![actor_str])?;
-    let mut total_decisions = 0u64;
-    let mut permits = 0u64;
-    let mut denies = 0u64;
-    let mut distinct_leaves: BTreeSet<MandateId> = BTreeSet::new();
-    let mut first_timestamp: Option<i64> = None;
-    let mut last_timestamp: Option<i64> = None;
-
-    while let Some(row) = rows.next()? {
-        let seq = col_i64(row, 0, "receipts.seq")?;
-        let chain_ids_json = col_text(row, 1, "receipts.chain_ids_json")?;
-        let timestamp = col_i64(row, 2, "receipts.timestamp")?;
-        let verdict_raw = col_text(row, 3, "receipts.verdict")?;
-        let deny_reason = col_opt_text(row, 4, "receipts.deny_reason")?;
-
-        let verdict = parse_verdict(seq, &verdict_raw, deny_reason)?;
-        let chain_ids = parse_chain_ids_json(seq, &chain_ids_json)?;
-
-        total_decisions += 1;
-        match verdict {
-            Verdict::Permit => permits += 1,
-            Verdict::Deny { .. } => denies += 1,
-        }
-        if let Some(leaf_id) = chain_ids.last() {
-            distinct_leaves.insert(*leaf_id);
-        }
-        first_timestamp = Some(first_timestamp.map_or(timestamp, |cur| cur.min(timestamp)));
-        last_timestamp = Some(last_timestamp.map_or(timestamp, |cur| cur.max(timestamp)));
-    }
-
-    Ok(TrackRecord {
-        actor_key: actor_key.clone(),
-        total_decisions,
-        permits,
-        denies,
-        distinct_mandates: u64::try_from(distinct_leaves.len()).unwrap_or(u64::MAX),
-        first_timestamp,
-        last_timestamp,
-    })
 }
 
 fn record_expected_permit_calls(
@@ -417,30 +377,10 @@ fn reconstruct_receipt(
     })
 }
 
-fn col_text(row: &Row<'_>, idx: usize, label: &str) -> Result<String, LedgerError> {
-    row.get::<_, String>(idx)
-        .map_err(|err| LedgerError::Integrity(format!("invalid TEXT value in {label}: {err}")))
-}
-
-fn col_opt_text(row: &Row<'_>, idx: usize, label: &str) -> Result<Option<String>, LedgerError> {
-    row.get::<_, Option<String>>(idx).map_err(|err| {
-        LedgerError::Integrity(format!("invalid nullable TEXT value in {label}: {err}"))
-    })
-}
-
-fn col_i64(row: &Row<'_>, idx: usize, label: &str) -> Result<i64, LedgerError> {
-    row.get::<_, i64>(idx)
-        .map_err(|err| LedgerError::Integrity(format!("invalid INTEGER value in {label}: {err}")))
-}
-
-fn col_opt_i64(row: &Row<'_>, idx: usize, label: &str) -> Result<Option<i64>, LedgerError> {
-    row.get::<_, Option<i64>>(idx).map_err(|err| {
-        LedgerError::Integrity(format!("invalid nullable INTEGER value in {label}: {err}"))
-    })
-}
-
 #[cfg(test)]
 mod tests {
+    use rusqlite::params;
+
     use super::*;
 
     #[test]
@@ -459,12 +399,12 @@ mod tests {
         let empty_conn = Connection::open_in_memory().unwrap();
         let actor = KeyId::parse("ed25519:bbbb").unwrap();
         assert!(matches!(
-            verify_integrity_in_conn(&empty_conn),
-            Err(LedgerError::Sqlite(_))
+            run_audit_tx(&empty_conn, None, || {}),
+            Err(LedgerError::Integrity(_))
         ));
         assert!(matches!(
-            track_record_in_conn(&empty_conn, &actor),
-            Err(LedgerError::Sqlite(_))
+            run_verified_track_record(&empty_conn, &actor),
+            Err(LedgerError::Integrity(_))
         ));
 
         empty_conn
@@ -571,6 +511,38 @@ mod tests {
         .unwrap();
         assert!(matches!(
             verify_quota_calls_consistency(&conn, &BTreeMap::new()),
+            Err(LedgerError::Integrity(_))
+        ));
+
+        // Direct defense-in-depth coverage for duplicate quota_calls / quota_sums rows.
+        conn.execute("DELETE FROM quota_calls", []).unwrap();
+        for _ in 0..2 {
+            conn.execute(
+                "INSERT INTO quota_calls VALUES (?1, 1)",
+                params![mid.to_string()],
+            )
+            .unwrap();
+        }
+        let mut expected = BTreeMap::new();
+        expected.insert(mid, 1);
+        assert!(matches!(
+            verify_quota_calls_consistency(&conn, &expected),
+            Err(LedgerError::Integrity(_))
+        ));
+
+        conn.execute_batch(
+            "CREATE TABLE quota_sums (mandate_id TEXT, unit TEXT, field TEXT, total TEXT);",
+        )
+        .unwrap();
+        for _ in 0..2 {
+            conn.execute(
+                "INSERT INTO quota_sums VALUES (?1, 'USD', 'resource.amount', '10.0')",
+                params![mid.to_string()],
+            )
+            .unwrap();
+        }
+        assert!(matches!(
+            verify_quota_sums_consistency(&conn, &expected),
             Err(LedgerError::Integrity(_))
         ));
 

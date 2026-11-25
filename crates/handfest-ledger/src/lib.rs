@@ -3,7 +3,9 @@
 
 mod audit;
 mod codec;
+mod preflight;
 mod quotas;
+mod schema;
 mod sqlite;
 
 use std::fmt;
@@ -20,7 +22,6 @@ use crate::codec::key_id_serde;
 /// Errors returned by [`ReceiptLedger`] implementations.
 #[derive(Debug)]
 pub enum LedgerError {
-    Sqlite(rusqlite::Error),
     Storage(String),
     Json(serde_json::Error),
     Integrity(String),
@@ -30,7 +31,6 @@ pub enum LedgerError {
 impl fmt::Display for LedgerError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Sqlite(err) => write!(f, "sqlite error: {err}"),
             Self::Storage(msg) => write!(f, "ledger storage error: {msg}"),
             Self::Json(err) => write!(f, "json serialization error: {err}"),
             Self::Integrity(msg) => write!(f, "ledger integrity error: {msg}"),
@@ -42,7 +42,6 @@ impl fmt::Display for LedgerError {
 impl std::error::Error for LedgerError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            Self::Sqlite(err) => Some(err),
             Self::Json(err) => Some(err),
             Self::Storage(_) | Self::Integrity(_) | Self::QuotaAccounting(_) => None,
         }
@@ -51,7 +50,7 @@ impl std::error::Error for LedgerError {
 
 impl From<rusqlite::Error> for LedgerError {
     fn from(err: rusqlite::Error) -> Self {
-        Self::Sqlite(err)
+        Self::Storage(err.to_string())
     }
 }
 

@@ -185,10 +185,11 @@ fn open_read_only_rejects_truncated_non_sqlite_and_live_locked_wal() {
         })
         .unwrap();
     live_conn.execute_batch("BEGIN; SELECT * FROM t;").unwrap();
-    assert!(matches!(
-        SqliteLedger::open_read_only(&live_wal_db),
-        Err(LedgerError::Integrity(_))
-    ));
+    let live_wal_err = SqliteLedger::open_read_only(&live_wal_db).unwrap_err();
+    assert!(
+        matches!(&live_wal_err, LedgerError::Integrity(msg) if msg.contains("WAL format header")),
+        "external held POSIX lock must not bypass 100-byte WAL header check; got: {live_wal_err}"
+    );
     live_conn.execute_batch("END;").unwrap();
 }
 
@@ -541,4 +542,322 @@ fn record_denial_chains_with_evaluate_and_record_preserves_quotas_and_updates_tr
     let ro = SqliteLedger::open_read_only(&db_path).unwrap();
     assert_eq!(ro.verify_integrity().unwrap(), 3);
     assert_eq!(ro.track_record(&req.actor_key).unwrap(), rec);
+}
+
+#[test]
+fn collate_nocase_ddl_tampering_on_quota_sums_is_rejected_on_open_and_audit() {
+    let dir = TempDir::new().unwrap();
+    let db_path = dir.path().join("collate_nocase.sqlite");
+    let (vm, req, facts) = sum_and_calls_mandate();
+    let mid = vm.ast.mandate_id();
+
+    {
+        let mut ledger = SqliteLedger::open(&db_path).unwrap();
+        let (v, _) = ledger
+            .evaluate_and_record(&[vm], &req, &facts, ts("2026-11-24T18:00:00Z"))
+            .unwrap();
+        assert_eq!(v, Verdict::Permit);
+    }
+
+    // Rebuild quota_sums with COLLATE NOCASE on unit while keeping PRIMARY KEY and valid rows.
+    {
+        let raw = Connection::open(&db_path).unwrap();
+        raw.execute_batch(
+            "DROP TABLE quota_sums;
+             CREATE TABLE quota_sums (
+                 mandate_id TEXT NOT NULL,
+                 unit TEXT NOT NULL COLLATE NOCASE,
+                 field TEXT NOT NULL,
+                 total TEXT NOT NULL,
+                 PRIMARY KEY (mandate_id, unit, field)
+             );",
+        )
+        .unwrap();
+        raw.execute(
+            "INSERT INTO quota_sums (mandate_id, unit, field, total) VALUES (?1, 'USD', 'resource.amount', '25.0')",
+            [mid.to_string()],
+        )
+        .unwrap();
+    }
+
+    assert!(matches!(
+        SqliteLedger::open(&db_path),
+        Err(LedgerError::Integrity(_))
+    ));
+    assert!(matches!(
+        SqliteLedger::open_read_only(&db_path)
+            .unwrap()
+            .verify_integrity(),
+        Err(LedgerError::Integrity(_))
+    ));
+}
+
+#[test]
+fn rogue_trigger_is_refused_on_open_before_record_denial_can_fire_it() {
+    let dir = TempDir::new().unwrap();
+    let db_path = dir.path().join("rogue_trigger_open.sqlite");
+    let (vm, req, facts) = sum_and_calls_mandate();
+    let mid = vm.ast.mandate_id();
+
+    {
+        let mut ledger = SqliteLedger::open(&db_path).unwrap();
+        let (v, _) = ledger
+            .evaluate_and_record(&[vm], &req, &facts, ts("2026-11-24T18:00:00Z"))
+            .unwrap();
+        assert_eq!(v, Verdict::Permit);
+    }
+
+    {
+        let raw = Connection::open(&db_path).unwrap();
+        raw.execute_batch(
+            "CREATE TRIGGER wipe_quotas AFTER INSERT ON receipts BEGIN UPDATE quota_calls SET calls = 0; END;",
+        )
+        .unwrap();
+    }
+
+    // SqliteLedger::open refuses the tampered schema immediately so record_denial can never fire
+    // the trigger.
+    assert!(matches!(
+        SqliteLedger::open(&db_path),
+        Err(LedgerError::Integrity(_))
+    ));
+
+    // Confirm quota_calls remained untouched at 1.
+    let raw = Connection::open(&db_path).unwrap();
+    let calls: i64 = raw
+        .query_row(
+            "SELECT calls FROM quota_calls WHERE mandate_id = ?1",
+            [mid.to_string()],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(calls, 1);
+}
+
+#[test]
+fn record_denial_preserves_existing_quota_sums_totals() {
+    let dir = TempDir::new().unwrap();
+    let db_path = dir.path().join("denial_preserves_sums.sqlite");
+    let (vm, req, facts) = sum_and_calls_mandate();
+    let mid = vm.ast.mandate_id();
+
+    let mut ledger = SqliteLedger::open(&db_path).unwrap();
+    let (v1, _) = ledger
+        .evaluate_and_record(
+            std::slice::from_ref(&vm),
+            &req,
+            &facts,
+            ts("2026-11-24T18:00:00Z"),
+        )
+        .unwrap();
+    assert_eq!(v1, Verdict::Permit);
+
+    ledger
+        .record_denial(
+            vec![mid],
+            &req,
+            ts("2026-11-24T18:01:00Z"),
+            "pre-gate policy block".to_string(),
+        )
+        .unwrap();
+
+    // Persisted quota_sums total must still be exactly "25.0".
+    {
+        let raw = Connection::open(&db_path).unwrap();
+        let total: String = raw
+            .query_row(
+                "SELECT total FROM quota_sums WHERE mandate_id = ?1 AND unit = 'USD' AND field = 'resource.amount'",
+                [mid.to_string()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(total, "25.0");
+    }
+
+    // A $75.1 transfer must be denied (25.0 + 75.1 > 100.0) while an exact $75.0 transfer permits.
+    let over_facts = VerifiedFacts::new().with("resource.amount", Scalar::Decimal(dec("75.1")));
+    let (v_over, _) = ledger
+        .evaluate_and_record(
+            std::slice::from_ref(&vm),
+            &req,
+            &over_facts,
+            ts("2026-11-24T18:02:00Z"),
+        )
+        .unwrap();
+    assert!(matches!(v_over, Verdict::Deny { .. }));
+
+    let exact_facts = VerifiedFacts::new().with("resource.amount", Scalar::Decimal(dec("75.0")));
+    let (v_exact, _) = ledger
+        .evaluate_and_record(&[vm], &req, &exact_facts, ts("2026-11-24T18:03:00Z"))
+        .unwrap();
+    assert_eq!(v_exact, Verdict::Permit);
+    assert_eq!(ledger.verify_integrity().unwrap(), 4);
+}
+
+#[test]
+fn integrity_check_catches_index_btree_desync_while_receipts_table_stays_intact() {
+    let dir = TempDir::new().unwrap();
+    let db_path = dir.path().join("index_desync.sqlite");
+    let (vm, req, facts) = sum_and_calls_mandate();
+
+    {
+        let mut ledger = SqliteLedger::open(&db_path).unwrap();
+        let (v, _) = ledger
+            .evaluate_and_record(&[vm], &req, &facts, ts("2026-11-24T18:00:00Z"))
+            .unwrap();
+        assert_eq!(v, Verdict::Permit);
+    }
+
+    // Locate the idx_receipts_actor_key B-tree page and flip the last byte of actor_key inside the
+    // index page ONLY, leaving the `receipts` table B-tree completely intact.
+    let (page_size, idx_rootpage): (usize, usize) = {
+        let raw = Connection::open(&db_path).unwrap();
+        let ps: i64 = raw.query_row("PRAGMA page_size", [], |r| r.get(0)).unwrap();
+        let rp: i64 = raw
+            .query_row(
+                "SELECT rootpage FROM sqlite_master WHERE type = 'index' AND name = 'idx_receipts_actor_key'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        (usize::try_from(ps).unwrap(), usize::try_from(rp).unwrap())
+    };
+
+    let mut bytes = fs::read(&db_path).unwrap();
+    let page_start = (idx_rootpage - 1) * page_size;
+    let page_end = idx_rootpage * page_size;
+    let needle = req.actor_key.to_string().into_bytes();
+    let rel_pos = bytes[page_start..page_end]
+        .windows(needle.len())
+        .position(|w| w == needle.as_slice())
+        .expect("actor_key must appear in idx_receipts_actor_key leaf page");
+    let flip_idx = page_start + rel_pos + needle.len() - 1;
+    bytes[flip_idx] = b'c';
+    fs::write(&db_path, &bytes).unwrap();
+
+    // Both read-only audit and writable open must reject the desynced index via PRAGMA integrity_check.
+    let err = SqliteLedger::open_read_only(&db_path)
+        .unwrap()
+        .audit_snapshot(Some(&req.actor_key))
+        .unwrap_err();
+    assert!(
+        matches!(&err, LedgerError::Integrity(msg) if msg.contains("integrity_check")),
+        "expected PRAGMA integrity_check Integrity error, got: {err}"
+    );
+    assert!(matches!(
+        SqliteLedger::open(&db_path),
+        Err(LedgerError::Integrity(_))
+    ));
+}
+
+#[test]
+fn verify_integrity_rejects_malformed_stored_actor_key() {
+    let dir = TempDir::new().unwrap();
+    let db_path = dir.path().join("bad_actor_key.sqlite");
+    let (vm, req, facts) = sum_and_calls_mandate();
+
+    {
+        let mut ledger = SqliteLedger::open(&db_path).unwrap();
+        ledger
+            .evaluate_and_record(&[vm], &req, &facts, ts("2026-11-24T18:00:00Z"))
+            .unwrap();
+    }
+
+    {
+        let raw = Connection::open(&db_path).unwrap();
+        raw.execute(
+            "UPDATE receipts SET actor_key = 'not-a-valid-key' WHERE seq = 1",
+            [],
+        )
+        .unwrap();
+    }
+
+    let err = SqliteLedger::open_read_only(&db_path)
+        .unwrap()
+        .verify_integrity()
+        .unwrap_err();
+    assert!(
+        matches!(&err, LedgerError::Integrity(msg) if msg.contains("invalid actor_key")),
+        "expected invalid actor_key Integrity error, got: {err}"
+    );
+}
+
+#[test]
+fn concurrent_open_read_only_and_audit_snapshot_handles_transient_journals_without_false_integrity_errors(
+) {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+
+    let dir = TempDir::new().unwrap();
+    let db_path = dir.path().join("concurrent_journal.sqlite");
+    let (vm, req, facts) = sum_and_calls_mandate();
+    let mid = vm.ast.mandate_id();
+
+    let mut writer = SqliteLedger::open(&db_path).unwrap();
+    writer
+        .evaluate_and_record(
+            std::slice::from_ref(&vm),
+            &req,
+            &facts,
+            ts("2026-11-24T18:00:00Z"),
+        )
+        .unwrap();
+
+    let done = Arc::new(AtomicBool::new(false));
+    let done_reader = Arc::clone(&done);
+    let reader_path = db_path.clone();
+    let reader_actor = req.actor_key.clone();
+
+    let reader = std::thread::spawn(move || {
+        let mut audits = 0usize;
+        let mut last_count = 0usize;
+        while !done_reader.load(Ordering::Acquire) || audits < 25 {
+            let ro = SqliteLedger::open_read_only(&reader_path)
+                .expect("concurrent open_read_only must not return false Integrity error");
+            let (count, maybe_rec) = ro
+                .audit_snapshot(Some(&reader_actor))
+                .expect("concurrent audit_snapshot must succeed");
+            let rec = maybe_rec.expect("expected TrackRecord");
+            assert_eq!(rec.total_decisions, u64::try_from(count).unwrap());
+            assert!(
+                count >= last_count,
+                "receipt count must be monotonic across snapshots"
+            );
+            last_count = count;
+            audits += 1;
+        }
+        (audits, last_count)
+    });
+
+    let base_ts = ts("2026-11-24T18:01:00Z");
+    let zero_facts = VerifiedFacts::new().with("resource.amount", Scalar::Decimal(dec("0.0")));
+    for i in 0..40i64 {
+        if i % 2 == 0 {
+            let (v, _) = writer
+                .evaluate_and_record(std::slice::from_ref(&vm), &req, &zero_facts, base_ts + i)
+                .unwrap();
+            assert_eq!(v, Verdict::Permit);
+        } else {
+            writer
+                .record_denial(
+                    vec![mid],
+                    &req,
+                    base_ts + i,
+                    format!("concurrent pre-gate denial {i}"),
+                )
+                .unwrap();
+        }
+    }
+    done.store(true, Ordering::Release);
+
+    let (audits, _) = reader.join().unwrap();
+    assert!(audits >= 25);
+
+    let final_ro = SqliteLedger::open_read_only(&db_path).unwrap();
+    let (final_count, final_rec) = final_ro.audit_snapshot(Some(&req.actor_key)).unwrap();
+    assert_eq!(final_count, 41);
+    let rec = final_rec.unwrap();
+    assert_eq!(rec.total_decisions, 41);
+    assert_eq!(rec.permits, 21);
+    assert_eq!(rec.denies, 20);
 }
