@@ -9,6 +9,86 @@ From Old Norse *handfæstning* — the written charter a ruler signed before tak
 
 `handfest` lets a principal vest bounded authority in another actor — human, service, or autonomous AI agent — **in structured plain English**, backed by **pluggable cryptographic trust anchors** (local/SSH keys, crypto wallets, Passkeys, EUDI Wallets, eIDAS QES), enforced by a **pure deterministic gate**, and recorded in a **hash-chained receipt ledger** that builds a verifiable track record.
 
+## Architecture at a Glance
+
+```text
+====================================================================================================
+  1. INTENT & SIGNING (WYSIWYS)                 2. MONOTONIC ATTENUATION (LATTICE)
+====================================================================================================
+
+  +-----------------------------------+         +-----------------------------------+
+  |  Principal (Human / Org)          |         |  Orchestrator (e.g. Brokkr)       |
+  |  "Merge my passing PRs for 8h,    |         |  Verifies M0, then narrows to     |
+  |   at most 5 calls"                |         |  ephemeral per-seat mandate M1:   |
+  +-----------------+-----------------+         |                                   |
+                    |                           |  HANDFEST v1                      |
+                    v  1:1 canonical bijection  |  PARENT sha256:8f4e...            |
+  +-----------------------------------+         |  FROM agent "brokkr:dispatcher"   |
+  |  HANDFEST v1 (Canonical Text)     |         |  TO   agent "brokkr:seat:ship"    |
+  |  FROM human "valentin" (key: ...) |         |  DELEGATION max 0 hops            |
+  |  TO   agent "brokkr:dispatcher"   |         |  ALLOW git.pr.merge               |
+  |  DELEGATION max 1 hop             |         |  ON repo "feedback-loop-ai/..."   |
+  |  ALLOW git.pr.merge               |  =====> |  WHERE pr == 492 AND 3m window    |
+  |  ON repo "feedback-loop-ai/*"     |  sub-   |  LIMIT 1 call                     |
+  |  WHERE author=="valentin" & 8h    |  sumes  +-----------------+-----------------+
+  |  LIMIT 5 calls                    | (pure                     |
+  +-----------------+-----------------+  Rust,                    |  Signed Chain [M0 -> M1]
+                    |                    no SMT)                  v
+                    v  signed by ANY Trust Anchor
+  +---------------------------------------------------------------------------------+
+  |  handfest-anchors (Pluggable Trust Anchors -> normalized VerifiedAnchorProof)   |
+  |  [x] Ed25519 / local keys   [ ] Passkeys & EIP-712 Wallets                      |
+  |  [ ] EUDI SD-JWT VC         [ ] eIDAS QES / QSeal (ETSI TS 119 612 EU LOTL)     |
+  +---------------------------------------------------------------------------------+
+
+====================================================================================================
+  3. DETERMINISTIC ENFORCEMENT & AUDITABLE TRACK RECORD (OUTSIDE THE MODEL)
+====================================================================================================
+
+  +-------------------------+    MCP stdio JSON-RPC     +-----------------------------------+
+  |  AI Model / Agent Seat  | ------------------------> |  handfest-mcp  (or Brokkr Broker) |
+  |  (Claude / Codex / Agy) |   tools/list (filtered)   |  - Hides ungranted tools          |
+  |  - Never holds root key |   tools/call (intercepted)|  - Supplies broker VerifiedFacts  |
+  |  - Prompt-injected text | <------------------------ |    & host Clock (model can't spoof|
+  |    cannot widen M0->M1  |   Permit -> forward       |    author, CI status, or time)    |
+  +-------------------------+   Deny   -> -32001 error  +-----------------+-----------------+
+                                (upstream NEVER called)                   |
+                                                                          v
+  +-----------------------------------------------------------------------------------------+
+  |  handfest-core::authorize()  (PURE #![no_std], zero I/O, zero clock, zero unsafe)       |
+  |  1. Verify every hop signature + ActorKind + valid window + subsumes(M_i, M_{i+1})      |
+  |  2. Evaluate EVERY mandate in chain in conjunction (M0 && M1 && ...)                    |
+  |  3. Check chain-wide quotas (anti-splitting: M0=5 calls caps ALL children combined)     |
+  +-----------------------------------+-----------------------------------------------------+
+                                      |
+             +------------------------+------------------------+
+             | Verdict::Permit                                 | Verdict::Deny { reason }
+             v                                                 v
+  +-------------------------+                       +---------------------------------------+
+  | Forward to Upstream MCP |                       |  handfest-ledger (SQLite, WAL mode)   |
+  | (GitHub, Cloud, Bank,   |                       |  - Single IMMEDIATE transaction:      |
+  |  Filesystem, etc.)      |                       |    * Atomic chain-wide quota update   |
+  +-------------------------+                       |    * Append hash-chained Receipt      |
+                                                    |      (prev_hash -> SHA-256 knot)      |
+                                                    |  - handfest audit (read-only):        |
+                                                    |    * Byte-for-byte replay & tamper    |
+                                                    |      detection + Actor TrackRecord    |
+                                                    +---------------------------------------+
+```
+
+### Crate Dependency Graph (Strictly One-Way)
+
+```text
+          [ handfest-cli ]      [ handfest-mcp ]
+              /   |   \            /   |   \
+             /    |    \          /    |    \
+            v     |     v        v     |     v
+  [ handfest-anchors ]  |  [ handfest-ledger ]
+            \           |           /
+             \          v          /
+              ---> [ handfest-core ] <---   (pure #![no_std], zero I/O)
+```
+
 ## What a Handfest Looks Like
 
 ```text
@@ -32,15 +112,15 @@ LIMIT 5 calls
 
 ## Workspace Layout
 
-* [`crates/handfest-core`](crates/handfest-core) — Pure, `no_std`-capable AST, Controlled-English parser/renderer, lattice narrowing proofs, chain evaluator, and receipt types.
-* [`crates/handfest-anchors`](crates/handfest-anchors) — Pluggable verifiers for Ed25519/OpenSSH keys, wallets/Passkeys, EUDI `SD-JWT VC` / `mdoc`, and eIDAS ETSI TS 119 612 QES.
-* [`crates/handfest-ledger`](crates/handfest-ledger) — Hash-chained receipt persistence, atomic chain-wide quota tracking, and deterministic offline replay / track-record queries.
-* [`crates/handfest-cli`](crates/handfest-cli) — Reference CLI (`handfest fmt`, `sign`, `narrow`, `verify`, `audit`).
+* [`crates/handfest-core`](crates/handfest-core) — Pure, `#![no_std]`-capable AST, Controlled-English parser/renderer, lattice narrowing proofs, chain evaluator, and receipt types.
+* [`crates/handfest-anchors`](crates/handfest-anchors) — Pluggable verifiers for Ed25519 keys, wallets/Passkeys, EUDI `SD-JWT VC` / `mdoc`, and eIDAS ETSI TS 119 612 QES.
+* [`crates/handfest-ledger`](crates/handfest-ledger) — Hash-chained SQLite receipt persistence, atomic chain-wide quota tracking, read-only integrity audit, and actor `TrackRecord` queries.
+* [`crates/handfest-cli`](crates/handfest-cli) — Reference CLI (`handfest fmt`, `keygen`, `sign`, `verify`, `check`, `audit`).
 * [`specs/`](specs/) — Formal `HANDFEST v1` grammar (`grammar.ebnf`) and architecture specification.
 
 ## Status
 
-Early scaffolding (`v0.1.0-dev`). See [`specs/architecture.md`](specs/architecture.md) and [`specs/grammar.ebnf`](specs/grammar.ebnf) for the v0.1 design.
+Active development (`v0.1.0-dev`): `handfest-core`, `handfest-anchors` (Ed25519), `handfest-ledger` (SQLite), and `handfest-cli` are live on `main`, with `handfest-mcp` in progress. See [`specs/architecture.md`](specs/architecture.md) and [`specs/grammar.ebnf`](specs/grammar.ebnf).
 
 ## License
 
