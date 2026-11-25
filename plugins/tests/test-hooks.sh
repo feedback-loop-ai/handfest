@@ -365,7 +365,7 @@ pass "Multi-hop delegation chain (root:leaf) enforced narrowed scope, leaf quota
 
 # Test 18: Validate all declarative example config files parse strictly and uphold security invariants
 python3 -I - "$REPO_ROOT" <<'PY_CFG'
-import json, os, sys
+import json, os, re, sys
 root = sys.argv[1]
 json_files = [
     "plugins/policy-map.example.json",
@@ -404,8 +404,24 @@ pre = cc_settings["hooks"]["PreToolUse"]
 assert len(pre) >= 1
 for entry in pre:
     assert entry["matcher"] != ".*", "PreToolUse matcher must not be wildcard '.*'"
+    assert re.search(entry["matcher"], "mcp__github-handfest__merge_pull_request") is None, (
+        f"PreToolUse matcher '{entry['matcher']}' must not match MCP tool mcp__github-handfest__merge_pull_request"
+    )
     for h in entry["hooks"]:
+        assert h["command"].startswith("/"), f"hook command must be an absolute path: {h['command']}"
         assert h["command"].startswith("/path/to/handfest-config/"), f"hook command must be outside-workspace: {h['command']}"
+
+def assert_all_paths_absolute(node, loc):
+    if isinstance(node, dict):
+        for k, v in node.items():
+            assert_all_paths_absolute(v, f"{loc}.{k}")
+    elif isinstance(node, list):
+        for idx, v in enumerate(node):
+            assert_all_paths_absolute(v, f"{loc}[{idx}]")
+    elif isinstance(node, str) and ("/" in node or node.endswith(".sh") or node.endswith(".json") or node.endswith(".sqlite")):
+        assert node.startswith("/"), f"{loc} must be an absolute outside-workspace path: {node}"
+
+assert_all_paths_absolute(cc_settings, "settings.example.json")
 
 for mcp_rel in ("plugins/claude-code/mcp.example.json", "plugins/dsh/mcp.example.json", "plugins/agy/mcp.example.json"):
     srv = loaded[mcp_rel]["mcpServers"]["github-handfest"]
@@ -444,7 +460,7 @@ WHERE context.time >= 2026-11-24T17:00:00Z
   AND resource.approved == true
   AND resource.scheduled_at >= 2026-11-24T18:00:00Z
   AND resource.amount <= 20.00
-LIMIT 25.00 USD sum(resource.amount)
+LIMIT 40.00 USD sum(resource.amount)
 MANDATE_EOF
 "$HANDFEST_BIN" fmt "$PAY_HF" >"$TMP_DIR/pay.canon.hf"
 PAY_SIGNED="$TMP_DIR/pay.signed.json"
@@ -480,28 +496,43 @@ assert_eq "decimal int-15 permit rc" "$HOOK_RC" "0"
 assert_json "decimal int-15 stdout" "$(cat "$TMP_DIR/stdout.txt")" "d['verdict'] == 'permit'"
 assert_json "decimal int-15 formatted" "$(cat "$CAPTURED_FACTS")" "d['resource.amount'] == {'decimal': '15.0'}"
 
-# Zero, trailing zeros beyond 18 digits (1.0000000000000000000 -> 1.0), and scale 28 all normalized and permitted
-for amt_json in '0' '"1.0000000000000000000"' '"0.0000000000000000000000000001"'; do
+# Zero, trailing zeros beyond 18 and 127 digits (1. + 127 zeros -> 1.0), scale 28, and mixed integer+fraction "12.34"
+LONG_ZEROS="$(python3 -I -c 'print("1." + "0" * 127)')"
+for amt_json in '0' '"1.0000000000000000000"' '"0.0000000000000000000000000001"' "\"$LONG_ZEROS\"" "$LONG_ZEROS"; do
   HOOK_RC=0
-  HANDFEST_POLICY_MAP="$PAY_MAP" HANDFEST_LEDGER="$PAY_LEDGER" HANDFEST_CHAIN="$PAY_SIGNED" \
+  rm -f "$CAPTURED_FACTS"
+  HANDFEST_BIN="$CAPTURE_SHIM" HANDFEST_POLICY_MAP="$PAY_MAP" HANDFEST_LEDGER="$PAY_LEDGER" HANDFEST_CHAIN="$PAY_SIGNED" \
     "$HOOK" <<<"{\"tool_name\":\"charge_card\",\"tool_input\":{\"currency\":\"USD\",\"approved\":true,\"scheduled_at\":\"2026-11-24T18:30:00Z\",\"amount\":$amt_json}}" \
     >"$TMP_DIR/stdout.txt" 2>"$TMP_DIR/stderr.txt" || HOOK_RC=$?
   assert_eq "decimal norm $amt_json rc" "$HOOK_RC" "0"
   assert_json "decimal norm $amt_json stdout" "$(cat "$TMP_DIR/stdout.txt")" "d['verdict'] == 'permit'"
+  if [[ "$amt_json" == *"$LONG_ZEROS"* ]]; then
+    assert_json "decimal long trailing zeros formatted" "$(cat "$CAPTURED_FACTS")" "d['resource.amount'] == {'decimal': '1.0'}"
+  fi
 done
 
-# Scientific notation "1.5e1" (15.0) pushes cumulative 16.0000000000000000000000000001 + 15.0 > 25.00 USD -> mandate_denied
+# Mixed integer+fraction decimal ("12.34") preserved verbatim and permitted (cumulative 30.3400... <= 40.00)
 HOOK_RC=0
 rm -f "$CAPTURED_FACTS"
 HANDFEST_BIN="$CAPTURE_SHIM" HANDFEST_POLICY_MAP="$PAY_MAP" HANDFEST_LEDGER="$PAY_LEDGER" HANDFEST_CHAIN="$PAY_SIGNED" \
-  "$HOOK" <<<'{"tool_name":"charge_card","tool_input":{"currency":"USD","approved":true,"scheduled_at":"2026-11-24T18:30:00Z","amount":"1.5e1"}}' \
+  "$HOOK" <<<'{"tool_name":"charge_card","tool_input":{"currency":"USD","approved":true,"scheduled_at":"2026-11-24T18:30:00Z","amount":"12.34"}}' \
   >"$TMP_DIR/stdout.txt" 2>"$TMP_DIR/stderr.txt" || HOOK_RC=$?
-assert_eq "decimal sci quota rc" "$HOOK_RC" "2"
-assert_json "decimal sci quota stderr" "$(cat "$TMP_DIR/stderr.txt")" "d['verdict'] == 'deny' and d['code'] == 'mandate_denied'"
-assert_json "decimal sci formatted" "$(cat "$CAPTURED_FACTS")" "d['resource.amount'] == {'decimal': '15.0'}"
+assert_eq "decimal mixed 12.34 rc" "$HOOK_RC" "0"
+assert_json "decimal mixed 12.34 stdout" "$(cat "$TMP_DIR/stdout.txt")" "d['verdict'] == 'permit'"
+assert_json "decimal mixed 12.34 formatted" "$(cat "$CAPTURED_FACTS")" "d['resource.amount'] == {'decimal': '12.34'}"
 
-# Reject pathological exponent, scale 29, i128::MAX+1, and i128::MIN-1
-for bad_amt in '"1e1000000"' '"0.00000000000000000000000000001"' '"170141183460469231731687303715884105728"' '"-170141183460469231731687303715884105729"'; do
+# Bare JSON scientific notation 1.5e1 (15.0) pushes cumulative 30.34... + 15.0 > 40.00 USD -> mandate_denied
+HOOK_RC=0
+rm -f "$CAPTURED_FACTS"
+HANDFEST_BIN="$CAPTURE_SHIM" HANDFEST_POLICY_MAP="$PAY_MAP" HANDFEST_LEDGER="$PAY_LEDGER" HANDFEST_CHAIN="$PAY_SIGNED" \
+  "$HOOK" <<<'{"tool_name":"charge_card","tool_input":{"currency":"USD","approved":true,"scheduled_at":"2026-11-24T18:30:00Z","amount":1.5e1}}' \
+  >"$TMP_DIR/stdout.txt" 2>"$TMP_DIR/stderr.txt" || HOOK_RC=$?
+assert_eq "decimal bare sci quota rc" "$HOOK_RC" "2"
+assert_json "decimal bare sci quota stderr" "$(cat "$TMP_DIR/stderr.txt")" "d['verdict'] == 'deny' and d['code'] == 'mandate_denied'"
+assert_json "decimal bare sci formatted" "$(cat "$CAPTURED_FACTS")" "d['resource.amount'] == {'decimal': '15.0'}"
+
+# Reject quoted scientific notation "1.5e1", pathological bare/quoted exponents, scale 29, i128::MAX+1, and i128::MIN-1
+for bad_amt in '"1.5e1"' '1e1000000' '"1e1000000"' '"0.00000000000000000000000000001"' '"170141183460469231731687303715884105728"' '"-170141183460469231731687303715884105729"'; do
   HOOK_RC=0
   HANDFEST_POLICY_MAP="$PAY_MAP" HANDFEST_LEDGER="$PAY_LEDGER" HANDFEST_CHAIN="$PAY_SIGNED" \
     "$HOOK" <<<"{\"tool_name\":\"charge_card\",\"tool_input\":{\"currency\":\"USD\",\"approved\":true,\"scheduled_at\":\"2026-11-24T18:30:00Z\",\"amount\":$bad_amt}}" \
@@ -529,7 +560,18 @@ FAKE_EOF
   assert_eq "spoofed exit-0 rc" "$HOOK_RC" "2"
   assert_json "spoofed exit-0 stderr" "$(cat "$TMP_DIR/stderr.txt")" "d['verdict'] == 'deny' and d['code'] == 'invalid_gate_output'"
 done
-pass "Defense-in-depth rejected exit-0 non-Permit and malformed receipt_hash outputs (exit 2)"
+cat <<'FAKE_DENY_EOF' >"$FAKE_BIN"
+#!/usr/bin/env bash
+printf '%s
+' '{"verdict":"deny","reason":"spoofed-hash-deny","receipt_hash":"garbage"}'
+exit 1
+FAKE_DENY_EOF
+chmod +x "$FAKE_BIN"
+HOOK_RC=0
+HANDFEST_BIN="$FAKE_BIN" "$HOOK" <<<"$VALID_PAYLOAD" >"$TMP_DIR/stdout.txt" 2>"$TMP_DIR/stderr.txt" || HOOK_RC=$?
+assert_eq "non-zero deny garbage receipt_hash rc" "$HOOK_RC" "2"
+assert_json "non-zero deny garbage receipt_hash omitted" "$(cat "$TMP_DIR/stderr.txt")" "d['verdict'] == 'deny' and d['code'] == 'mandate_denied' and 'receipt_hash' not in d"
+pass "Defense-in-depth rejected exit-0 non-Permit/malformed receipt_hash and stripped garbage receipt_hash on non-zero deny"
 
 # Test 21: python3 -I isolation blocks malicious ./json.py in CWD and PYTHONPATH
 EVIL_CWD="$TMP_DIR/evil-cwd"
@@ -563,6 +605,14 @@ HANDFEST_POLICY_MAP="$PAY_MAP" HANDFEST_LEDGER="$PAY_LEDGER" HANDFEST_CHAIN="$PA
   >"$TMP_DIR/stdout.txt" 2>"$TMP_DIR/stderr.txt" || HOOK_RC=$?
 assert_eq "decimal trailing newline rc" "$HOOK_RC" "2"
 assert_json "decimal trailing newline stderr" "$(cat "$TMP_DIR/stderr.txt")" "d['verdict'] == 'deny' and d['code'] == 'invalid_argument'"
+
+# Arabic-Indic Unicode year digits in timestamp (٢٠٢٦-11-24T18:30:00Z)
+HOOK_RC=0
+HANDFEST_POLICY_MAP="$PAY_MAP" HANDFEST_LEDGER="$PAY_LEDGER" HANDFEST_CHAIN="$PAY_SIGNED" \
+  "$HOOK" <<<'{"tool_name":"charge_card","tool_input":{"currency":"USD","approved":true,"scheduled_at":"\u0662\u0660\u0662\u0666-11-24T18:30:00Z","amount":1}}' \
+  >"$TMP_DIR/stdout.txt" 2>"$TMP_DIR/stderr.txt" || HOOK_RC=$?
+assert_eq "unicode timestamp rc" "$HOOK_RC" "2"
+assert_json "unicode timestamp stderr" "$(cat "$TMP_DIR/stderr.txt")" "d['verdict'] == 'deny' and d['code'] == 'invalid_argument'"
 
 # Trailing \n on timestamp
 HOOK_RC=0
@@ -640,5 +690,106 @@ HANDFEST_LEDGER="$HYPHEN_LEDGER" HANDFEST_CHAIN="$HYPHEN_SIGNED" \
 assert_eq "hyphen resource_id rc" "$HOOK_RC" "0"
 assert_json "hyphen resource_id stdout" "$(cat "$TMP_DIR/stdout.txt")" "d['verdict'] == 'permit' and d['receipt_hash'].startswith('sha256:')"
 pass "Hyphen-prefixed resource_id ('-repo') permitted cleanly via --flag=value argv"
+
+# Test 24: stderr write failure (ENOSPC via /dev/full) deterministically exits 2 (never 1)
+HOOK_RC=0
+printf '%s' '{"hook_event_name":"PreToolUse","tool_name":"Bash","tool_input":{"command":"rm -rf /"}}' \
+  | "$HOOK" >/dev/null 2>/dev/full || HOOK_RC=$?
+assert_eq "stderr /dev/full unmapped tool rc" "$HOOK_RC" "2"
+
+EMPTY_BIN="$TMP_DIR/empty-bin"
+mkdir -p "$EMPTY_BIN"
+HOOK_RC=0
+printf '%s' '{"hook_event_name":"PreToolUse","tool_name":"Bash","tool_input":{"command":"id"}}' \
+  | env PATH="$EMPTY_BIN" "$(command -v bash)" "$HOOK" >/dev/null 2>/dev/full || HOOK_RC=$?
+assert_eq "stderr /dev/full missing python3 rc" "$HOOK_RC" "2"
+pass "stderr OSError/ENOSPC (2>/dev/full) failed closed with exit 2 in both Python and bash fallback"
+
+# Test 25: Strict UTF-8 decoding, lone UTF-16 surrogates, and recursive nested key checks
+# Place raw 0xff inside an otherwise valid permitted payload/policy so errors="replace" would pass instead of denying
+HOOK_RC=0
+UTF8_LEDGER="$TMP_DIR/utf8-ledger.sqlite"
+printf '{"tool_name":"merge_pull_request","tool_input":{"owner":"feedback-loop-ai","repo":"handfest","pull_number":10,"note":"bad\xff"}}' \
+  | HANDFEST_LEDGER="$UTF8_LEDGER" "$HOOK" >"$TMP_DIR/stdout.txt" 2>"$TMP_DIR/stderr.txt" || HOOK_RC=$?
+assert_eq "invalid utf8 stdin rc" "$HOOK_RC" "2"
+assert_json "invalid utf8 stdin stderr" "$(cat "$TMP_DIR/stderr.txt")" "d['verdict'] == 'deny' and d['code'] == 'invalid_input'"
+
+BAD_UTF8_MAP="$TMP_DIR/bad-utf8-policy-map.json"
+printf '{"tools":{"merge_pull_request":{"action":"git.pr.merge","resource_kind":"repo","static_resource_id":"handfest","static_facts":{"resource.note":{"str":"bad\xff"}}}}}' >"$BAD_UTF8_MAP"
+HOOK_RC=0
+HANDFEST_LEDGER="$UTF8_LEDGER" HANDFEST_POLICY_MAP="$BAD_UTF8_MAP" "$HOOK" <<<"$VALID_PAYLOAD" >"$TMP_DIR/stdout.txt" 2>"$TMP_DIR/stderr.txt" || HOOK_RC=$?
+assert_eq "invalid utf8 policy map rc" "$HOOK_RC" "2"
+assert_json "invalid utf8 policy map stderr" "$(cat "$TMP_DIR/stderr.txt")" "d['verdict'] == 'deny' and d['code'] == 'invalid_policy_map'"
+
+# Lone UTF-16 surrogate in tool_name
+run_hook '{"tool_name":"merge_\ud800","tool_input":{"owner":"feedback-loop-ai","repo":"handfest","pull_number":10}}'
+assert_eq "surrogate tool_name rc" "$HOOK_RC" "2"
+assert_json "surrogate tool_name stderr" "$HOOK_ERR" "d['verdict'] == 'deny' and d['code'] == 'invalid_input'"
+
+# Lone UTF-16 surrogate in tool_input (both mapped and unmapped nested string)
+run_hook '{"tool_name":"merge_pull_request","tool_input":{"owner":"feedback-loop-ai","repo":"handfest\ud800","pull_number":10}}'
+assert_eq "surrogate tool_input mapped rc" "$HOOK_RC" "2"
+assert_json "surrogate tool_input mapped stderr" "$HOOK_ERR" "d['verdict'] == 'deny' and d['code'] == 'invalid_input'"
+
+run_hook '{"tool_name":"merge_pull_request","tool_input":{"owner":"feedback-loop-ai","repo":"handfest","pull_number":10,"extra":["ok","bad\ud800"]}}'
+assert_eq "surrogate tool_input nested rc" "$HOOK_RC" "2"
+assert_json "surrogate tool_input nested stderr" "$HOOK_ERR" "d['verdict'] == 'deny' and d['code'] == 'invalid_input'"
+
+# Nested case-colliding keys and nested non-ASCII key inside array
+run_hook '{"tool_name":"merge_pull_request","tool_input":{"owner":"feedback-loop-ai","repo":"handfest","pull_number":10,"extra":{"force":false,"Force":true}}}'
+assert_eq "nested case collision rc" "$HOOK_RC" "2"
+assert_json "nested case collision stderr" "$HOOK_ERR" "d['verdict'] == 'deny' and d['code'] == 'invalid_input'"
+
+run_hook '{"tool_name":"merge_pull_request","tool_input":{"owner":"feedback-loop-ai","repo":"handfest","pull_number":10,"items":[{"caf\u00e9":1}]}}'
+assert_eq "nested non-ascii key rc" "$HOOK_RC" "2"
+assert_json "nested non-ascii key stderr" "$HOOK_ERR" "d['verdict'] == 'deny' and d['code'] == 'invalid_input'"
+pass "Strict UTF-8, lone UTF-16 surrogates, and recursive nested key checks all failed closed (exit 2)"
+
+# Test 26: Binding boundary tests (i64 overflow, NUL control char, NaN JSON constant)
+run_hook '{"tool_name":"merge_pull_request","tool_input":{"owner":"feedback-loop-ai","repo":"handfest","pull_number":9223372036854775808}}'
+assert_eq "i64 overflow rc" "$HOOK_RC" "2"
+assert_json "i64 overflow stderr" "$HOOK_ERR" "d['verdict'] == 'deny' and d['code'] == 'invalid_argument'"
+
+run_hook '{"tool_name":"merge_pull_request","tool_input":{"owner":"feedback-loop-ai","repo":"handfest\u0000","pull_number":10}}'
+assert_eq "nul control char rc" "$HOOK_RC" "2"
+assert_json "nul control char stderr" "$HOOK_ERR" "d['verdict'] == 'deny' and d['code'] == 'invalid_argument'"
+
+run_hook '{"tool_name":"merge_pull_request","tool_input":{"owner":"feedback-loop-ai","repo":"handfest","pull_number":NaN}}'
+assert_eq "NaN json constant rc" "$HOOK_RC" "2"
+assert_json "NaN json constant stderr" "$HOOK_ERR" "d['verdict'] == 'deny' and d['code'] == 'invalid_input'"
+pass "i64 overflow, NUL control char, and NaN JSON constant all failed closed (exit 2)"
+
+# Test 27: Example mandates in claude-code/SKILL.md and agy/SKILL.md align with policy-map.example.json and permit the example call
+for skill_rel in "plugins/claude-code/SKILL.md" "plugins/agy/SKILL.md"; do
+  SKILL_HF="$TMP_DIR/$(echo "$skill_rel" | tr '/' '_').hf"
+  python3 -I - "$REPO_ROOT/$skill_rel" "$HUMAN_KEY" "$AGENT_KEY" "$SKILL_HF" <<'PY_SKILL'
+import re, sys
+skill_path, human_key, agent_key, out_path = sys.argv[1:]
+with open(skill_path, "r", encoding="utf-8") as fh:
+    text = fh.read()
+m = re.search(r"```text\n(HANDFEST v1\n.*?)```", text, re.DOTALL)
+assert m, f"HANDFEST v1 example block not found in {skill_path}"
+mandate = (
+    m.group(1)
+    .replace("<principal>", "valentin")
+    .replace("ed25519:<principal-pub-hex>", human_key)
+    .replace("<agent-name>", "claude:coder")
+    .replace("ed25519:<agent-pub-hex>", agent_key)
+)
+with open(out_path, "w", encoding="utf-8") as fh:
+    fh.write(mandate)
+PY_SKILL
+  "$HANDFEST_BIN" fmt "$SKILL_HF" >"$SKILL_HF.canon"
+  SKILL_SIGNED="$SKILL_HF.signed.json"
+  "$HANDFEST_BIN" sign --mandate "$SKILL_HF.canon" --key "$HUMAN_KEY_FILE" \
+    --valid-from 2026-11-24T17:00:00Z --valid-until 2026-11-25T01:00:00Z --out "$SKILL_SIGNED" >/dev/null
+  SKILL_LEDGER="$SKILL_HF.ledger.sqlite"
+  HOOK_RC=0
+  HANDFEST_LEDGER="$SKILL_LEDGER" HANDFEST_CHAIN="$SKILL_SIGNED" \
+    "$HOOK" <<<"$VALID_PAYLOAD" >"$TMP_DIR/stdout.txt" 2>"$TMP_DIR/stderr.txt" || HOOK_RC=$?
+  assert_eq "skill example $skill_rel permit rc" "$HOOK_RC" "0"
+  assert_json "skill example $skill_rel permit stdout" "$(cat "$TMP_DIR/stdout.txt")" "d['verdict'] == 'permit' and d['receipt_hash'].startswith('sha256:')"
+done
+pass "Example mandates in claude-code/SKILL.md and agy/SKILL.md aligned with policy-map.example.json and permitted the example call"
 
 echo "ALL $PASS_COUNT HOOK & PLUGIN TESTS PASSED."

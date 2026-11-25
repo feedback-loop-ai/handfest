@@ -25,11 +25,12 @@ FROM human "<principal>" (key: ed25519:<principal-pub-hex>)
 TO agent "<agent-name>" (key: ed25519:<agent-pub-hex>)
 DELEGATION max 0 hops
 ALLOW git.pr.merge
-ON repo "org/repo"
+ON repo "handfest"
 WHERE context.time >= 2026-11-24T17:00:00Z
   AND context.time < 2026-11-25T01:00:00Z
-  AND resource.author == "<principal>"
+  AND resource.owner == "feedback-loop-ai"
   AND resource.environment == "staging"
+  AND resource.pr >= 1
 LIMIT 5 calls
 ```
 
