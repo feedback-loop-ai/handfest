@@ -1,7 +1,7 @@
 use handfest_anchors::{
-    format_actor_kind, format_assurance, parse_actor_kind, parse_assurance, verify_chain,
-    verify_ed25519, AnchorError, AnchorVerifier, AssuranceLevel, Ed25519KeyFile, Ed25519Keypair,
-    Ed25519Verifier, SignedMandate,
+    format_actor_kind, format_assurance, parse_actor_kind, parse_assurance, signing_payload,
+    verify_chain, verify_ed25519, AnchorError, AnchorVerifier, AssuranceLevel, Ed25519KeyFile,
+    Ed25519Keypair, Ed25519Verifier, SignedMandate, SIGNING_DOMAIN_PREFIX,
 };
 use handfest_core::ast::{
     parse_rfc3339_utc, KeyId, MandateId, Scalar, MAX_RFC3339_TIMESTAMP, MIN_RFC3339_TIMESTAMP,
@@ -249,7 +249,7 @@ fn tamper_detection_on_canonical_text_signature_signer_and_envelope() {
     equal_window.valid_until = equal_window.valid_from;
     assert!(matches!(
         verify_ed25519(&equal_window),
-        Err(AnchorError::InvalidValidityWindow { .. })
+        Err(AnchorError::InvalidSignature(_))
     ));
 
     let mut out_of_bounds = signed;
@@ -390,4 +390,89 @@ fn multi_hop_verify_chain_and_wire_helpers() {
         verify_chain(&[root_signed, bad_child]),
         Err(AnchorError::ChainHop { hop: 1, .. })
     ));
+}
+
+#[test]
+fn envelope_metadata_tampering_invalidates_signature_and_equal_window_is_signable() {
+    let root_kp = Ed25519Keypair::generate();
+    let other_kp = Ed25519Keypair::generate();
+    let disp_kp = Ed25519Keypair::generate();
+    let words = root_canonical(&root_kp.key_id(), &disp_kp.key_id());
+
+    let valid_from = ts("2026-11-24T17:00:00Z");
+    let valid_until = ts("2026-11-25T01:00:00Z");
+    let signed = root_kp
+        .sign_mandate(&words, "local-key-1", valid_from, valid_until)
+        .expect("sign mandate");
+
+    let base_payload = signing_payload(&signed);
+    assert!(base_payload.starts_with(SIGNING_DOMAIN_PREFIX));
+
+    // Mutating valid_until to another valid timestamp must fail signature verification.
+    let mut bad_valid_until = signed.clone();
+    bad_valid_until.valid_until = ts("2026-11-26T01:00:00Z");
+    assert_ne!(signing_payload(&bad_valid_until), base_payload);
+    assert!(matches!(
+        verify_ed25519(&bad_valid_until),
+        Err(AnchorError::InvalidSignature(_))
+    ));
+
+    // Mutating valid_from to another valid timestamp must fail signature verification.
+    let mut bad_valid_from = signed.clone();
+    bad_valid_from.valid_from = ts("2026-11-24T16:00:00Z");
+    assert_ne!(signing_payload(&bad_valid_from), base_payload);
+    assert!(matches!(
+        verify_ed25519(&bad_valid_from),
+        Err(AnchorError::InvalidSignature(_))
+    ));
+
+    // Mutating anchor_id must fail signature verification.
+    let mut bad_anchor_id = signed.clone();
+    bad_anchor_id.anchor_id = "spoofed-anchor".to_string();
+    assert_ne!(signing_payload(&bad_anchor_id), base_payload);
+    assert!(matches!(
+        verify_ed25519(&bad_anchor_id),
+        Err(AnchorError::InvalidSignature(_))
+    ));
+
+    // Mutating assurance must both change the signed payload and fail verification.
+    let mut bad_assurance = signed.clone();
+    bad_assurance.assurance = "qualified_qes".to_string();
+    assert_ne!(signing_payload(&bad_assurance), base_payload);
+    assert!(verify_ed25519(&bad_assurance).is_err());
+
+    // Mutating actor_kind must both change the signed payload and fail verification.
+    let mut bad_actor_kind = signed.clone();
+    bad_actor_kind.actor_kind = "agent".to_string();
+    assert_ne!(signing_payload(&bad_actor_kind), base_payload);
+    assert!(verify_ed25519(&bad_actor_kind).is_err());
+
+    // Mutating signer_key must both change the signed payload and fail verification.
+    let mut bad_signer = signed.clone();
+    bad_signer.signer_key = other_kp.key_id().to_string();
+    assert_ne!(signing_payload(&bad_signer), base_payload);
+    assert!(verify_ed25519(&bad_signer).is_err());
+
+    // valid_from == valid_until is permitted in anchor signing/verification, while gate rejects empty windows.
+    let empty_window_signed = root_kp
+        .sign_mandate(&words, "local-key-1", valid_from, valid_from)
+        .expect("valid_from == valid_until should sign");
+    let empty_window_verified =
+        verify_ed25519(&empty_window_signed).expect("valid_from == valid_until should verify");
+    let req = ActionRequest {
+        actor_key: disp_kp.key_id(),
+        action: "git.pr.merge".to_string(),
+        resource_kind: "repo".to_string(),
+        resource_id: "feedback-loop-ai/handfest".to_string(),
+    };
+    let facts = VerifiedFacts::new().with("resource.author", Scalar::Str("valentin".to_string()));
+    let (verdict, _) = authorize(
+        &[empty_window_verified],
+        &req,
+        &facts,
+        &QuotaSnapshot::new(),
+        valid_from,
+        None,
+    );
+    assert!(matches!(verdict, Verdict::Deny { ref reason } if reason.contains("validity window")));
 }

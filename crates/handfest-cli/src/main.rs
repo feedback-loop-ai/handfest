@@ -330,25 +330,25 @@ fn cmd_check(args: &CheckArgs) -> Result<ExitCode, String> {
 }
 
 fn cmd_audit(ledger_path: &Path, actor_key_raw: Option<&str>) -> Result<ExitCode, String> {
-    let ledger = SqliteLedger::open(ledger_path)
+    let actor_key = match actor_key_raw {
+        Some(raw) => {
+            Some(KeyId::parse(raw).map_err(|err| format!("invalid --actor-key '{raw}': {err}"))?)
+        }
+        None => None,
+    };
+
+    let ledger = SqliteLedger::open_read_only(ledger_path)
         .map_err(|err| format!("failed to open ledger '{}': {err}", ledger_path.display()))?;
-    let verified_receipts = ledger
-        .verify_integrity()
+    let (verified_receipts, track_record) = ledger
+        .audit_snapshot(actor_key.as_ref())
         .map_err(|err| format!("audit integrity check failed: {err}"))?;
 
-    let output = match actor_key_raw {
-        Some(raw) => {
-            let actor_key =
-                KeyId::parse(raw).map_err(|err| format!("invalid --actor-key '{raw}': {err}"))?;
-            let record = ledger
-                .track_record(&actor_key)
-                .map_err(|err| format!("failed to compute track record: {err}"))?;
-            json!({
-                "status": "ok",
-                "verified_receipts": verified_receipts,
-                "track_record": record,
-            })
-        }
+    let output = match track_record {
+        Some(record) => json!({
+            "status": "ok",
+            "verified_receipts": verified_receipts,
+            "track_record": record,
+        }),
         None => json!({
             "status": "ok",
             "verified_receipts": verified_receipts,
@@ -391,15 +391,71 @@ fn parse_timestamp_arg(flag: &str, raw: &str) -> Result<i64, String> {
     ))
 }
 
+#[cfg(unix)]
 fn write_secret_file(path: &Path, content: &str) -> Result<(), String> {
-    let mut opts = fs::OpenOptions::new();
-    opts.write(true).create(true).truncate(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        opts.mode(0o600);
+    use std::os::unix::fs::PermissionsExt;
+
+    let parent = match path.parent() {
+        Some(dir) if !dir.as_os_str().is_empty() => dir,
+        _ => Path::new("."),
+    };
+    let pid = std::process::id();
+
+    let (tmp_path, mut file) = create_unique_secret_temp(parent, pid)?;
+    let write_res = (|| -> std::io::Result<()> {
+        file.set_permissions(fs::Permissions::from_mode(0o600))?;
+        file.write_all(content.as_bytes())?;
+        file.sync_all()?;
+        Ok(())
+    })();
+    drop(file);
+
+    if let Err(err) = write_res {
+        let _ = fs::remove_file(&tmp_path);
+        return Err(format!("failed to write '{}': {err}", path.display()));
     }
-    let mut file = opts
+
+    if let Err(err) = fs::rename(&tmp_path, path) {
+        let _ = fs::remove_file(&tmp_path);
+        return Err(format!("failed to install '{}': {err}", path.display()));
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn create_unique_secret_temp(parent: &Path, pid: u32) -> Result<(PathBuf, fs::File), String> {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    for attempt in 0u32..64 {
+        let tmp_path = parent.join(format!(".handfest-secret-{pid}-{attempt}.tmp"));
+        match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&tmp_path)
+        {
+            Ok(file) => return Ok((tmp_path, file)),
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(err) => {
+                return Err(format!(
+                    "failed to create temporary secret file in '{}': {err}",
+                    parent.display()
+                ));
+            }
+        }
+    }
+    Err(format!(
+        "failed to allocate unique temporary secret file in '{}'",
+        parent.display()
+    ))
+}
+
+#[cfg(not(unix))]
+fn write_secret_file(path: &Path, content: &str) -> Result<(), String> {
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
         .open(path)
         .map_err(|err| format!("failed to create '{}': {err}", path.display()))?;
     file.write_all(content.as_bytes())

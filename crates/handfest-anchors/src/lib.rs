@@ -14,8 +14,9 @@ use serde::{Deserialize, Serialize};
 
 pub use handfest_core::AssuranceLevel;
 
-/// Domain-separation prefix prepended to canonical `HANDFEST v1` text before Ed25519 signing.
-pub const SIGNING_DOMAIN_PREFIX: &[u8] = b"handfest-v1-sig\0";
+/// Domain-separation prefix prepended to length-prefixed envelope metadata and canonical
+/// `HANDFEST v1` text before Ed25519 signing.
+pub const SIGNING_DOMAIN_PREFIX: &[u8] = b"handfest-v1-envelope\0";
 
 /// Errors returned while loading keys, signing, or verifying trust-anchor envelopes.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -84,7 +85,7 @@ impl fmt::Display for AnchorError {
                 valid_until,
             } => write!(
                 f,
-                "invalid validity window [{valid_from}..{valid_until}): valid_from must be strictly less than valid_until"
+                "invalid validity window [{valid_from}..{valid_until}): valid_from must be less than or equal to valid_until"
             ),
             Self::KeyIdMismatch { expected, actual } => {
                 write!(f, "key_id mismatch in key file: derived '{expected}', file has '{actual}'")
@@ -214,7 +215,8 @@ impl Ed25519Keypair {
         Ok(keypair)
     }
 
-    /// Signs strictly canonical `HANDFEST v1` text with domain separation `b"handfest-v1-sig\0"`.
+    /// Signs strictly canonical `HANDFEST v1` text and all envelope metadata with domain
+    /// separation `b"handfest-v1-envelope\0"`.
     pub fn sign_mandate(
         &self,
         canonical_words: &str,
@@ -235,10 +237,7 @@ impl Ed25519Keypair {
             });
         }
 
-        let payload = signing_payload(canonical_words);
-        let signature: Signature = self.signing_key.sign(&payload);
-
-        Ok(SignedMandate {
+        let mut signed = SignedMandate {
             canonical_words: canonical_words.to_string(),
             anchor_id,
             assurance: format_assurance(AssuranceLevel::LocalKey).to_string(),
@@ -246,8 +245,12 @@ impl Ed25519Keypair {
             signer_key: my_key_id.to_string(),
             valid_from,
             valid_until,
-            signature_hex: hex::encode(signature.to_bytes()),
-        })
+            signature_hex: String::new(),
+        };
+        let payload = signing_payload(&signed);
+        let signature: Signature = self.signing_key.sign(&payload);
+        signed.signature_hex = hex::encode(signature.to_bytes());
+        Ok(signed)
     }
 }
 
@@ -305,7 +308,7 @@ pub fn verify_ed25519(signed: &SignedMandate) -> Result<VerifiedMandate, AnchorE
         .map_err(AnchorError::InvalidSignature)?;
     let signature = Signature::from_bytes(&sig_bytes);
 
-    let payload = signing_payload(&signed.canonical_words);
+    let payload = signing_payload(signed);
     verifying_key
         .verify_strict(&payload, &signature)
         .map_err(|err| AnchorError::InvalidSignature(err.to_string()))?;
@@ -339,13 +342,36 @@ pub fn verify_chain(mandates: &[SignedMandate]) -> Result<Vec<VerifiedMandate>, 
     Ok(verified)
 }
 
-/// Builds the domain-separated payload signed by Ed25519 anchors.
+/// Builds the domain-separated, length-prefixed payload signed by Ed25519 anchors.
+///
+/// Binds `anchor_id`, `assurance`, `actor_kind`, `signer_key`, `valid_from`, `valid_until`,
+/// and `canonical_words` unambiguously so tampering with any envelope field invalidates the
+/// signature.
 #[must_use]
-pub fn signing_payload(canonical_words: &str) -> Vec<u8> {
-    let mut payload = Vec::with_capacity(SIGNING_DOMAIN_PREFIX.len() + canonical_words.len());
+pub fn signing_payload(signed: &SignedMandate) -> Vec<u8> {
+    let capacity = SIGNING_DOMAIN_PREFIX.len()
+        + (8 * 7)
+        + signed.anchor_id.len()
+        + signed.assurance.len()
+        + signed.actor_kind.len()
+        + signed.signer_key.len()
+        + signed.canonical_words.len();
+    let mut payload = Vec::with_capacity(capacity);
     payload.extend_from_slice(SIGNING_DOMAIN_PREFIX);
-    payload.extend_from_slice(canonical_words.as_bytes());
+    push_len_prefixed_str(&mut payload, &signed.anchor_id);
+    push_len_prefixed_str(&mut payload, &signed.assurance);
+    push_len_prefixed_str(&mut payload, &signed.actor_kind);
+    push_len_prefixed_str(&mut payload, &signed.signer_key);
+    payload.extend_from_slice(&signed.valid_from.to_be_bytes());
+    payload.extend_from_slice(&signed.valid_until.to_be_bytes());
+    push_len_prefixed_str(&mut payload, &signed.canonical_words);
     payload
+}
+
+fn push_len_prefixed_str(buf: &mut Vec<u8>, value: &str) {
+    let len = u64::try_from(value.len()).expect("string byte length fits in u64");
+    buf.extend_from_slice(&len.to_be_bytes());
+    buf.extend_from_slice(value.as_bytes());
 }
 
 /// Parses an actor kind string (`"human" | "org" | "agent" | "service"`).
@@ -415,7 +441,7 @@ fn validate_validity_window(valid_from: i64, valid_until: i64) -> Result<(), Anc
     if !is_valid_timestamp(valid_until) {
         return Err(AnchorError::InvalidTimestamp(valid_until));
     }
-    if valid_from >= valid_until {
+    if valid_from > valid_until {
         return Err(AnchorError::InvalidValidityWindow {
             valid_from,
             valid_until,

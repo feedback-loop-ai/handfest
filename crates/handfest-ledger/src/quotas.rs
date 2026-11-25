@@ -1,6 +1,6 @@
 //! Atomic chain-wide quota snapshot loading and update helpers for [`SqliteLedger`].
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 
 use handfest_core::ast::{Decimal, MandateId, Quota, Scalar};
 use handfest_core::gate::{QuotaSnapshot, VerifiedFacts, VerifiedMandate};
@@ -66,13 +66,22 @@ pub(crate) fn compute_quota_updates(
     facts: &VerifiedFacts,
     usage: &QuotaSnapshot,
 ) -> Result<QuotaUpdates, LedgerError> {
-    let unique_ids: BTreeSet<MandateId> = chain_ids.iter().copied().collect();
-    let sum_fields = collect_sum_deltas(chain, facts)?;
+    if chain.len() != chain_ids.len() {
+        return Err(LedgerError::QuotaAccounting(format!(
+            "chain length ({}) does not match chain_ids length ({})",
+            chain.len(),
+            chain_ids.len()
+        )));
+    }
 
-    let mut calls = Vec::with_capacity(unique_ids.len());
-    let mut sums = Vec::with_capacity(unique_ids.len() * sum_fields.len());
+    let mut seen_ids: BTreeSet<MandateId> = BTreeSet::new();
+    let mut calls = Vec::with_capacity(chain_ids.len());
+    let mut sums = Vec::new();
 
-    for mid in unique_ids {
+    for (vm, &mid) in chain.iter().zip(chain_ids.iter()) {
+        if !seen_ids.insert(mid) {
+            continue;
+        }
         let next_calls = usage
             .calls_for(&mid)
             .checked_add(1)
@@ -82,24 +91,10 @@ pub(crate) fn compute_quota_updates(
             })?;
         calls.push((mid, next_calls));
 
-        for ((unit, field), delta) in &sum_fields {
-            let prior = usage.sum_for(&mid, unit, field);
-            if prior.is_negative() {
-                return Err(LedgerError::QuotaAccounting(format!(
-                    "negative prior sum total for ({mid}, {unit}, {field})"
-                )));
-            }
-            let next = prior.checked_add(delta).ok_or_else(|| {
-                LedgerError::QuotaAccounting(format!(
-                    "decimal overflow adding {delta} to {prior} for ({mid}, {unit}, {field})"
-                ))
-            })?;
-            if next.is_negative() {
-                return Err(LedgerError::QuotaAccounting(format!(
-                    "negative resulting sum total for ({mid}, {unit}, {field})"
-                )));
-            }
-            sums.push((mid, unit.clone(), field.clone(), next));
+        for (unit, field) in collect_mandate_sum_keys(vm) {
+            let delta = extract_non_negative_decimal(facts, &field)?;
+            let next = add_non_negative_sum(usage, &mid, &unit, &field, &delta)?;
+            sums.push((mid, unit, field, next));
         }
     }
 
@@ -128,24 +123,40 @@ pub(crate) fn apply_quota_updates(
     Ok(())
 }
 
-fn collect_sum_deltas(
-    chain: &[VerifiedMandate],
-    facts: &VerifiedFacts,
-) -> Result<BTreeMap<(String, String), Decimal>, LedgerError> {
-    let mut sum_fields: BTreeMap<(String, String), Decimal> = BTreeMap::new();
-    for vm in chain {
-        for quota in vm.ast.limits() {
-            if let Quota::Sum { unit, field, .. } = quota {
-                let key = (unit.clone(), field.clone());
-                if sum_fields.contains_key(&key) {
-                    continue;
-                }
-                let delta = extract_non_negative_decimal(facts, field)?;
-                sum_fields.insert(key, delta);
-            }
+fn collect_mandate_sum_keys(vm: &VerifiedMandate) -> BTreeSet<(String, String)> {
+    let mut keys = BTreeSet::new();
+    for quota in vm.ast.limits() {
+        if let Quota::Sum { unit, field, .. } = quota {
+            keys.insert((unit.clone(), field.clone()));
         }
     }
-    Ok(sum_fields)
+    keys
+}
+
+fn add_non_negative_sum(
+    usage: &QuotaSnapshot,
+    mid: &MandateId,
+    unit: &str,
+    field: &str,
+    delta: &Decimal,
+) -> Result<Decimal, LedgerError> {
+    let prior = usage.sum_for(mid, unit, field);
+    if prior.is_negative() {
+        return Err(LedgerError::QuotaAccounting(format!(
+            "negative prior sum total for ({mid}, {unit}, {field})"
+        )));
+    }
+    let next = prior.checked_add(delta).ok_or_else(|| {
+        LedgerError::QuotaAccounting(format!(
+            "decimal overflow adding {delta} to {prior} for ({mid}, {unit}, {field})"
+        ))
+    })?;
+    if next.is_negative() {
+        return Err(LedgerError::QuotaAccounting(format!(
+            "negative resulting sum total for ({mid}, {unit}, {field})"
+        )));
+    }
+    Ok(next)
 }
 
 fn extract_non_negative_decimal(

@@ -333,3 +333,413 @@ fn verify_rejects_widened_child_and_audit_without_actor_key_succeeds() {
     assert_eq!(audit_json["verified_receipts"], 1);
     assert!(audit_json.get("track_record").is_none());
 }
+
+fn setup_budget_mandate(dir: &Path) -> (PathBuf, String) {
+    let (root_key_path, root_key) = keygen_to(dir, "root.key.json");
+    let (_disp_key_path, disp_key) = keygen_to(dir, "disp.key.json");
+    let root_hf = dir.join("budget.hf");
+    fs::write(
+        &root_hf,
+        format!(
+            concat!(
+                "HANDFEST v1\n",
+                "FROM human \"valentin\" (key: {root_key})\n",
+                "TO agent \"treasury\" (key: {disp_key})\n",
+                "DELEGATION max 0 hops\n",
+                "ALLOW pay.transfer\n",
+                "ON account \"ops-main\"\n",
+                "LIMIT 100.00 USD sum(resource.amount)\n",
+            ),
+            root_key = root_key,
+            disp_key = disp_key
+        ),
+    )
+    .unwrap();
+    let root_signed = dir.join("budget.signed.json");
+    let _ = sign_to(
+        &root_hf,
+        &root_key_path,
+        "2026-11-24T00:00:00Z",
+        "2026-11-25T00:00:00Z",
+        &root_signed,
+    );
+    (root_signed, disp_key)
+}
+
+fn run_budget_check(
+    ledger: &Path,
+    root_signed: &Path,
+    disp_key: &str,
+    facts_arg: &str,
+    now: &str,
+) -> Output {
+    run_raw(&[
+        "check",
+        "--ledger",
+        path_str(ledger),
+        "--chain",
+        path_str(root_signed),
+        "--actor-key",
+        disp_key,
+        "--action",
+        "pay.transfer",
+        "--resource-kind",
+        "account",
+        "--resource-id",
+        "ops-main",
+        "--facts",
+        facts_arg,
+        "--now",
+        now,
+    ])
+}
+
+/// Brackets a single charge on a fresh 100.00 USD budget to 1e-28 precision (MAX_DECIMAL_SCALE):
+/// `(100 - expected + 1e-28)` MUST Deny and `(100 - expected)` MUST Permit.
+fn assert_exact_budget_charge(
+    ledger: &Path,
+    root_signed: &Path,
+    disp_key: &str,
+    amount_json: &str,
+    over_rem: &str,
+    exact_rem: &str,
+) {
+    let first = run_budget_check(
+        ledger,
+        root_signed,
+        disp_key,
+        amount_json,
+        "2026-11-24T12:01:00Z",
+    );
+    assert!(first.status.success(), "expected permit for {amount_json}");
+    let first_json: Value = serde_json::from_slice(&first.stdout).unwrap();
+    assert_eq!(first_json["verdict"], "permit");
+
+    let over_facts = format!(r#"{{"resource.amount": {over_rem}}}"#);
+    let over = run_budget_check(
+        ledger,
+        root_signed,
+        disp_key,
+        &over_facts,
+        "2026-11-24T12:02:00Z",
+    );
+    assert!(
+        !over.status.success(),
+        "expected deny for {over_rem} after charging {amount_json}"
+    );
+    let over_json: Value = serde_json::from_slice(&over.stdout).unwrap();
+    assert_eq!(over_json["verdict"], "deny");
+    assert!(over_json["reason"]
+        .as_str()
+        .unwrap()
+        .contains("sum quota exceeded"));
+
+    let exact_facts = format!(r#"{{"resource.amount": {exact_rem}}}"#);
+    let exact = run_budget_check(
+        ledger,
+        root_signed,
+        disp_key,
+        &exact_facts,
+        "2026-11-24T12:03:00Z",
+    );
+    assert!(
+        exact.status.success(),
+        "expected permit for exact remainder {exact_rem} after charging {amount_json}"
+    );
+    let exact_json: Value = serde_json::from_slice(&exact.stdout).unwrap();
+    assert_eq!(exact_json["verdict"], "permit");
+}
+
+#[test]
+fn exact_decimal_facts_and_fifo_path_support() {
+    let dir = TempDir::new().unwrap();
+    let (root_signed, disp_key) = setup_budget_mandate(dir.path());
+
+    // 100.000000000000001 rounds to 100.0 in IEEE-754 f64, so exact decimal parsing MUST Deny it.
+    let over_out = run_budget_check(
+        &dir.path().join("over.sqlite"),
+        &root_signed,
+        &disp_key,
+        r#"{"resource.amount": 100.000000000000001}"#,
+        "2026-11-24T12:00:00Z",
+    );
+    assert!(!over_out.status.success());
+    let over_json: Value = serde_json::from_slice(&over_out.stdout).unwrap();
+    assert_eq!(over_json["verdict"], "deny");
+    assert!(over_json["reason"]
+        .as_str()
+        .unwrap()
+        .contains("sum quota exceeded"));
+
+    // 0.00000001 and scientific notation 1e-8 must each charge exactly 0.00000001 (not 0).
+    for (name, facts_json) in [
+        ("tiny_plain.sqlite", r#"{"resource.amount": 0.00000001}"#),
+        ("tiny_sci.sqlite", r#"{"resource.amount": 1e-8}"#),
+    ] {
+        assert_exact_budget_charge(
+            &dir.path().join(name),
+            &root_signed,
+            &disp_key,
+            facts_json,
+            "99.9999999900000000000000000001",
+            "99.99999999",
+        );
+    }
+
+    // Plain decimals with redundant fractional zeros beyond 28 lexical digits must match e0.
+    for (name, facts_json) in [
+        (
+            "trailing_zeros_plain.sqlite",
+            r#"{"resource.amount": 1.500000000000000000000000000000}"#,
+        ),
+        (
+            "trailing_zeros_sci.sqlite",
+            r#"{"resource.amount": 1.500000000000000000000000000000e0}"#,
+        ),
+    ] {
+        assert_exact_budget_charge(
+            &dir.path().join(name),
+            &root_signed,
+            &disp_key,
+            facts_json,
+            "98.5000000000000000000000000001",
+            "98.5",
+        );
+    }
+
+    // Non-regular readable path (FIFO) must work for --facts without hanging on regression.
+    #[cfg(unix)]
+    assert_fifo_facts_roundtrip(dir.path(), &root_signed, &disp_key);
+}
+
+#[cfg(unix)]
+fn assert_fifo_facts_roundtrip(dir: &Path, root_signed: &Path, disp_key: &str) {
+    use std::fs::OpenOptions;
+    use std::sync::mpsc::{self, RecvTimeoutError};
+    use std::time::Duration;
+
+    let fifo_ledger = dir.join("fifo.sqlite");
+    let fifo_path = dir.join("facts.fifo");
+    let status = Command::new("mkfifo")
+        .arg(&fifo_path)
+        .status()
+        .expect("spawn mkfifo");
+    assert!(status.success(), "mkfifo failed");
+
+    let (done_tx, done_rx) = mpsc::channel();
+    let fifo_writer_path = fifo_path.clone();
+    let writer = std::thread::spawn(move || {
+        let res = fs::write(&fifo_writer_path, r#"{"resource.amount": 0.00000001}"#);
+        let _ = done_tx.send(());
+        res
+    });
+
+    let fifo_out = run_budget_check(
+        &fifo_ledger,
+        root_signed,
+        disp_key,
+        path_str(&fifo_path),
+        "2026-11-24T12:03:00Z",
+    );
+
+    let writer_still_blocked = matches!(
+        done_rx.recv_timeout(Duration::from_secs(2)),
+        Err(RecvTimeoutError::Timeout)
+    );
+    // Open the FIFO O_RDWR to unblock a stuck writer without ever blocking if the writer
+    // already closed the FIFO and its completion message was merely delayed.
+    let _unblock_guard = if writer_still_blocked {
+        OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&fifo_path)
+            .ok()
+    } else {
+        None
+    };
+    let write_res = writer.join().expect("fifo writer thread panicked");
+    drop(_unblock_guard);
+    assert!(
+        !writer_still_blocked,
+        "CLI exited without opening FIFO read end (stderr: {})",
+        String::from_utf8_lossy(&fifo_out.stderr)
+    );
+    write_res.expect("write to fifo");
+    assert!(fifo_out.status.success());
+    let fifo_json: Value = serde_json::from_slice(&fifo_out.stdout).unwrap();
+    assert_eq!(fifo_json["verdict"], "permit");
+
+    let over_after_fifo = run_budget_check(
+        &fifo_ledger,
+        root_signed,
+        disp_key,
+        r#"{"resource.amount": 99.9999999900000000000000000001}"#,
+        "2026-11-24T12:04:00Z",
+    );
+    assert!(!over_after_fifo.status.success());
+}
+
+#[test]
+fn audit_missing_ledger_does_not_create_file_and_reads_readonly_dir() {
+    let dir = TempDir::new().unwrap();
+
+    // Auditing a missing ledger must fail and must NOT create the file.
+    let missing_path = dir.path().join("missing.sqlite");
+    let missing_out = run_raw(&["audit", "--ledger", path_str(&missing_path)]);
+    assert!(!missing_out.status.success());
+    assert!(
+        !missing_path.exists(),
+        "handfest audit must never create a missing ledger file"
+    );
+
+    // Populate a real ledger inside a dedicated subdirectory.
+    let ro_dir = dir.path().join("readonly_dir");
+    fs::create_dir(&ro_dir).unwrap();
+    let (root_key_path, root_key) = keygen_to(dir.path(), "root.key.json");
+    let (_disp_key_path, disp_key) = keygen_to(dir.path(), "disp.key.json");
+    let root_hf = dir.path().join("root.hf");
+    fs::write(
+        &root_hf,
+        format!(
+            concat!(
+                "HANDFEST v1\n",
+                "FROM human \"valentin\" (key: {root_key})\n",
+                "TO agent \"dispatcher\" (key: {disp_key})\n",
+                "DELEGATION max 0 hops\n",
+                "ALLOW git.pr.merge\n",
+                "ON repo \"feedback-loop-ai/handfest\"\n",
+                "LIMIT 5 calls\n",
+            ),
+            root_key = root_key,
+            disp_key = disp_key
+        ),
+    )
+    .unwrap();
+    let root_signed = dir.path().join("root.signed.json");
+    let _ = sign_to(
+        &root_hf,
+        &root_key_path,
+        "2026-11-24T00:00:00Z",
+        "2026-11-25T00:00:00Z",
+        &root_signed,
+    );
+
+    let ledger_path = ro_dir.join("ledger.sqlite");
+    let _ = run_ok(&[
+        "check",
+        "--ledger",
+        path_str(&ledger_path),
+        "--chain",
+        path_str(&root_signed),
+        "--actor-key",
+        &disp_key,
+        "--action",
+        "git.pr.merge",
+        "--resource-kind",
+        "repo",
+        "--resource-id",
+        "feedback-loop-ai/handfest",
+        "--now",
+        "2026-11-24T12:00:00Z",
+    ]);
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        struct RestorePerms {
+            dir: PathBuf,
+            file: PathBuf,
+        }
+        impl Drop for RestorePerms {
+            fn drop(&mut self) {
+                let _ = fs::set_permissions(&self.dir, fs::Permissions::from_mode(0o755));
+                let _ = fs::set_permissions(&self.file, fs::Permissions::from_mode(0o644));
+            }
+        }
+
+        let _guard = RestorePerms {
+            dir: ro_dir.clone(),
+            file: ledger_path.clone(),
+        };
+        fs::set_permissions(&ledger_path, fs::Permissions::from_mode(0o444)).unwrap();
+        fs::set_permissions(&ro_dir, fs::Permissions::from_mode(0o555)).unwrap();
+
+        let audit_out = run_ok(&[
+            "audit",
+            "--ledger",
+            path_str(&ledger_path),
+            "--actor-key",
+            &disp_key,
+        ]);
+        let audit_json: Value = serde_json::from_str(&audit_out).unwrap();
+        assert_eq!(audit_json["status"], "ok");
+        assert_eq!(audit_json["verified_receipts"], 1);
+        assert_eq!(audit_json["track_record"]["permits"], 1);
+
+        assert_audit_succeeds_with_readonly_tmpdir(dir.path(), &ledger_path, &disp_key);
+    }
+}
+
+#[cfg(unix)]
+fn assert_audit_succeeds_with_readonly_tmpdir(dir: &Path, ledger_path: &Path, disp_key: &str) {
+    use std::os::unix::fs::PermissionsExt;
+
+    let ro_tmp = dir.join("readonly_tmp");
+    fs::create_dir(&ro_tmp).unwrap();
+    struct RestoreTmp(PathBuf);
+    impl Drop for RestoreTmp {
+        fn drop(&mut self) {
+            let _ = fs::set_permissions(&self.0, fs::Permissions::from_mode(0o755));
+        }
+    }
+    let _tmp_guard = RestoreTmp(ro_tmp.clone());
+    fs::set_permissions(&ro_tmp, fs::Permissions::from_mode(0o555)).unwrap();
+
+    let ro_tmp_out = handfest_bin()
+        .env("TMPDIR", &ro_tmp)
+        .args([
+            "audit",
+            "--ledger",
+            path_str(ledger_path),
+            "--actor-key",
+            disp_key,
+        ])
+        .output()
+        .expect("spawn handfest audit with read-only TMPDIR");
+    assert!(
+        ro_tmp_out.status.success(),
+        "audit failed with read-only TMPDIR: {}",
+        String::from_utf8_lossy(&ro_tmp_out.stderr)
+    );
+    let ro_tmp_json: Value = serde_json::from_slice(&ro_tmp_out.stdout).unwrap();
+    assert_eq!(ro_tmp_json["status"], "ok");
+    assert_eq!(ro_tmp_json["verified_receipts"], 1);
+    assert_eq!(ro_tmp_json["track_record"]["permits"], 1);
+}
+
+#[cfg(unix)]
+#[test]
+fn keygen_overwriting_world_readable_file_enforces_0600() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = TempDir::new().unwrap();
+    let key_path = dir.path().join("existing.key.json");
+    fs::write(&key_path, "stale-placeholder").unwrap();
+    fs::set_permissions(&key_path, fs::Permissions::from_mode(0o644)).unwrap();
+    assert_eq!(
+        fs::metadata(&key_path).unwrap().permissions().mode() & 0o777,
+        0o644
+    );
+
+    let key_id = run_ok(&["keygen", "--out", path_str(&key_path)])
+        .trim()
+        .to_string();
+    assert!(key_id.starts_with("ed25519:"));
+
+    let mode = fs::metadata(&key_path).unwrap().permissions().mode() & 0o777;
+    assert_eq!(
+        mode, 0o600,
+        "overwritten secret key file must have 0o600 permissions, got {mode:#o}"
+    );
+}
