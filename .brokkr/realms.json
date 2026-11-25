@@ -3,6 +3,7 @@
   "realms": [
     {
       "default_branch": "main",
+      "house": "docs/house-rules.md",
       "name": "handfest",
       "path": ".."
     }
