@@ -7,9 +7,9 @@ use std::time::{Duration, Instant};
 use crate::exact_json::{parse_exact_json, ExactJson};
 use crate::framing::{
     classify_upstream_frame, extract_id_value, fail_upstream_error, fail_upstream_protocol,
-    format_jsonrpc_error_line, validate_client_envelope, write_jsonrpc_error, write_raw_line,
-    JsonRpcId, LineReadError, UpstreamFrame, JSONRPC_INTERNAL_ERROR, JSONRPC_INVALID_REQUEST,
-    JSONRPC_METHOD_NOT_FOUND, JSONRPC_PARSE_ERROR,
+    format_jsonrpc_error_line, reject_unknown_keys, validate_client_envelope, write_jsonrpc_error,
+    write_raw_line, JsonRpcId, LineReadError, UpstreamFrame, JSONRPC_INTERNAL_ERROR,
+    JSONRPC_INVALID_REQUEST, JSONRPC_METHOD_NOT_FOUND, JSONRPC_PARSE_ERROR,
 };
 use crate::proxy::{Clock, McpProxy, ProxyError, ReceiptLedger, HANDFEST_DENIED_ERROR_CODE};
 use crate::transport::{DuplexTransport, IoEvent, RecvOutcome};
@@ -111,10 +111,15 @@ impl SessionState {
         Some(item)
     }
 
-    fn first_queued_request_id(&self) -> Option<&JsonRpcId> {
+    fn first_queued_client_id(&self) -> Option<&JsonRpcId> {
         self.queued_client.iter().find_map(|item| match item {
             QueuedClientItem::Request { id, .. } => Some(id),
-            _ => None,
+            QueuedClientItem::InvalidFrame { id: Some(id), .. } => Some(id),
+            QueuedClientItem::BareCr
+            | QueuedClientItem::InvalidUtf8
+            | QueuedClientItem::ParseError(_)
+            | QueuedClientItem::InvalidFrame { id: None, .. }
+            | QueuedClientItem::Notification { .. } => None,
         })
     }
 
@@ -156,16 +161,22 @@ impl<C: Clock, L: ReceiptLedger> McpProxy<C, L> {
         let mut state = SessionState::default();
 
         loop {
+            if let Some(err) = transport.poll_writer_error() {
+                return Err(err);
+            }
+            if state.upstream_eof
+                && (transport.has_pending_upstream() || !state.queued_client.is_empty())
+            {
+                return emit_upstream_eof(
+                    client_out,
+                    state.active_id().or_else(|| state.first_queued_client_id()),
+                );
+            }
             transport.flush_upstream()?;
             if let Some(err) = transport.poll_writer_error() {
                 return Err(err);
             }
             self.drain_queued_client(&mut state, &mut transport, client_out)?;
-            if state.upstream_eof {
-                if let Some(req_id) = state.first_queued_request_id() {
-                    return emit_upstream_eof(client_out, Some(req_id));
-                }
-            }
             if state.client_eof {
                 if state.queued_client.is_empty()
                     && !transport.has_pending_upstream()
@@ -555,16 +566,30 @@ impl<C: Clock, L: ReceiptLedger> McpProxy<C, L> {
     }
 }
 
+pub(crate) fn ensure_upstream_alive<CW: Write>(
+    req_id: &JsonRpcId,
+    ctx: &mut DispatchCtx<'_, CW>,
+) -> Result<(), ProxyError> {
+    if let Some(err) = ctx.transport.poll_writer_error() {
+        return Err(err);
+    }
+    if ctx.state.upstream_eof || ctx.transport.poll_upstream_eof() {
+        if let Some(err) = ctx.transport.poll_writer_error() {
+            return Err(err);
+        }
+        ctx.state.upstream_eof = true;
+        return emit_upstream_eof(ctx.client_out, Some(req_id));
+    }
+    Ok(())
+}
+
 pub(crate) fn dispatch_to_upstream<CW: Write>(
     req_id: JsonRpcId,
     kind: PendingKind,
     raw_frame: &str,
     ctx: &mut DispatchCtx<'_, CW>,
 ) -> Result<(), ProxyError> {
-    if ctx.state.upstream_eof || ctx.transport.poll_upstream_eof() {
-        ctx.state.upstream_eof = true;
-        return emit_upstream_eof(ctx.client_out, Some(&req_id));
-    }
+    ensure_upstream_alive(&req_id, ctx)?;
     ctx.transport.send_upstream(raw_frame.to_string())?;
     ctx.state.active_request = Some(PendingRequest { id: req_id, kind });
     ctx.state.interleaved_count = 0;
@@ -614,10 +639,14 @@ fn classify_client_line(raw_line: String) -> QueuedClientItem {
 }
 
 fn extract_cancel_request_id(obj: &BTreeMap<String, ExactJson>) -> Option<JsonRpcId> {
-    obj.get("params")
-        .and_then(ExactJson::as_object)
-        .and_then(|params| params.get("requestId"))
-        .and_then(|val| extract_id_value(val).ok())
+    let params = obj.get("params").and_then(ExactJson::as_object)?;
+    reject_unknown_keys(
+        params,
+        &["requestId", "reason", "_meta"],
+        "notifications/cancelled params",
+    )
+    .ok()?;
+    extract_id_value(params.get("requestId")?).ok()
 }
 
 fn is_cancellation_item(item: &QueuedClientItem) -> bool {

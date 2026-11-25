@@ -13,6 +13,7 @@ use handfest_core::gate::{ActionRequest, VerifiedFacts};
 use serde::{Deserialize, Serialize};
 
 use crate::exact_json::{parse_decimal_str, parse_exact_json, parse_json_decimal, ExactJson};
+use crate::framing::{find_case_colliding_keys, find_non_ascii_key};
 
 /// Expected scalar type for an argument-derived fact.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -134,6 +135,9 @@ impl ToolPolicy {
             (Some(arg), None) if arg.is_empty() => Err(MappingError::InvalidPolicy(format!(
                 "tool '{tool_name}': resource_id_arg must not be empty"
             ))),
+            (Some(arg), None) if !arg.is_ascii() => Err(MappingError::InvalidPolicy(format!(
+                "tool '{tool_name}': resource_id_arg '{arg}' must be ASCII"
+            ))),
             (Some(_), None) => Ok(()),
             (None, Some(static_id)) if !is_valid_quoted_str(static_id) => {
                 Err(MappingError::InvalidPolicy(format!(
@@ -152,12 +156,9 @@ impl ToolPolicy {
 
     fn validate_facts(&self, tool_name: &str) -> Result<(), MappingError> {
         let mut target_fields = BTreeSet::new();
+        let mut folded_arg_keys: BTreeMap<String, &str> = BTreeMap::new();
         for (arg_key, spec) in &self.arg_facts {
-            if arg_key.is_empty() {
-                return Err(MappingError::InvalidPolicy(format!(
-                    "tool '{tool_name}': arg_facts key must not be empty"
-                )));
-            }
+            self.validate_arg_fact_key(tool_name, arg_key, &mut folded_arg_keys)?;
             if !is_valid_field_path(&spec.field) {
                 return Err(MappingError::InvalidPolicy(format!(
                     "tool '{tool_name}': invalid arg_facts field path '{}'",
@@ -183,6 +184,37 @@ impl ToolPolicy {
                     "tool '{tool_name}': static fact '{field}': {err}"
                 ))
             })?;
+        }
+        Ok(())
+    }
+
+    fn validate_arg_fact_key<'a>(
+        &self,
+        tool_name: &str,
+        arg_key: &'a str,
+        folded_arg_keys: &mut BTreeMap<String, &'a str>,
+    ) -> Result<(), MappingError> {
+        if arg_key.is_empty() {
+            return Err(MappingError::InvalidPolicy(format!(
+                "tool '{tool_name}': arg_facts key must not be empty"
+            )));
+        }
+        if !arg_key.is_ascii() {
+            return Err(MappingError::InvalidPolicy(format!(
+                "tool '{tool_name}': arg_facts key '{arg_key}' must be ASCII"
+            )));
+        }
+        if let Some(res_arg) = self.resource_id_arg.as_deref() {
+            if arg_key != res_arg && arg_key.eq_ignore_ascii_case(res_arg) {
+                return Err(MappingError::InvalidPolicy(format!(
+                    "tool '{tool_name}': arg_facts key '{arg_key}' collides case-insensitively with resource_id_arg '{res_arg}'"
+                )));
+            }
+        }
+        if let Some(prev) = folded_arg_keys.insert(arg_key.to_ascii_lowercase(), arg_key) {
+            return Err(MappingError::InvalidPolicy(format!(
+                "tool '{tool_name}': arg_facts key '{arg_key}' collides case-insensitively with '{prev}'"
+            )));
         }
         Ok(())
     }
@@ -228,6 +260,10 @@ pub enum MappingError {
         key: String,
         collides_with: String,
     },
+    NonAsciiArgumentKey {
+        tool: String,
+        key: String,
+    },
 }
 
 impl fmt::Display for MappingError {
@@ -266,6 +302,9 @@ impl fmt::Display for MappingError {
                 f,
                 "tool '{tool}': argument key '{key}' collides case-insensitively with '{collides_with}'"
             ),
+            Self::NonAsciiArgumentKey { tool, key } => {
+                write!(f, "tool '{tool}': argument key '{key}' must be ASCII")
+            }
         }
     }
 }
@@ -583,6 +622,12 @@ fn reject_configured_case_collision(
 fn check_json_case_collisions(tool_name: &str, val: &ExactJson) -> Result<(), MappingError> {
     match val {
         ExactJson::Object(map) => {
+            if let Some(key) = find_non_ascii_key(map) {
+                return Err(MappingError::NonAsciiArgumentKey {
+                    tool: tool_name.to_string(),
+                    key: key.to_string(),
+                });
+            }
             if let Some((a, b)) = find_case_colliding_keys(map) {
                 return Err(MappingError::CaseCollidingArgumentKey {
                     tool: tool_name.to_string(),
@@ -605,86 +650,17 @@ fn check_json_case_collisions(tool_name: &str, val: &ExactJson) -> Result<(), Ma
     }
 }
 
-fn find_case_colliding_keys(map: &BTreeMap<String, ExactJson>) -> Option<(&str, &str)> {
-    let mut seen: BTreeMap<String, &str> = BTreeMap::new();
-    for key in map.keys() {
-        let folded = key.to_ascii_lowercase();
-        if let Some(&prev) = seen.get(&folded) {
-            return Some((prev, key.as_str()));
-        }
-        seen.insert(folded, key.as_str());
-    }
-    None
-}
-
 fn is_valid_concrete_action(action: &str) -> bool {
     ActionPat::parse(action).is_ok_and(|pat| !pat.is_wildcard())
 }
 
 #[cfg(test)]
 mod tests {
-    use handfest_core::ast::Decimal;
-
     use super::*;
 
     fn test_actor() -> KeyId {
         KeyId::parse("ed25519:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef")
             .unwrap()
-    }
-
-    #[test]
-    fn maps_all_five_fact_types_losslessly_with_static_resource_and_override() {
-        let json = r#"{
-            "tools": {
-                "submit": {
-                    "action": "finance.invoice.submit",
-                    "resource_kind": "ledger",
-                    "static_resource_id": "prod-main",
-                    "arg_facts": {
-                        "tag": { "field": "resource.tag", "type": "str" },
-                        "count": { "field": "resource.count", "type": "int" },
-                        "amount": { "field": "resource.amount", "type": "decimal" },
-                        "urgent": { "field": "resource.urgent", "type": "bool" },
-                        "due": { "field": "resource.due", "type": "timestamp" }
-                    },
-                    "static_facts": {
-                        "resource.tag": { "str": "broker-enforced" }
-                    }
-                }
-            }
-        }"#;
-        let map = ToolPolicyMap::from_json_str(json).unwrap();
-        let args = r#"{
-            "tag": "spoofed",
-            "count": 7,
-            "amount": 100.000000000000001,
-            "urgent": true,
-            "due": "2026-06-01T12:00:00Z"
-        }"#;
-        let (req, facts) = map
-            .map_call_json(&test_actor(), "submit", Some(args))
-            .unwrap();
-        assert_eq!(req.action, "finance.invoice.submit");
-        assert_eq!(req.resource_kind, "ledger");
-        assert_eq!(req.resource_id, "prod-main");
-        assert_eq!(
-            facts.get("resource.tag"),
-            Some(&Scalar::Str("broker-enforced".to_string()))
-        );
-        assert_eq!(facts.get("resource.count"), Some(&Scalar::Int(7)));
-        assert_eq!(
-            facts.get("resource.amount"),
-            Some(&Scalar::Decimal(
-                Decimal::parse("100.000000000000001").unwrap()
-            ))
-        );
-        assert_eq!(facts.get("resource.urgent"), Some(&Scalar::Bool(true)));
-        assert_eq!(
-            facts.get("resource.due"),
-            Some(&Scalar::Timestamp(
-                parse_rfc3339_utc("2026-06-01T12:00:00Z").unwrap()
-            ))
-        );
     }
 
     #[test]

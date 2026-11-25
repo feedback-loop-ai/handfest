@@ -1529,3 +1529,400 @@ fn shutdown_deadline_fires_even_while_chatty_upstream_continuously_emits_notific
         "chatty upstream defeated shutdown timeout (took {elapsed:?})"
     );
 }
+
+#[test]
+fn round6_poll_upstream_eof_detects_eof_behind_buffered_notification_without_burning_quota() {
+    struct GatedRespNotifEofReader {
+        release_rx: Option<mpsc::Receiver<()>>,
+        payload: Cursor<Vec<u8>>,
+        dropped_tx: Option<mpsc::SyncSender<()>>,
+    }
+
+    impl Read for GatedRespNotifEofReader {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            if let Some(rx) = self.release_rx.take() {
+                let _ = rx.recv();
+            }
+            self.payload.read(buf)
+        }
+    }
+
+    impl Drop for GatedRespNotifEofReader {
+        fn drop(&mut self) {
+            if let Some(tx) = self.dropped_tx.take() {
+                let _ = tx.send(());
+            }
+        }
+    }
+
+    let now = parse_rfc3339_utc("2026-06-01T00:00:00Z").unwrap();
+    let (verified, agent_kp) = single_hop_chain("LIMIT 1 calls\n");
+    let mut proxy = McpProxy::new(
+        verified,
+        agent_kp.key_id(),
+        merge_pr_policy_map(),
+        SqliteLedger::open_in_memory().unwrap(),
+        FixedClock::new(now),
+    )
+    .unwrap();
+
+    // Upstream writes resp 1, then a buffered notification, then hits EOF — so when id: 1
+    // finishes and queued `tools/call (id: 2)` runs, `UpstreamEof` sits BEHIND a buffered
+    // `UpstreamLine` notification in `event_rx`.
+    let payload = concat!(
+        r#"{"jsonrpc":"2.0","id":1,"result":{"pong":1}}"#,
+        "\n",
+        r#"{"jsonrpc":"2.0","method":"notifications/progress","params":{"step":1}}"#,
+        "\n",
+    );
+    let (mut client_in_w, client_in_r) = mem_pipe();
+    let (mut client_out_w, mut client_out_r) = mem_pipe();
+    let (up_in_w, mut up_in_r) = mem_pipe();
+    let (eof_tx, eof_rx) = mpsc::sync_channel(1);
+    let (release_tx, release_rx) = mpsc::sync_channel(1);
+
+    let up_out_r = BufReader::new(GatedRespNotifEofReader {
+        release_rx: Some(release_rx),
+        payload: Cursor::new(payload.as_bytes().to_vec()),
+        dropped_tx: Some(eof_tx),
+    });
+
+    let proxy_thread = thread::spawn(move || {
+        let res = proxy.run(client_in_r, &mut client_out_w, up_in_w, up_out_r);
+        (proxy, res)
+    });
+
+    writeln!(client_in_w, r#"{{"jsonrpc":"2.0","id":1,"method":"ping"}}"#).unwrap();
+    let mut seen_ping = String::new();
+    up_in_r.read_line(&mut seen_ping).unwrap();
+    assert!(seen_ping.contains("\"id\":1"));
+
+    writeln!(
+        client_in_w,
+        r#"{{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{{"name":"merge_pr","arguments":{{"repo":"org/app"}}}}}}"#
+    )
+    .unwrap();
+    thread::sleep(Duration::from_millis(30));
+
+    release_tx.send(()).unwrap();
+    eof_rx
+        .recv_timeout(Duration::from_secs(2))
+        .expect("upstream emitted resp 1 + notification + EOF into event_rx");
+
+    let mut line1 = String::new();
+    client_out_r.read_line(&mut line1).unwrap();
+    let resp1: Value = serde_json::from_str(line1.trim_end()).unwrap();
+    assert_eq!(resp1["id"], json!(1));
+
+    let mut line2 = String::new();
+    client_out_r.read_line(&mut line2).unwrap();
+    let resp2: Value = serde_json::from_str(line2.trim_end()).unwrap();
+    assert_eq!(resp2["id"], json!(2));
+    assert_eq!(resp2["error"]["code"], json!(-32603));
+
+    drop(client_in_w);
+    let (proxy, res) = proxy_thread.join().unwrap();
+    assert!(
+        matches!(res, Err(ProxyError::UpstreamEof)),
+        "expected ProxyError::UpstreamEof, got {res:?}"
+    );
+    assert_eq!(
+        proxy.ledger().verify_integrity().unwrap(),
+        0,
+        "tools/call must not consume SQLite quota when UpstreamEof sits behind a buffered notification"
+    );
+}
+
+struct FailOnSecondWrite {
+    writes: usize,
+    raw_os_code: i32,
+    first_tx: Option<mpsc::SyncSender<()>>,
+    failed_tx: Option<mpsc::SyncSender<()>>,
+}
+
+impl Write for FailOnSecondWrite {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.writes += 1;
+        if self.writes == 1 {
+            let _ = self.first_tx.take().map(|tx| tx.send(()));
+            return Ok(buf.len());
+        }
+        let _ = self.failed_tx.take().map(|tx| tx.send(()));
+        Err(io::Error::from_raw_os_error(self.raw_os_code))
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+struct WaitOnThirdWrite {
+    writes: usize,
+    wait_rx: Option<mpsc::Receiver<()>>,
+    buf: Vec<u8>,
+}
+
+impl Write for WaitOnThirdWrite {
+    fn write(&mut self, data: &[u8]) -> io::Result<usize> {
+        self.writes += 1;
+        if self.writes == 3 {
+            let _ = self
+                .wait_rx
+                .take()
+                .map(|rx| rx.recv_timeout(Duration::from_secs(2)));
+            thread::sleep(Duration::from_millis(15));
+        }
+        self.buf.extend_from_slice(data);
+        Ok(data.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+#[test]
+fn round6_write_failure_before_queued_tools_call_aborts_without_burning_quota() {
+    const RAW_OS_CODE: i32 = 32;
+    let now = parse_rfc3339_utc("2026-06-01T00:00:00Z").unwrap();
+    let (verified, agent_kp) = single_hop_chain("LIMIT 1 calls\n");
+    let mut proxy = McpProxy::new(
+        verified,
+        agent_kp.key_id(),
+        merge_pr_policy_map(),
+        SqliteLedger::open_in_memory().unwrap(),
+        FixedClock::new(now),
+    )
+    .unwrap();
+
+    let (mut client_in_w, client_in_r) = mem_pipe();
+    let (mut up_out_w, up_out_r) = mem_pipe();
+    let (first_tx, first_rx) = mpsc::sync_channel(1);
+    let (failed_tx, failed_rx) = mpsc::sync_channel(1);
+
+    let proxy_thread = thread::spawn(move || {
+        let mut client_out = WaitOnThirdWrite {
+            writes: 0,
+            wait_rx: Some(failed_rx),
+            buf: Vec::new(),
+        };
+        let res = proxy.run(
+            client_in_r,
+            &mut client_out,
+            FailOnSecondWrite {
+                writes: 0,
+                raw_os_code: RAW_OS_CODE,
+                first_tx: Some(first_tx),
+                failed_tx: Some(failed_tx),
+            },
+            up_out_r,
+        );
+        (proxy, res)
+    });
+
+    // Activate id: 1 (first write succeeds).
+    writeln!(client_in_w, r#"{{"jsonrpc":"2.0","id":1,"method":"ping"}}"#).unwrap();
+    first_rx
+        .recv_timeout(Duration::from_secs(2))
+        .expect("first write succeeded");
+
+    // While id: 1 is active, pipeline in `queued_client`:
+    //   1. BareCr (forces subsequent notification to queue behind it)
+    //   2. notifications/initialized (triggers FailOnSecondWrite during drain_queued_client)
+    //   3. BareCr (waits for writer failure so UpstreamWriteFailed is queued before item 4)
+    //   4. tools/call (id: 2) — must detect writer failure BEFORE evaluate_and_record!
+    client_in_w.write_all(b"bad\r1\n").unwrap();
+    writeln!(
+        client_in_w,
+        r#"{{"jsonrpc":"2.0","method":"notifications/initialized"}}"#
+    )
+    .unwrap();
+    client_in_w.write_all(b"bad\r2\n").unwrap();
+    writeln!(
+        client_in_w,
+        r#"{{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{{"name":"merge_pr","arguments":{{"repo":"org/app"}}}}}}"#
+    )
+    .unwrap();
+    thread::sleep(Duration::from_millis(30));
+
+    // Upstream emits resp 1 followed immediately by a notification before closing nothing.
+    writeln!(
+        up_out_w,
+        r#"{{"jsonrpc":"2.0","id":1,"result":{{"pong":1}}}}"#
+    )
+    .unwrap();
+    writeln!(
+        up_out_w,
+        r#"{{"jsonrpc":"2.0","method":"notifications/progress","params":{{"step":1}}}}"#
+    )
+    .unwrap();
+
+    let (proxy, res) = proxy_thread.join().unwrap();
+    drop(client_in_w);
+    drop(up_out_w);
+    assert!(
+        matches!(
+            res,
+            Err(ProxyError::Io(ref err)) if err.raw_os_error() == Some(RAW_OS_CODE)
+        ),
+        "expected ProxyError::Io(raw_os_error={RAW_OS_CODE}), got {res:?}"
+    );
+    assert_eq!(
+        proxy.ledger().verify_integrity().unwrap(),
+        0,
+        "queued tools/call must not consume SQLite quota after writer failure in drain_queued_client"
+    );
+}
+
+#[test]
+fn round6_stalled_writer_with_queued_invalid_frame_and_upstream_eof_aborts_with_frame_id() {
+    use std::time::Instant;
+
+    let now = parse_rfc3339_utc("2026-06-01T00:00:00Z").unwrap();
+    let (verified, agent_kp) = single_hop_chain("");
+    let mut proxy = McpProxy::new(
+        verified,
+        agent_kp.key_id(),
+        merge_pr_policy_map(),
+        SqliteLedger::open_in_memory().unwrap(),
+        FixedClock::new(now),
+    )
+    .unwrap();
+
+    // Stall writer with notifications (active_request == None, has_pending_upstream() == true),
+    // then queue ONLY an InvalidFrame carrying `id: 42` (no Request item in queued_client).
+    let mut prefix = Vec::new();
+    for _ in 0..1026 {
+        prefix
+            .extend_from_slice(b"{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}\n");
+    }
+    prefix.extend_from_slice(
+        b"{\"jsonrpc\":\"2.0\",\"id\":42,\"method\":\"ping\",\"METHOD\":\"evil\"}\n",
+    );
+
+    let (drained_tx, drained_rx) = mpsc::sync_channel(1);
+    let (_close_tx, close_rx) = mpsc::sync_channel(1);
+    let client_in_r = BufReader::new(SignalAfterPrefixReader {
+        prefix,
+        pos: 0,
+        drained_tx: Some(drained_tx),
+        close_rx,
+    });
+    let (mut client_out_w, mut client_out_r) = mem_pipe();
+    let (_gate_tx, gate_rx) = mpsc::sync_channel(1);
+    let (entered_tx, entered_rx) = mpsc::sync_channel(1);
+    let (up_out_w, up_out_r) = mem_pipe();
+
+    let proxy_thread = thread::spawn(move || {
+        proxy.run(
+            client_in_r,
+            &mut client_out_w,
+            GateWriter {
+                gate_rx: Some(gate_rx),
+                entered_tx: Some(entered_tx),
+            },
+            up_out_r,
+        )
+    });
+
+    entered_rx
+        .recv_timeout(Duration::from_secs(2))
+        .expect("writer stalled on GateWriter");
+    drained_rx
+        .recv_timeout(Duration::from_secs(2))
+        .expect("writer queue filled and InvalidFrame(id: 42) queued");
+
+    let started = Instant::now();
+    drop(up_out_w);
+
+    let mut err_line = String::new();
+    client_out_r.read_line(&mut err_line).unwrap();
+    let err_resp: Value = serde_json::from_str(err_line.trim_end()).unwrap();
+    assert_eq!(err_resp["id"], json!(42));
+    assert_eq!(err_resp["error"]["code"], json!(-32603));
+
+    let res = proxy_thread.join().unwrap();
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "stalled writer + queued InvalidFrame + upstream_eof deadlocked on recv_event(None)"
+    );
+    assert!(
+        matches!(res, Err(ProxyError::UpstreamEof)),
+        "expected ProxyError::UpstreamEof, got {res:?}"
+    );
+}
+
+#[test]
+fn round6_stalled_writer_with_no_queued_ids_and_upstream_eof_aborts_immediately() {
+    use std::time::Instant;
+
+    let now = parse_rfc3339_utc("2026-06-01T00:00:00Z").unwrap();
+    let (verified, agent_kp) = single_hop_chain("");
+    let mut proxy = McpProxy::new(
+        verified,
+        agent_kp.key_id(),
+        merge_pr_policy_map(),
+        SqliteLedger::open_in_memory().unwrap(),
+        FixedClock::new(now),
+    )
+    .unwrap();
+
+    // Stall writer with notifications + bare CR (no id), client stdin remains open.
+    let mut prefix = Vec::new();
+    for _ in 0..1026 {
+        prefix
+            .extend_from_slice(b"{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}\n");
+    }
+    prefix.extend_from_slice(b"bad\rframe\n");
+
+    let (drained_tx, drained_rx) = mpsc::sync_channel(1);
+    let (_close_tx, close_rx) = mpsc::sync_channel(1);
+    let client_in_r = BufReader::new(SignalAfterPrefixReader {
+        prefix,
+        pos: 0,
+        drained_tx: Some(drained_tx),
+        close_rx,
+    });
+    let (mut client_out_w, mut client_out_r) = mem_pipe();
+    let (_gate_tx, gate_rx) = mpsc::sync_channel(1);
+    let (entered_tx, entered_rx) = mpsc::sync_channel(1);
+    let (up_out_w, up_out_r) = mem_pipe();
+
+    let proxy_thread = thread::spawn(move || {
+        proxy.run(
+            client_in_r,
+            &mut client_out_w,
+            GateWriter {
+                gate_rx: Some(gate_rx),
+                entered_tx: Some(entered_tx),
+            },
+            up_out_r,
+        )
+    });
+
+    entered_rx
+        .recv_timeout(Duration::from_secs(2))
+        .expect("writer stalled on GateWriter");
+    drained_rx
+        .recv_timeout(Duration::from_secs(2))
+        .expect("writer queue filled and BareCr queued");
+
+    let started = Instant::now();
+    drop(up_out_w);
+
+    let mut err_line = String::new();
+    client_out_r.read_line(&mut err_line).unwrap();
+    let err_resp: Value = serde_json::from_str(err_line.trim_end()).unwrap();
+    assert_eq!(err_resp["id"], json!(null));
+    assert_eq!(err_resp["error"]["code"], json!(-32603));
+
+    let res = proxy_thread.join().unwrap();
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "stalled writer + upstream_eof without queued request id deadlocked"
+    );
+    assert!(
+        matches!(res, Err(ProxyError::UpstreamEof)),
+        "expected ProxyError::UpstreamEof, got {res:?}"
+    );
+}

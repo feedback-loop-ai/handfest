@@ -142,30 +142,22 @@ impl DuplexTransport {
         }
     }
 
-    /// Non-blockingly drains up to `EVENT_CHANNEL_BOUND` queued transport events into the
-    /// FIFO buffer and reports whether the next unread upstream event is EOF (`Ok(None)`).
-    ///
-    /// Stops at the first `UpstreamLine` so an unread upstream response sitting ahead of EOF is
-    /// never mistaken for premature EOF.
+    /// Non-blockingly drains all currently queued transport events from `event_rx` into the FIFO
+    /// `buffered_events` buffer (preserving order for `recv_event`) and reports whether an
+    /// upstream EOF (`UpstreamLine(Ok(None))`) or writer failure (`UpstreamWriteFailed`) is
+    /// already queued, even behind buffered upstream notifications.
     pub(crate) fn poll_upstream_eof(&mut self) -> bool {
-        for ev in &self.buffered_events {
-            if let IoEvent::UpstreamLine(res) = ev {
-                return matches!(res, Ok(None));
-            }
+        const MAX_POLL_DRAIN: usize = EVENT_CHANNEL_BOUND + 3;
+        if self.buffered_events.iter().any(is_upstream_terminal_event) {
+            return true;
         }
-        while self.buffered_events.len() < EVENT_CHANNEL_BOUND {
+        for _ in 0..MAX_POLL_DRAIN {
             match self.event_rx.try_recv() {
                 Ok(ev) => {
-                    let outcome = match &ev {
-                        IoEvent::UpstreamLine(Ok(None)) => Some(true),
-                        IoEvent::UpstreamLine(_) => Some(false),
-                        IoEvent::ClientLine(_)
-                        | IoEvent::UpstreamWriteReady
-                        | IoEvent::UpstreamWriteFailed => None,
-                    };
+                    let terminal = is_upstream_terminal_event(&ev);
                     self.buffered_events.push_back(ev);
-                    if let Some(is_eof) = outcome {
-                        return is_eof;
+                    if terminal {
+                        return true;
                     }
                 }
                 Err(TryRecvError::Empty | TryRecvError::Disconnected) => break,
@@ -265,6 +257,13 @@ impl DuplexTransport {
     }
 }
 
+const fn is_upstream_terminal_event(ev: &IoEvent) -> bool {
+    matches!(
+        ev,
+        IoEvent::UpstreamLine(Ok(None)) | IoEvent::UpstreamWriteFailed
+    )
+}
+
 fn try_send_with_wakeup(
     tx: &SyncSender<String>,
     frame: String,
@@ -290,6 +289,7 @@ mod tests {
     struct BurstLineReader {
         remaining: usize,
         ready_tx: Option<mpsc::SyncSender<()>>,
+        eof_gate_rx: Option<mpsc::Receiver<()>>,
         buf: Vec<u8>,
         pos: usize,
     }
@@ -299,6 +299,21 @@ mod tests {
             Self {
                 remaining: lines,
                 ready_tx: Some(ready_tx),
+                eof_gate_rx: None,
+                buf: Vec::new(),
+                pos: 0,
+            }
+        }
+
+        fn gated(
+            lines: usize,
+            ready_tx: mpsc::SyncSender<()>,
+            eof_gate_rx: mpsc::Receiver<()>,
+        ) -> Self {
+            Self {
+                remaining: lines,
+                ready_tx: Some(ready_tx),
+                eof_gate_rx: Some(eof_gate_rx),
                 buf: Vec::new(),
                 pos: 0,
             }
@@ -309,6 +324,7 @@ mod tests {
         fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
             if self.pos >= self.buf.len() {
                 if self.remaining == 0 {
+                    let _ = self.eof_gate_rx.take().map(|rx| rx.recv());
                     return Ok(0);
                 }
                 self.remaining -= 1;
@@ -556,11 +572,12 @@ mod tests {
     #[test]
     fn recv_event_enforces_expired_deadline_before_popping_buffered_or_queued_events() {
         let (ready_tx, ready_rx) = mpsc::sync_channel(1);
+        let (eof_gate_tx, eof_gate_rx) = mpsc::sync_channel(1);
         let (_client_hold_tx, client_hold_rx) = mpsc::sync_channel(1);
         let mut transport = DuplexTransport::start(
             BufReader::new(BlockingEofReader(client_hold_rx)),
             Vec::<u8>::new(),
-            BufReader::new(BurstLineReader::new(4, ready_tx)),
+            BufReader::new(BurstLineReader::gated(4, ready_tx, eof_gate_rx)),
             1024,
         );
         ready_rx
@@ -574,23 +591,87 @@ mod tests {
             transport.recv_event(Some(expired)),
             RecvOutcome::Timeout
         ));
-        // Unread notification sits ahead of EOF, so `poll_upstream_eof` buffers it and returns false.
+        // While upstream is still open, `poll_upstream_eof` buffers notifications and returns false.
         assert!(!transport.poll_upstream_eof());
         assert!(matches!(
             transport.recv_event(Some(expired)),
             RecvOutcome::Timeout
         ));
-        // Drain all 4 notifications; now EOF is the next upstream event.
+
+        // Release EOF behind the buffered notifications: full lookahead MUST detect EOF before
+        // draining the notifications, while preserving all 4 notifications + EOF in FIFO order.
+        drop(eof_gate_tx);
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !transport.poll_upstream_eof() {
+            assert!(
+                Instant::now() < deadline,
+                "poll_upstream_eof failed to detect EOF behind buffered notifications"
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert!(matches!(
+            transport.recv_event(Some(expired)),
+            RecvOutcome::Timeout
+        ));
         for _ in 0..4 {
             assert!(matches!(
                 transport.recv_event(Some(Instant::now() + Duration::from_secs(2))),
                 RecvOutcome::Event(IoEvent::UpstreamLine(Ok(Some(_))))
             ));
         }
-        assert!(transport.poll_upstream_eof());
         assert!(matches!(
-            transport.recv_event(Some(expired)),
-            RecvOutcome::Timeout
+            transport.recv_event(Some(Instant::now() + Duration::from_secs(2))),
+            RecvOutcome::Event(IoEvent::UpstreamLine(Ok(None)))
+        ));
+    }
+
+    #[test]
+    fn poll_upstream_eof_detects_write_failure_behind_buffered_notification_in_fifo_order() {
+        const RAW_OS_CODE: i32 = 32;
+        let (ready_tx, ready_rx) = mpsc::sync_channel(1);
+        let (_eof_gate_tx, eof_gate_rx) = mpsc::sync_channel(1);
+        let (fail_tx, fail_rx) = mpsc::sync_channel(1);
+        let (_client_hold_tx, client_hold_rx) = mpsc::sync_channel(1);
+        let mut transport = DuplexTransport::start(
+            BufReader::new(BlockingEofReader(client_hold_rx)),
+            RawOsFailingWriter {
+                raw_os_code: RAW_OS_CODE,
+                attempted_tx: Some(fail_tx),
+            },
+            BufReader::new(BurstLineReader::gated(1, ready_tx, eof_gate_rx)),
+            1024,
+        );
+        ready_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("upstream notification queued first");
+        assert!(!transport.poll_upstream_eof());
+
+        transport
+            .send_upstream(r#"{"jsonrpc":"2.0","id":1,"method":"ping"}"#.to_string())
+            .expect("queued frame to failing writer");
+        fail_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("writer observed raw OS error");
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !transport.poll_upstream_eof() {
+            assert!(
+                Instant::now() < deadline,
+                "poll_upstream_eof failed to detect UpstreamWriteFailed behind notification"
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert!(matches!(
+            transport.recv_event(Some(Instant::now() + Duration::from_secs(2))),
+            RecvOutcome::Event(IoEvent::UpstreamLine(Ok(Some(_))))
+        ));
+        assert!(matches!(
+            transport.recv_event(Some(Instant::now() + Duration::from_secs(2))),
+            RecvOutcome::Event(IoEvent::UpstreamWriteFailed)
+        ));
+        assert!(matches!(
+            transport.take_writer_error(),
+            ProxyError::Io(ref err) if err.raw_os_error() == Some(RAW_OS_CODE)
         ));
     }
 }

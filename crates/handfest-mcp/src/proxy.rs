@@ -17,11 +17,11 @@ pub use crate::adapters::{
 };
 use crate::exact_json::ExactJson;
 use crate::framing::{
-    fail_upstream_protocol, reject_unknown_keys, write_denied_response, write_jsonrpc_error,
-    write_raw_line, JsonRpcId, JSONRPC_INTERNAL_ERROR,
+    fail_upstream_protocol, find_case_colliding_keys, find_non_ascii_key, reject_unknown_keys,
+    write_denied_response, write_jsonrpc_error, write_raw_line, JsonRpcId, JSONRPC_INTERNAL_ERROR,
 };
 use crate::mapping::{denial_resource_id, ToolPolicyMap};
-use crate::session::{dispatch_to_upstream, emit_upstream_eof, DispatchCtx, PendingKind};
+use crate::session::{dispatch_to_upstream, ensure_upstream_alive, DispatchCtx, PendingKind};
 
 /// Default maximum JSON-RPC line length in bytes (1 MiB).
 pub const DEFAULT_MAX_LINE_BYTES: usize = 1024 * 1024;
@@ -168,10 +168,7 @@ impl<C: Clock, L: ReceiptLedger> McpProxy<C, L> {
                 }
             };
 
-        if ctx.state.upstream_eof || ctx.transport.poll_upstream_eof() {
-            ctx.state.upstream_eof = true;
-            return emit_upstream_eof(ctx.client_out, Some(&req_id));
-        }
+        ensure_upstream_alive(&req_id, ctx)?;
 
         let (verdict, receipt) =
             match self
@@ -215,10 +212,27 @@ impl<C: Clock, L: ReceiptLedger> McpProxy<C, L> {
             return write_raw_line(client_out, raw_line);
         }
 
-        let Some(tools) = resp_obj
+        let Some(result_obj) = resp_obj
             .get_mut("result")
             .and_then(ExactJson::as_object_mut)
-            .and_then(|res| res.get_mut("tools"))
+        else {
+            return fail_upstream_protocol(
+                client_out,
+                Some(req_id),
+                "malformed upstream tools/list response: missing result object".to_string(),
+            );
+        };
+
+        if let Err(detail) = reject_unknown_keys(
+            result_obj,
+            &["tools", "nextCursor", "_meta"],
+            "upstream tools/list result",
+        ) {
+            return fail_upstream_protocol(client_out, Some(req_id), detail);
+        }
+
+        let Some(tools) = result_obj
+            .get_mut("tools")
             .and_then(ExactJson::as_array_mut)
         else {
             return fail_upstream_protocol(
@@ -227,6 +241,10 @@ impl<C: Clock, L: ReceiptLedger> McpProxy<C, L> {
                 "malformed upstream tools/list response: missing result.tools array".to_string(),
             );
         };
+
+        if let Err(detail) = validate_tools_list_entries(tools) {
+            return fail_upstream_protocol(client_out, Some(req_id), detail);
+        }
 
         tools.retain(|entry| {
             entry
@@ -358,6 +376,33 @@ fn build_mapping_denial_request(
             resource_id: tool_name.to_string(),
         },
     }
+}
+
+fn validate_tools_list_entries(tools: &[ExactJson]) -> Result<(), String> {
+    for entry in tools {
+        let Some(obj) = entry.as_object() else {
+            return Err("malformed upstream tools/list entry: expected JSON object".to_string());
+        };
+        if let Some(key) = find_non_ascii_key(obj) {
+            return Err(format!(
+                "malformed upstream tools/list entry: non-ASCII key '{key}'"
+            ));
+        }
+        if let Some(key) = obj
+            .keys()
+            .find(|k| k.as_str() != "name" && k.eq_ignore_ascii_case("name"))
+        {
+            return Err(format!(
+                "malformed upstream tools/list entry: key '{key}' collides case-insensitively with 'name'"
+            ));
+        }
+        if let Some((a, b)) = find_case_colliding_keys(obj) {
+            return Err(format!(
+                "malformed upstream tools/list entry: key '{b}' collides case-insensitively with '{a}'"
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn extract_tool_call_params(

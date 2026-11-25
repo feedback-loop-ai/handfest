@@ -98,6 +98,22 @@ pub(crate) fn reject_unknown_keys(
     Ok(())
 }
 
+pub(crate) fn find_non_ascii_key(obj: &BTreeMap<String, ExactJson>) -> Option<&str> {
+    obj.keys().find(|k| !k.is_ascii()).map(String::as_str)
+}
+
+pub(crate) fn find_case_colliding_keys(obj: &BTreeMap<String, ExactJson>) -> Option<(&str, &str)> {
+    let mut seen: BTreeMap<String, &str> = BTreeMap::new();
+    for key in obj.keys() {
+        let folded = key.to_ascii_lowercase();
+        if let Some(&prev) = seen.get(&folded) {
+            return Some((prev, key.as_str()));
+        }
+        seen.insert(folded, key.as_str());
+    }
+    None
+}
+
 pub(crate) fn extract_request_id(
     obj: &BTreeMap<String, ExactJson>,
 ) -> Result<Option<JsonRpcId>, String> {
