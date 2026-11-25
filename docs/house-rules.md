@@ -69,6 +69,12 @@ High cyclomatic complexity paired with thin test coverage is a design defect:
 * Hold **100% line and branch coverage across all levels**: unit tests, boundary/property tests, integration tests, adversarial/negative security tests, and end-to-end binary/wire tests.
 * Every production guard, error path, and refusal branch must be bound by a test that fails when the guard is mutated or removed. Prefer making invalid states unrepresentable in the type system over leaving unreachable defensive branches; any genuinely unreachable branch must be explicitly justified.
 
+### 11. Minimal / Zero-Dependency MVP Posture
+
+* **Default to zero external dependencies.** External crates are allowed during prototyping to reach a first demonstrable end-to-end flow, **but the MVP goal is zero external dependencies unless absolutely necessary or economically unfeasible to own cleanly** (e.g., audited cryptographic primitives like Ed25519/SHA-256/X.509/COSE or an embedded SQL engine like SQLite).
+* Never add a crate for small utilities (`hex`, globbing, RFC 3339 parsing, error boilerplate, or thin JSON/CLI glue) that can be owned cleanly in small, 100%-covered pure Rust.
+* Every external dependency in `Cargo.toml` must pass `deny.toml` (permissive-only), carry an explicit justification comment, and be treated as debt to eliminate before MVP unless it sits on an audited crypto or storage boundary.
+
 ---
 
 ## Reviewer Severity Table
