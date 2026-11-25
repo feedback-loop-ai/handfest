@@ -2,7 +2,7 @@
 
 use std::collections::BTreeSet;
 
-use rusqlite::{Connection, ErrorCode, OptionalExtension};
+use rusqlite::{Connection, OptionalExtension, TransactionBehavior};
 
 use crate::codec::{col_opt_text, col_text};
 use crate::LedgerError;
@@ -62,22 +62,40 @@ struct SchemaRow {
 
 /// Initializes a brand-new empty ledger database with the canonical schema, or strictly verifies
 /// the schema and B-tree integrity of an existing non-empty database before any write executes.
-pub(crate) fn initialize_or_verify_schema(conn: &Connection) -> Result<(), LedgerError> {
-    let has_objects = conn
+///
+/// Runs inside a single `BEGIN IMMEDIATE ... COMMIT` transaction so concurrent openers on a fresh
+/// database path serialize cleanly without ever observing a partially initialized schema, and any
+/// partial DDL or integrity failure rolls back cleanly rather than bricking the database file.
+pub(crate) fn initialize_or_verify_schema(conn: &mut Connection) -> Result<(), LedgerError> {
+    initialize_or_verify_schema_with_hook(conn, || Ok(()))
+}
+
+fn initialize_or_verify_schema_with_hook<F>(
+    conn: &mut Connection,
+    after_first_ddl: F,
+) -> Result<(), LedgerError>
+where
+    F: FnOnce() -> Result<(), LedgerError>,
+{
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let has_objects = tx
         .query_row("SELECT 1 FROM sqlite_master LIMIT 1", [], |_| Ok(true))
         .optional()?
         .unwrap_or(false);
     if !has_objects {
+        tx.execute_batch(RECEIPTS_CREATE_SQL)?;
+        after_first_ddl()?;
         for ddl in [
-            RECEIPTS_CREATE_SQL,
             IDX_RECEIPTS_ACTOR_KEY_CREATE_SQL,
             QUOTA_CALLS_CREATE_SQL,
             QUOTA_SUMS_CREATE_SQL,
         ] {
-            conn.execute_batch(ddl)?;
+            tx.execute_batch(ddl)?;
         }
     }
-    verify_schema_integrity(conn)
+    verify_schema_integrity(&tx)?;
+    tx.commit()?;
+    Ok(())
 }
 
 /// Verifies exact canonical DDL in `sqlite_master` (rejecting any altered constraint/collation,
@@ -162,12 +180,10 @@ fn validate_schema_object(row: &SchemaRow) -> Result<(), LedgerError> {
 }
 
 fn verify_integrity_check(conn: &Connection) -> Result<(), LedgerError> {
-    let mut stmt = conn
-        .prepare("PRAGMA integrity_check")
-        .map_err(map_corrupt_err)?;
-    let mut rows = stmt.query([]).map_err(map_corrupt_err)?;
+    let mut stmt = conn.prepare("PRAGMA integrity_check")?;
+    let mut rows = stmt.query([])?;
     let mut results = Vec::new();
-    while let Some(row) = rows.next().map_err(map_corrupt_err)? {
+    while let Some(row) = rows.next()? {
         results.push(col_text(row, 0, "PRAGMA integrity_check")?);
     }
     validate_integrity_check_results(&results)
@@ -184,22 +200,6 @@ fn validate_integrity_check_results(results: &[String]) -> Result<(), LedgerErro
             other.join("; ")
         ))),
     }
-}
-
-fn map_corrupt_err(err: rusqlite::Error) -> LedgerError {
-    if matches!(
-        err,
-        rusqlite::Error::SqliteFailure(
-            rusqlite::ffi::Error {
-                code: ErrorCode::DatabaseCorrupt | ErrorCode::NotADatabase,
-                ..
-            },
-            _
-        )
-    ) {
-        return LedgerError::Integrity(format!("SQLite corruption during integrity_check: {err}"));
-    }
-    LedgerError::from(err)
 }
 
 fn expected_ddl(create_sql: &str) -> String {
@@ -229,16 +229,16 @@ mod tests {
 
     #[test]
     fn canonical_schema_initializes_and_validates_cleanly() {
-        let conn = Connection::open_in_memory().unwrap();
-        initialize_or_verify_schema(&conn).unwrap();
+        let mut conn = Connection::open_in_memory().unwrap();
+        initialize_or_verify_schema(&mut conn).unwrap();
         // Second call on existing DB verifies without modifying schema.
-        initialize_or_verify_schema(&conn).unwrap();
+        initialize_or_verify_schema(&mut conn).unwrap();
     }
 
     #[test]
     fn schema_validation_rejects_missing_duplicate_rebound_and_tampered_objects() {
-        let conn = Connection::open_in_memory().unwrap();
-        initialize_or_verify_schema(&conn).unwrap();
+        let mut conn = Connection::open_in_memory().unwrap();
+        initialize_or_verify_schema(&mut conn).unwrap();
         let valid_rows = load_sqlite_master_rows(&conn).unwrap();
         validate_schema_rows(&valid_rows).unwrap();
 
@@ -310,19 +310,41 @@ mod tests {
             validate_integrity_check_results(&["ok".to_string(), "extra".to_string()]),
             Err(LedgerError::Integrity(_))
         ));
+    }
 
-        let corrupt_err = rusqlite::Error::SqliteFailure(
-            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_CORRUPT),
-            Some("corrupt".to_string()),
+    #[test]
+    fn schema_initialization_is_atomic_on_partial_failure_and_invisible_mid_transaction() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db_path = dir.path().join("atomic_schema_init.sqlite");
+        let mut conn = Connection::open(&db_path).unwrap();
+
+        // 1. Mid-init failure after CREATE TABLE receipts must roll back completely rather than
+        //    leaving a half-initialized database that bricks subsequent opens.
+        let err = initialize_or_verify_schema_with_hook(&mut conn, || {
+            let observer = Connection::open(&db_path).unwrap();
+            let visible_rows: i64 = observer
+                .query_row("SELECT count(*) FROM sqlite_master", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(
+                visible_rows, 0,
+                "other connections must not observe uncommitted half-initialized schema"
+            );
+            Err(LedgerError::Storage(
+                "simulated mid-init failure".to_string(),
+            ))
+        })
+        .unwrap_err();
+        assert!(matches!(err, LedgerError::Storage(_)));
+
+        let remaining: i64 = conn
+            .query_row("SELECT count(*) FROM sqlite_master", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            remaining, 0,
+            "partial schema initialization failure must roll back all DDL"
         );
-        assert!(matches!(
-            map_corrupt_err(corrupt_err),
-            LedgerError::Integrity(_)
-        ));
-        let busy_err = rusqlite::Error::SqliteFailure(
-            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_BUSY),
-            Some("busy".to_string()),
-        );
-        assert!(matches!(map_corrupt_err(busy_err), LedgerError::Storage(_)));
+
+        // 2. Subsequent initialization succeeds cleanly on the rolled-back database.
+        initialize_or_verify_schema(&mut conn).unwrap();
     }
 }

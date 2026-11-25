@@ -782,6 +782,46 @@ fn verify_integrity_rejects_malformed_stored_actor_key() {
     );
 }
 
+fn assert_open_read_only_retries_transient_journal(
+    db_path: &std::path::Path,
+    expected_receipts: usize,
+) {
+    use std::sync::{Arc, Barrier};
+    use std::time::{Duration, Instant};
+
+    let mut journal_os = db_path.as_os_str().to_os_string();
+    journal_os.push("-journal");
+    let journal_path = std::path::PathBuf::from(journal_os);
+    // Genuine SQLite rollback-journal magic + non-zero 28-byte header simulates a hot commit.
+    fs::write(
+        &journal_path,
+        b"\xd9\xd5\x05\xf9\x20\xa1\x63\xd7transient-in-flight-commit-hdr",
+    )
+    .unwrap();
+
+    let barrier = Arc::new(Barrier::new(2));
+    let bg_barrier = Arc::clone(&barrier);
+    let bg_journal = journal_path.clone();
+    let clearer = std::thread::spawn(move || {
+        bg_barrier.wait();
+        std::thread::sleep(Duration::from_millis(30));
+        fs::remove_file(&bg_journal).unwrap();
+    });
+
+    barrier.wait();
+    let started = Instant::now();
+    let ro = SqliteLedger::open_read_only(db_path)
+        .expect("open_read_only must observe and retry a transient -journal until it clears");
+    let elapsed = started.elapsed();
+    clearer.join().unwrap();
+
+    assert!(
+        elapsed >= Duration::from_millis(20),
+        "expected open_read_only to actually observe and retry transient -journal (elapsed: {elapsed:?})"
+    );
+    assert_eq!(ro.verify_integrity().unwrap(), expected_receipts);
+}
+
 #[test]
 fn concurrent_open_read_only_and_audit_snapshot_handles_transient_journals_without_false_integrity_errors(
 ) {
@@ -802,6 +842,9 @@ fn concurrent_open_read_only_and_audit_snapshot_handles_transient_journals_witho
             ts("2026-11-24T18:00:00Z"),
         )
         .unwrap();
+
+    // Deterministically prove the retry loop actually observes and retries a transient -journal.
+    assert_open_read_only_retries_transient_journal(&db_path, 1);
 
     let done = Arc::new(AtomicBool::new(false));
     let done_reader = Arc::clone(&done);
@@ -860,4 +903,100 @@ fn concurrent_open_read_only_and_audit_snapshot_handles_transient_journals_witho
     assert_eq!(rec.total_decisions, 41);
     assert_eq!(rec.permits, 21);
     assert_eq!(rec.denies, 20);
+}
+
+#[test]
+fn concurrent_multi_thread_open_on_fresh_database_initializes_schema_cleanly() {
+    use std::sync::{Arc, Barrier};
+
+    let dir = TempDir::new().unwrap();
+    let (vm, req, facts) = sum_and_calls_mandate();
+
+    for round in 0..5 {
+        let db_path = dir.path().join(format!("fresh_concurrent_{round}.sqlite"));
+        let threads = 8usize;
+        let barrier = Arc::new(Barrier::new(threads));
+
+        let mut handles = Vec::with_capacity(threads);
+        for _ in 0..threads {
+            let b = Arc::clone(&barrier);
+            let p = db_path.clone();
+            handles.push(std::thread::spawn(move || {
+                b.wait();
+                let ledger = SqliteLedger::open(&p)
+                    .expect("concurrent SqliteLedger::open on fresh DB must succeed");
+                assert_eq!(ledger.verify_integrity().unwrap(), 0);
+            }));
+        }
+        for handle in handles {
+            handle.join().unwrap();
+        }
+
+        let mut writer = SqliteLedger::open(&db_path).unwrap();
+        let (verdict, _) = writer
+            .evaluate_and_record(
+                std::slice::from_ref(&vm),
+                &req,
+                &facts,
+                ts("2026-11-24T18:00:00Z"),
+            )
+            .unwrap();
+        assert_eq!(verdict, Verdict::Permit);
+        assert_eq!(writer.verify_integrity().unwrap(), 1);
+    }
+}
+
+#[test]
+fn corrupt_database_page_header_and_page_size_bytes_map_to_integrity_error() {
+    let dir = TempDir::new().unwrap();
+    let base_db = dir.path().join("valid_base.sqlite");
+    let (vm, req, facts) = sum_and_calls_mandate();
+
+    {
+        let mut ledger = SqliteLedger::open(&base_db).unwrap();
+        let (v, _) = ledger
+            .evaluate_and_record(&[vm], &req, &facts, ts("2026-11-24T18:00:00Z"))
+            .unwrap();
+        assert_eq!(v, Verdict::Permit);
+    }
+    let valid_bytes = fs::read(&base_db).unwrap();
+
+    // Case 1: corrupt page-1 B-tree header byte at offset 100 -> SQLITE_CORRUPT -> Integrity.
+    let corrupt_page1 = dir.path().join("corrupt_byte_100.sqlite");
+    let mut b1 = valid_bytes.clone();
+    b1[100] = 0xFF;
+    fs::write(&corrupt_page1, &b1).unwrap();
+
+    let ro_err = SqliteLedger::open_read_only(&corrupt_page1)
+        .and_then(|ro| ro.verify_integrity())
+        .unwrap_err();
+    assert!(
+        matches!(ro_err, LedgerError::Integrity(_)),
+        "corrupt byte 100 must return LedgerError::Integrity (not Storage), got: {ro_err:?}"
+    );
+    let rw_err = SqliteLedger::open(&corrupt_page1).unwrap_err();
+    assert!(
+        matches!(rw_err, LedgerError::Integrity(_)),
+        "writable open on corrupt byte 100 must return LedgerError::Integrity, got: {rw_err:?}"
+    );
+
+    // Case 2: corrupt SQLite header page-size bytes 16..18 ([0x00, 0x03]) -> SQLITE_NOTADB -> Integrity.
+    let corrupt_pagesize = dir.path().join("corrupt_pagesize.sqlite");
+    let mut b2 = valid_bytes;
+    b2[16] = 0x00;
+    b2[17] = 0x03;
+    fs::write(&corrupt_pagesize, &b2).unwrap();
+
+    let ro_err = SqliteLedger::open_read_only(&corrupt_pagesize)
+        .and_then(|ro| ro.verify_integrity())
+        .unwrap_err();
+    assert!(
+        matches!(ro_err, LedgerError::Integrity(_)),
+        "corrupt page-size bytes 16..18 must return LedgerError::Integrity (not Storage), got: {ro_err:?}"
+    );
+    let rw_err = SqliteLedger::open(&corrupt_pagesize).unwrap_err();
+    assert!(
+        matches!(rw_err, LedgerError::Integrity(_)),
+        "writable open on corrupt page-size bytes must return LedgerError::Integrity, got: {rw_err:?}"
+    );
 }

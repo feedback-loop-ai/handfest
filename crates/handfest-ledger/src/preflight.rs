@@ -1,4 +1,5 @@
-//! Portable pre-open read-only file/header/sidecar checks and in-process writer tracking.
+//! Portable pre-open read-only file/header/sidecar checks and inode-keyed in-process handle
+//! tracking.
 
 use std::collections::BTreeMap;
 use std::fs::{self, File};
@@ -16,33 +17,64 @@ const HOT_JOURNAL_RETRY_BUDGET: Duration = Duration::from_millis(500);
 const HOT_JOURNAL_INITIAL_BACKOFF: Duration = Duration::from_millis(2);
 const HOT_JOURNAL_MAX_BACKOFF: Duration = Duration::from_millis(25);
 
-static OPEN_WRITER_PATHS: OnceLock<Mutex<BTreeMap<PathBuf, usize>>> = OnceLock::new();
-
-fn open_writer_paths() -> &'static Mutex<BTreeMap<PathBuf, usize>> {
-    OPEN_WRITER_PATHS.get_or_init(|| Mutex::new(BTreeMap::new()))
+/// Process-local file identity for POSIX `fcntl` lock preservation.
+///
+/// On Unix, POSIX `fcntl` locks are associated with `(st_dev, st_ino)` across all pathnames and
+/// hard links pointing to the same inode. On non-Unix platforms, falls back to the canonical path.
+#[cfg(unix)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct FileIdentity {
+    dev: u64,
+    ino: u64,
 }
 
-/// RAII registration of an open writable [`crate::SqliteLedger`] canonical path in this process.
-///
-/// While at least one writable `SqliteLedger` is open for a canonical path, we already verified
-/// that the file is a rollback-journal (`DELETE`) SQLite ledger, so `open_read_only` skips raw
-/// `std::fs::File::open` on the main DB inode and avoids POSIX `close()` releasing this process's
-/// `fcntl` locks.
-pub(crate) struct ActiveWriterGuard(PathBuf);
+#[cfg(not(unix))]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct FileIdentity {
+    canonical: PathBuf,
+}
 
-impl ActiveWriterGuard {
-    pub(crate) fn acquire(canonical: PathBuf) -> Self {
-        let mut map = open_writer_paths()
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
-        *map.entry(canonical.clone()).or_insert(0) += 1;
-        Self(canonical)
+impl FileIdentity {
+    #[cfg(unix)]
+    fn from_metadata(_canonical: &Path, meta: &fs::Metadata) -> Self {
+        use std::os::unix::fs::MetadataExt;
+        Self {
+            dev: meta.dev(),
+            ino: meta.ino(),
+        }
+    }
+
+    #[cfg(not(unix))]
+    fn from_metadata(canonical: &Path, _meta: &fs::Metadata) -> Self {
+        Self {
+            canonical: canonical.to_path_buf(),
+        }
+    }
+
+    fn from_path(canonical: &Path) -> io::Result<Self> {
+        let meta = fs::metadata(canonical)?;
+        Ok(Self::from_metadata(canonical, &meta))
     }
 }
 
-impl Drop for ActiveWriterGuard {
+static ACTIVE_HANDLES: OnceLock<Mutex<BTreeMap<FileIdentity, usize>>> = OnceLock::new();
+
+fn active_handles() -> &'static Mutex<BTreeMap<FileIdentity, usize>> {
+    ACTIVE_HANDLES.get_or_init(|| Mutex::new(BTreeMap::new()))
+}
+
+/// RAII registration of any open file-backed [`crate::SqliteLedger`] handle (writable OR read-only)
+/// in this process, keyed by [`FileIdentity`].
+///
+/// While at least one handle is open on a given inode in this process (`refcount > 0`),
+/// `open_read_only_guarded` skips raw `std::fs::File::open` on the main DB inode so POSIX
+/// `close()` never drops in-process `fcntl` SHARED/RESERVED/EXCLUSIVE locks across hard links or
+/// concurrent readers.
+pub(crate) struct ActiveHandleGuard(FileIdentity);
+
+impl Drop for ActiveHandleGuard {
     fn drop(&mut self) {
-        let mut map = open_writer_paths()
+        let mut map = active_handles()
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
         if let Some(count) = map.get_mut(&self.0) {
@@ -54,14 +86,78 @@ impl Drop for ActiveWriterGuard {
     }
 }
 
-pub(crate) fn has_active_in_process_writer(canonical: &Path) -> bool {
-    let map = open_writer_paths()
+#[cfg(test)]
+pub(crate) fn active_handle_count(canonical: &Path) -> usize {
+    let Ok(id) = FileIdentity::from_path(canonical) else {
+        return 0;
+    };
+    let map = active_handles()
         .lock()
         .unwrap_or_else(PoisonError::into_inner);
-    map.get(canonical).copied().unwrap_or(0) > 0
+    map.get(&id).copied().unwrap_or(0)
 }
 
-pub(crate) fn validate_read_only_files(canonical: &Path) -> Result<(), LedgerError> {
+/// Opens a writable ledger connection while holding the process-local active-handle registry lock
+/// so its [`ActiveHandleGuard`] is registered atomically before any concurrent `open_read_only`
+/// call in this process can inspect the raw file header.
+pub(crate) fn open_writable_guarded<T, F>(
+    path: &Path,
+    open_conn: F,
+) -> Result<(T, ActiveHandleGuard), LedgerError>
+where
+    F: FnOnce() -> Result<T, LedgerError>,
+{
+    let mut map = active_handles()
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
+    let conn = open_conn()?;
+    let canonical = fs::canonicalize(path).map_err(|err| {
+        LedgerError::Storage(format!(
+            "failed to canonicalize ledger path '{}': {err}",
+            path.display()
+        ))
+    })?;
+    let id = FileIdentity::from_path(&canonical).map_err(|err| {
+        LedgerError::Storage(format!(
+            "failed to stat ledger path '{}': {err}",
+            canonical.display()
+        ))
+    })?;
+    *map.entry(id.clone()).or_insert(0) += 1;
+    Ok((conn, ActiveHandleGuard(id)))
+}
+
+/// Validates read-only sidecars and opens a read-only ledger connection while holding the
+/// process-local active-handle registry lock across the `refcount == 0` check, header inspection,
+/// SQLite open, and refcount increment.
+///
+/// Sidecar checks (`-wal` and `-journal`, including bounded hot-journal backoff) run outside the
+/// registry mutex so waiting on an external writer never stalls unrelated handle opens or drops.
+pub(crate) fn open_read_only_guarded<T, F>(
+    canonical: &Path,
+    open_conn: F,
+) -> Result<(T, ActiveHandleGuard), LedgerError>
+where
+    F: FnOnce(&Path) -> Result<T, LedgerError>,
+{
+    stat_read_only_regular_file(canonical)?;
+    check_wal_sidecar(&append_suffix(canonical, "-wal"))?;
+    check_rollback_journal_sidecar(&append_suffix(canonical, "-journal"))?;
+
+    let mut map = active_handles()
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
+    let meta = stat_read_only_regular_file(canonical)?;
+    let id = FileIdentity::from_metadata(canonical, &meta);
+    if map.get(&id).copied().unwrap_or(0) == 0 {
+        inspect_sqlite_header(canonical)?;
+    }
+    let conn = open_conn(canonical)?;
+    *map.entry(id.clone()).or_insert(0) += 1;
+    Ok((conn, ActiveHandleGuard(id)))
+}
+
+fn stat_read_only_regular_file(canonical: &Path) -> Result<fs::Metadata, LedgerError> {
     let meta = fs::metadata(canonical).map_err(|err| {
         LedgerError::Integrity(format!(
             "failed to stat read-only ledger '{}': {err}",
@@ -81,14 +177,7 @@ pub(crate) fn validate_read_only_files(canonical: &Path) -> Result<(), LedgerErr
             meta.len()
         )));
     }
-
-    check_wal_sidecar(&append_suffix(canonical, "-wal"))?;
-    check_rollback_journal_sidecar(&append_suffix(canonical, "-journal"))?;
-
-    if !has_active_in_process_writer(canonical) {
-        inspect_sqlite_header(canonical)?;
-    }
-    Ok(())
+    Ok(meta)
 }
 
 fn inspect_sqlite_header(canonical: &Path) -> Result<(), LedgerError> {
@@ -230,7 +319,11 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let missing = dir.path().join("missing.sqlite");
         assert!(matches!(
-            validate_read_only_files(&missing),
+            open_read_only_guarded(&missing, |_| Ok(())),
+            Err(LedgerError::Integrity(_))
+        ));
+        assert!(matches!(
+            open_read_only_guarded(dir.path(), |_| Ok(())),
             Err(LedgerError::Integrity(_))
         ));
         assert!(matches!(
@@ -298,20 +391,51 @@ mod tests {
     }
 
     #[test]
-    fn active_writer_guard_refcounts_and_clears_on_drop() {
+    fn active_handle_guard_refcounts_by_inode_across_hard_links_and_clears_on_drop() {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("guard.sqlite");
-        assert!(!has_active_in_process_writer(&path));
+        let mut fake_sqlite = [0u8; SQLITE_HEADER_LEN];
+        fake_sqlite[..SQLITE_HEADER_MAGIC.len()].copy_from_slice(SQLITE_HEADER_MAGIC);
+        fake_sqlite[18] = 1;
+        fake_sqlite[19] = 1;
+        fs::write(&path, fake_sqlite).unwrap();
+        let canonical = fs::canonicalize(&path).unwrap();
+        assert_eq!(active_handle_count(&canonical), 0);
 
-        let g1 = ActiveWriterGuard::acquire(path.clone());
-        assert!(has_active_in_process_writer(&path));
-        let g2 = ActiveWriterGuard::acquire(path.clone());
-        assert!(has_active_in_process_writer(&path));
+        let ((), g1) = open_writable_guarded(&canonical, || Ok(())).unwrap();
+        assert_eq!(active_handle_count(&canonical), 1);
 
-        drop(g1);
-        assert!(has_active_in_process_writer(&path));
-        drop(g2);
-        assert!(!has_active_in_process_writer(&path));
+        #[cfg(unix)]
+        {
+            let alias = dir.path().join("guard_hardlink.sqlite");
+            fs::hard_link(&canonical, &alias).unwrap();
+            let canonical_alias = fs::canonicalize(&alias).unwrap();
+            assert_ne!(canonical, canonical_alias);
+            assert_eq!(
+                active_handle_count(&canonical_alias),
+                1,
+                "hard link must share the same inode entry in active-handle registry"
+            );
+
+            let ((), g2) = open_read_only_guarded(&canonical_alias, |_| Ok(())).unwrap();
+            assert_eq!(active_handle_count(&canonical), 2);
+            assert_eq!(active_handle_count(&canonical_alias), 2);
+            drop(g1);
+            assert_eq!(active_handle_count(&canonical), 1);
+            drop(g2);
+            assert_eq!(active_handle_count(&canonical), 0);
+            assert_eq!(active_handle_count(&canonical_alias), 0);
+        }
+
+        #[cfg(not(unix))]
+        {
+            let ((), g2) = open_read_only_guarded(&canonical, |_| Ok(())).unwrap();
+            assert_eq!(active_handle_count(&canonical), 2);
+            drop(g1);
+            assert_eq!(active_handle_count(&canonical), 1);
+            drop(g2);
+            assert_eq!(active_handle_count(&canonical), 0);
+        }
     }
 
     #[test]

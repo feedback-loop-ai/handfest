@@ -15,7 +15,7 @@ use rusqlite::{
 };
 
 use crate::audit::{run_audit_tx, run_verified_track_record};
-use crate::preflight::{validate_read_only_files, ActiveWriterGuard};
+use crate::preflight::{open_read_only_guarded, open_writable_guarded, ActiveHandleGuard};
 use crate::quotas::{apply_quota_updates, compute_quota_updates, load_quota_snapshot};
 use crate::schema::initialize_or_verify_schema;
 use crate::{LedgerError, ReceiptLedger, TrackRecord};
@@ -28,10 +28,10 @@ const BUSY_TIMEOUT_MS: u64 = 5_000;
 /// `PRAGMA synchronous = FULL`) so read-only auditing works natively on `0444` files in `0555`
 /// directories and across concurrent OS processes with zero `-wal`/`-shm` sidecars.
 pub struct SqliteLedger {
-    // Field order matters: `conn` drops before `_writer_guard` so the in-process writer entry
+    // Field order matters: `conn` drops before `_handle_guard` so the in-process handle entry
     // remains registered until SQLite finishes closing the connection and releasing POSIX locks.
     conn: Connection,
-    _writer_guard: Option<ActiveWriterGuard>,
+    _handle_guard: Option<ActiveHandleGuard>,
 }
 
 impl fmt::Debug for SqliteLedger {
@@ -57,16 +57,10 @@ impl SqliteLedger {
         let flags = OpenFlags::SQLITE_OPEN_READ_WRITE
             | OpenFlags::SQLITE_OPEN_CREATE
             | OpenFlags::SQLITE_OPEN_NO_MUTEX;
-        let conn = Connection::open_with_flags(path, flags)?;
-        let mut ledger = Self::init(conn, "delete")?;
-        let canonical = fs::canonicalize(path).map_err(|err| {
-            LedgerError::Storage(format!(
-                "failed to canonicalize ledger path '{}': {err}",
-                path.display()
-            ))
+        let (conn, handle_guard) = open_writable_guarded(path, || {
+            Connection::open_with_flags(path, flags).map_err(LedgerError::from)
         })?;
-        ledger._writer_guard = Some(ActiveWriterGuard::acquire(canonical));
-        Ok(ledger)
+        Self::init(conn, Some(handle_guard), "delete")
     }
 
     /// Opens an existing SQLite ledger in strict read-only mode.
@@ -84,50 +78,68 @@ impl SqliteLedger {
                 path.display()
             ))
         })?;
-        validate_read_only_files(&canonical)?;
 
         let flags = OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX;
-        let conn = Connection::open_with_flags(&canonical, flags)?;
-        conn.busy_timeout(Duration::from_millis(BUSY_TIMEOUT_MS))?;
-        conn.pragma_update(None, "query_only", "ON")?;
-        let journal_mode: String = conn.query_row("PRAGMA journal_mode", [], |row| row.get(0))?;
+        let (conn, handle_guard) = open_read_only_guarded(&canonical, |p| {
+            Connection::open_with_flags(p, flags).map_err(LedgerError::from)
+        })?;
+        // Bind `Self` immediately so `conn` always drops before `_handle_guard` on any error.
+        let ledger = Self {
+            conn,
+            _handle_guard: Some(handle_guard),
+        };
+        ledger
+            .conn
+            .busy_timeout(Duration::from_millis(BUSY_TIMEOUT_MS))?;
+        ledger.conn.pragma_update(None, "query_only", "ON")?;
+        let journal_mode: String = ledger
+            .conn
+            .query_row("PRAGMA journal_mode", [], |row| row.get(0))?;
         if journal_mode.eq_ignore_ascii_case("wal") {
             return Err(LedgerError::Integrity(format!(
                 "read-only ledger '{}' uses WAL mode; rollback-journal mode required",
                 canonical.display()
             )));
         }
-        let _: Option<i64> = conn
+        let _: Option<i64> = ledger
+            .conn
             .query_row("SELECT 1 FROM sqlite_master LIMIT 1", [], |row| row.get(0))
             .optional()?;
-        Ok(Self {
-            conn,
-            _writer_guard: None,
-        })
+        Ok(ledger)
     }
 
     /// Opens an in-memory SQLite ledger for testing or ephemeral execution.
     pub fn open_in_memory() -> Result<Self, LedgerError> {
         let conn = Connection::open_in_memory()?;
-        Self::init(conn, "memory")
+        Self::init(conn, None, "memory")
     }
 
-    fn init(conn: Connection, expected_journal_mode: &str) -> Result<Self, LedgerError> {
-        conn.busy_timeout(Duration::from_millis(BUSY_TIMEOUT_MS))?;
+    fn init(
+        conn: Connection,
+        handle_guard: Option<ActiveHandleGuard>,
+        expected_journal_mode: &str,
+    ) -> Result<Self, LedgerError> {
+        // Bind `Self` immediately so `conn` always drops before `_handle_guard` on any error.
+        let mut ledger = Self {
+            conn,
+            _handle_guard: handle_guard,
+        };
+        ledger
+            .conn
+            .busy_timeout(Duration::from_millis(BUSY_TIMEOUT_MS))?;
         let actual_mode: String =
-            conn.query_row("PRAGMA journal_mode = DELETE;", [], |row| row.get(0))?;
+            ledger
+                .conn
+                .query_row("PRAGMA journal_mode = DELETE;", [], |row| row.get(0))?;
         if !actual_mode.eq_ignore_ascii_case(expected_journal_mode) {
             return Err(LedgerError::Storage(format!(
                 "failed to set SQLite journal_mode to '{expected_journal_mode}'; got '{actual_mode}'"
             )));
         }
-        conn.pragma_update(None, "synchronous", "FULL")?;
-        conn.pragma_update(None, "foreign_keys", "ON")?;
-        initialize_or_verify_schema(&conn)?;
-        Ok(Self {
-            conn,
-            _writer_guard: None,
-        })
+        ledger.conn.pragma_update(None, "synchronous", "FULL")?;
+        ledger.conn.pragma_update(None, "foreign_keys", "ON")?;
+        initialize_or_verify_schema(&mut ledger.conn)?;
+        Ok(ledger)
     }
 
     /// Atomically loads prior quotas, evaluates `chain` via `handfest_core::gate::authorize`,
@@ -335,22 +347,31 @@ mod tests {
     use handfest_core::AssuranceLevel;
     use tempfile::TempDir;
 
-    use crate::preflight::has_active_in_process_writer;
+    use crate::preflight::active_handle_count;
 
     use super::*;
 
     fn sample_chain_and_req() -> (Vec<VerifiedMandate>, ActionRequest, VerifiedFacts, i64) {
-        let ast = parse_mandate(concat!(
-            "HANDFEST v1\n",
-            "FROM human \"valentin\" (key: ed25519:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa)\n",
-            "TO agent \"dispatcher\" (key: ed25519:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb)\n",
-            "DELEGATION max 0 hops\n",
-            "ALLOW git.pr.merge\n",
-            "ON repo \"feedback-loop-ai/*\"\n",
-            "WHERE resource.author == \"valentin\"\n",
-            "LIMIT 10 calls\n",
-        ))
-        .unwrap();
+        sample_chain_and_req_with_limit(10)
+    }
+
+    fn sample_chain_and_req_with_limit(
+        max_calls: u64,
+    ) -> (Vec<VerifiedMandate>, ActionRequest, VerifiedFacts, i64) {
+        let mandate_text = format!(
+            concat!(
+                "HANDFEST v1\n",
+                "FROM human \"valentin\" (key: ed25519:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa)\n",
+                "TO agent \"dispatcher\" (key: ed25519:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb)\n",
+                "DELEGATION max 0 hops\n",
+                "ALLOW git.pr.merge\n",
+                "ON repo \"feedback-loop-ai/*\"\n",
+                "WHERE resource.author == \"valentin\"\n",
+                "LIMIT {max_calls} calls\n",
+            ),
+            max_calls = max_calls
+        );
+        let ast = parse_mandate(&mandate_text).unwrap();
         let proof = VerifiedAnchorProof {
             anchor_id: "test-anchor".to_string(),
             assurance: AssuranceLevel::LocalKey,
@@ -471,7 +492,7 @@ mod tests {
     #[test]
     fn init_rejects_unexpected_journal_mode_and_corrupt_latest_hash() {
         let mem = Connection::open_in_memory().unwrap();
-        let err = SqliteLedger::init(mem, "delete").unwrap_err();
+        let err = SqliteLedger::init(mem, None, "delete").unwrap_err();
         assert!(matches!(err, LedgerError::Storage(_)));
         assert!(err.to_string().contains("ledger storage error"));
         assert!(std::error::Error::source(&err).is_none());
@@ -492,24 +513,31 @@ mod tests {
     }
 
     #[test]
-    fn active_writer_tracker_refcounts_open_writers_and_cleans_up_on_drop() {
+    fn active_handle_tracker_refcounts_both_open_and_open_read_only_and_cleans_up_on_drop() {
         let dir = TempDir::new().unwrap();
         let db_path = dir.path().join("tracked.sqlite");
         let l1 = SqliteLedger::open(&db_path).unwrap();
         let canonical = fs::canonicalize(&db_path).unwrap();
-        assert!(has_active_in_process_writer(&canonical));
+        assert_eq!(active_handle_count(&canonical), 1);
 
-        let l2 = SqliteLedger::open(&db_path).unwrap();
-        assert!(has_active_in_process_writer(&canonical));
+        let ro1 = SqliteLedger::open_read_only(&db_path).unwrap();
+        assert_eq!(active_handle_count(&canonical), 2);
+        let ro2 = SqliteLedger::open_read_only(&db_path).unwrap();
+        assert_eq!(active_handle_count(&canonical), 3);
+
         drop(l1);
-        assert!(
-            has_active_in_process_writer(&canonical),
-            "second open writer must keep path registered"
+        assert_eq!(
+            active_handle_count(&canonical),
+            2,
+            "open read-only handles must keep inode registered after writer drops"
         );
-        drop(l2);
-        assert!(
-            !has_active_in_process_writer(&canonical),
-            "dropping all writers must clear path from tracker"
+        drop(ro1);
+        assert_eq!(active_handle_count(&canonical), 1);
+        drop(ro2);
+        assert_eq!(
+            active_handle_count(&canonical),
+            0,
+            "dropping all handles must clear inode from tracker"
         );
     }
 
@@ -530,5 +558,218 @@ mod tests {
             matches!(&err, LedgerError::Integrity(msg) if msg.contains("uses WAL mode")),
             "expected post-open WAL mode rejection, got: {err}"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn hardlink_limit_one_child_helper() {
+        let Ok(db_path) = std::env::var("HANDFEST_HARDLINK_RACE_DB") else {
+            return;
+        };
+        let mode = std::env::var("HANDFEST_HARDLINK_RACE_MODE").unwrap();
+        if mode == "probe" {
+            let conn = Connection::open(&db_path).expect("probe open");
+            conn.busy_timeout(Duration::ZERO).unwrap();
+            let res = conn.execute_batch("BEGIN IMMEDIATE; ROLLBACK;");
+            assert!(
+                res.is_err(),
+                "parent POSIX RESERVED lock was dropped after hard-link open_read_only!"
+            );
+            return;
+        }
+        let (chain, req, facts, now) = sample_chain_and_req_with_limit(1);
+        let mut ledger = SqliteLedger::open(&db_path).expect("child open");
+        let (verdict, _) = ledger
+            .evaluate_and_record(&chain, &req, &facts, now + 1)
+            .expect("child evaluate_and_record");
+        assert!(
+            matches!(verdict, Verdict::Deny { .. }),
+            "expected LIMIT 1 calls Deny after parent committed Permit, got: {verdict:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn hardlink_open_read_only_preserves_writer_lock_and_limit_one_across_processes() {
+        use std::process::Command;
+
+        let dir = TempDir::new().unwrap();
+        let orig = dir.path().join("orig_limit_one.sqlite");
+        let alias = dir.path().join("alias_limit_one.sqlite");
+        let (chain, req, facts, now) = sample_chain_and_req_with_limit(1);
+
+        let mut writer = SqliteLedger::open(&orig).unwrap();
+        fs::hard_link(&orig, &alias).unwrap();
+
+        let tx = writer
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .unwrap();
+        let prev = load_latest_receipt_hash(&tx).unwrap();
+        let chain_ids: Vec<MandateId> = chain.iter().map(|vm| vm.ast.mandate_id()).collect();
+        let usage = load_quota_snapshot(&tx, &chain_ids).unwrap();
+        let (verdict, receipt) = authorize(&chain, &req, &facts, &usage, now, prev);
+        assert_eq!(verdict, Verdict::Permit);
+        let updates = compute_quota_updates(&chain, &chain_ids, &facts, &usage).unwrap();
+
+        // Open and close a read-only handle via the hard-link alias while `tx` holds RESERVED lock.
+        {
+            let ro = SqliteLedger::open_read_only(&alias).unwrap();
+            assert_eq!(ro.verify_integrity().unwrap(), 0);
+        }
+
+        // Cross-process probe must fail immediately (kernel POSIX lock intact).
+        let exe = std::env::current_exe().expect("current test exe");
+        let probe = Command::new(&exe)
+            .args([
+                "--exact",
+                "sqlite::tests::hardlink_limit_one_child_helper",
+                "--quiet",
+            ])
+            .env("HANDFEST_HARDLINK_RACE_DB", &orig)
+            .env("HANDFEST_HARDLINK_RACE_MODE", "probe")
+            .status()
+            .expect("spawn probe");
+        assert!(
+            probe.success(),
+            "hard-link open_read_only dropped parent POSIX lock"
+        );
+
+        // Concurrent child writer attempting the same LIMIT 1 calls mandate must wait for commit
+        // and then be denied rather than double-permitting.
+        let mut child = Command::new(&exe)
+            .args([
+                "--exact",
+                "sqlite::tests::hardlink_limit_one_child_helper",
+                "--quiet",
+            ])
+            .env("HANDFEST_HARDLINK_RACE_DB", &orig)
+            .env("HANDFEST_HARDLINK_RACE_MODE", "evaluate")
+            .spawn()
+            .expect("spawn child writer");
+
+        insert_receipt(&tx, &receipt, &req.resource_kind, &req.resource_id).unwrap();
+        apply_quota_updates(&tx, &updates).unwrap();
+        tx.commit().unwrap();
+
+        assert!(
+            child.wait().expect("wait child").success(),
+            "child process violated LIMIT 1 calls or failed"
+        );
+        assert_eq!(writer.verify_integrity().unwrap(), 2);
+        let rec = writer.track_record(&req.actor_key).unwrap();
+        assert_eq!(rec.permits, 1);
+        assert_eq!(rec.denies, 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ro_snapshot_exclusive_probe_helper() {
+        let Ok(db_path) = std::env::var("HANDFEST_RO_SNAPSHOT_DB") else {
+            return;
+        };
+        let conn = Connection::open(&db_path).expect("probe open");
+        conn.busy_timeout(Duration::ZERO).unwrap();
+        let res = conn.execute_batch("BEGIN EXCLUSIVE; ROLLBACK;");
+        let expect_locked =
+            std::env::var("HANDFEST_RO_SNAPSHOT_EXPECT_LOCKED").as_deref() == Ok("1");
+        if expect_locked {
+            assert!(
+                res.is_err(),
+                "expected parent read-only POSIX SHARED lock to remain held, but child acquired EXCLUSIVE"
+            );
+        } else {
+            res.expect("expected child EXCLUSIVE lock to succeed after parent read tx ended");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn concurrent_open_read_only_handles_preserve_posix_shared_lock_and_snapshot_isolation() {
+        use std::process::Command;
+
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("concurrent_ro_snapshot.sqlite");
+        let (chain, req, facts, now) = sample_chain_and_req();
+
+        {
+            let mut writer = SqliteLedger::open(&db_path).unwrap();
+            writer
+                .evaluate_and_record(&chain, &req, &facts, now)
+                .unwrap();
+        }
+        let canonical = fs::canonicalize(&db_path).unwrap();
+        assert_eq!(active_handle_count(&canonical), 0);
+
+        let ro1 = SqliteLedger::open_read_only(&db_path).unwrap();
+        assert_eq!(active_handle_count(&canonical), 1);
+
+        let exe = std::env::current_exe().expect("current test exe");
+        let (start_tx, start_rx) = mpsc::channel();
+        let (done_tx, done_rx) = mpsc::channel();
+        let writer_path = db_path.clone();
+        let writer_req = req.clone();
+        let writer_handle = std::thread::spawn(move || {
+            start_rx.recv().unwrap();
+            let mut w = SqliteLedger::open(&writer_path).unwrap();
+            let res = w.evaluate_and_record(&chain, &writer_req, &facts, now + 60);
+            done_tx.send(()).unwrap();
+            res.unwrap()
+        });
+
+        let (verified, maybe_rec) = run_audit_tx(&ro1.conn, Some(&req.actor_key), || {
+            // Opening and closing a second read-only handle on the same path (with no writer open)
+            // must hit refcount > 0 and preserve ro1's POSIX SHARED lock.
+            {
+                let ro2 = SqliteLedger::open_read_only(&db_path).unwrap();
+                assert_eq!(active_handle_count(&canonical), 2);
+                let (c2, r2) = ro2.audit_snapshot(Some(&req.actor_key)).unwrap();
+                assert_eq!(c2, 1);
+                assert_eq!(r2.unwrap().total_decisions, 1);
+            }
+            assert_eq!(active_handle_count(&canonical), 1);
+
+            let locked = Command::new(&exe)
+                .args([
+                    "--exact",
+                    "sqlite::tests::ro_snapshot_exclusive_probe_helper",
+                    "--quiet",
+                ])
+                .env("HANDFEST_RO_SNAPSHOT_DB", &db_path)
+                .env("HANDFEST_RO_SNAPSHOT_EXPECT_LOCKED", "1")
+                .status()
+                .expect("spawn locked probe");
+            assert!(
+                locked.success(),
+                "second open_read_only dropped first reader's POSIX SHARED lock!"
+            );
+
+            start_tx.send(()).unwrap();
+            assert!(
+                done_rx.recv_timeout(Duration::from_millis(50)).is_err(),
+                "writer must not commit while ro1 holds its audit read snapshot"
+            );
+        })
+        .unwrap();
+
+        assert_eq!(verified, 1);
+        assert_eq!(maybe_rec.unwrap().total_decisions, 1);
+        writer_handle.join().unwrap();
+
+        let unlocked = Command::new(&exe)
+            .args([
+                "--exact",
+                "sqlite::tests::ro_snapshot_exclusive_probe_helper",
+                "--quiet",
+            ])
+            .env("HANDFEST_RO_SNAPSHOT_DB", &db_path)
+            .env("HANDFEST_RO_SNAPSHOT_EXPECT_LOCKED", "0")
+            .status()
+            .expect("spawn unlocked probe");
+        assert!(unlocked.success());
+
+        let (after_count, after_rec) = ro1.audit_snapshot(Some(&req.actor_key)).unwrap();
+        assert_eq!(after_count, 2);
+        assert_eq!(after_rec.unwrap().total_decisions, 2);
     }
 }

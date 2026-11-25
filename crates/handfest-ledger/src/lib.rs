@@ -50,6 +50,18 @@ impl std::error::Error for LedgerError {
 
 impl From<rusqlite::Error> for LedgerError {
     fn from(err: rusqlite::Error) -> Self {
+        if matches!(
+            err,
+            rusqlite::Error::SqliteFailure(
+                rusqlite::ffi::Error {
+                    code: rusqlite::ErrorCode::DatabaseCorrupt | rusqlite::ErrorCode::NotADatabase,
+                    ..
+                },
+                _,
+            )
+        ) {
+            return Self::Integrity(err.to_string());
+        }
         Self::Storage(err.to_string())
     }
 }
@@ -62,6 +74,7 @@ impl From<serde_json::Error> for LedgerError {
 
 /// Actor track-record projection derived from persisted [`DecisionReceipt`] rows.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TrackRecord {
     #[serde(with = "key_id_serde")]
     pub actor_key: KeyId,
@@ -133,4 +146,64 @@ pub trait ReceiptLedger {
         &self,
         actor_key: Option<&KeyId>,
     ) -> Result<(usize, Option<TrackRecord>), LedgerError>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rusqlite_corrupt_and_notadb_errors_map_to_integrity_while_others_map_to_storage() {
+        let corrupt = rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_CORRUPT),
+            Some("database disk image is malformed".to_string()),
+        );
+        assert!(matches!(
+            LedgerError::from(corrupt),
+            LedgerError::Integrity(_)
+        ));
+
+        let notadb = rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_NOTADB),
+            Some("file is not a database".to_string()),
+        );
+        assert!(matches!(
+            LedgerError::from(notadb),
+            LedgerError::Integrity(_)
+        ));
+
+        let busy = rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_BUSY),
+            Some("database is locked".to_string()),
+        );
+        assert!(matches!(LedgerError::from(busy), LedgerError::Storage(_)));
+    }
+
+    #[test]
+    fn track_record_deserialization_rejects_unknown_fields() {
+        let rec = TrackRecord {
+            actor_key: KeyId::parse(
+                "ed25519:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            )
+            .unwrap(),
+            total_decisions: 1,
+            permits: 1,
+            denies: 0,
+            distinct_mandates: 1,
+            first_timestamp: Some(1_700_000_000),
+            last_timestamp: Some(1_700_000_000),
+        };
+        let encoded = serde_json::to_string(&rec).unwrap();
+        assert_eq!(serde_json::from_str::<TrackRecord>(&encoded).unwrap(), rec);
+
+        let with_extra = format!(
+            r#"{},"unexpected_field":true}}"#,
+            &encoded[..encoded.len() - 1]
+        );
+        let err = serde_json::from_str::<TrackRecord>(&with_extra).unwrap_err();
+        assert!(
+            err.to_string().contains("unknown field"),
+            "expected unknown field rejection, got: {err}"
+        );
+    }
 }
