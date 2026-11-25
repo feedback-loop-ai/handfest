@@ -2,22 +2,24 @@
 
 use std::collections::BTreeMap;
 use std::fs;
-use std::io::{self, BufRead, BufReader, Read, Write};
+use std::io::{self, BufRead, BufReader, Cursor, Read, Write};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use handfest_anchors::{Ed25519Keypair, SignedMandate};
+use handfest_anchors::{AnchorError, AnchorVerifier, Ed25519Keypair, SignedMandate};
 use handfest_core::ast::parse_rfc3339_utc;
 use handfest_core::cnl::{parse_mandate, try_render_canonical};
-use handfest_core::gate::{DecisionReceipt, VerifiedMandate};
-use handfest_core::Verdict;
+use handfest_core::gate::{
+    authorize, ActionRequest, DecisionReceipt, QuotaSnapshot, VerifiedFacts, VerifiedMandate,
+};
+use handfest_core::{ActorKind, Verdict};
 use handfest_ledger::SqliteLedger;
 use handfest_mcp::{
-    verify_mandate_chain, FactSpec, FactType, FixedClock, McpProxy, ProxyError, ToolPolicy,
-    ToolPolicyMap, TypedScalar, HANDFEST_DENIED_ERROR_CODE,
+    verify_mandate_chain, verify_mandate_chain_with, FactSpec, FactType, FixedClock, McpProxy,
+    ProxyError, ReceiptLedger, ToolPolicy, ToolPolicyMap, TypedScalar, HANDFEST_DENIED_ERROR_CODE,
 };
 use serde_json::{json, Value};
 use tempfile::tempdir;
@@ -86,6 +88,7 @@ fn mem_pipe() -> (PipeWriter, BufReader<PipeReader>) {
 #[derive(Default)]
 struct FakeUpstreamState {
     tool_calls: Mutex<Vec<Value>>,
+    raw_frames: Mutex<Vec<String>>,
     notifications: Mutex<Vec<String>>,
     call_count: AtomicUsize,
 }
@@ -97,6 +100,10 @@ impl FakeUpstreamState {
 
     fn recorded_calls(&self) -> Vec<Value> {
         self.tool_calls.lock().unwrap().clone()
+    }
+
+    fn recorded_raw_frames(&self) -> Vec<String> {
+        self.raw_frames.lock().unwrap().clone()
     }
 
     fn recorded_notifications(&self) -> Vec<String> {
@@ -125,11 +132,12 @@ fn spawn_fake_upstream(
             if read_n == 0 {
                 break;
             }
-            let trimmed = line.trim();
-            if trimmed.is_empty() {
+            let raw = line.trim_end_matches('\n');
+            if raw.is_empty() {
                 continue;
             }
-            let req: Value = serde_json::from_str(trimmed).expect("upstream received valid JSON");
+            state_bg.raw_frames.lock().unwrap().push(raw.to_string());
+            let req: Value = serde_json::from_str(raw).expect("upstream received valid JSON");
             let method = req["method"].as_str().unwrap_or("");
             let id = req.get("id");
 
@@ -281,14 +289,12 @@ fn run_proxy_session(
     advertised_tools: Vec<Value>,
     client_lines: &[&str],
 ) -> (Result<(), ProxyError>, Vec<Value>, Arc<FakeUpstreamState>) {
-    let (mut up_in, mut up_out, state, handle) = spawn_fake_upstream(advertised_tools);
+    let (up_in, up_out, state, handle) = spawn_fake_upstream(advertised_tools);
     let input_blob = client_lines.join("\n") + "\n";
-    let mut client_in = BufReader::new(input_blob.as_bytes());
+    let client_in = BufReader::new(Cursor::new(input_blob.into_bytes()));
     let mut client_out = Vec::new();
 
-    let run_res = proxy.run(&mut client_in, &mut client_out, &mut up_in, &mut up_out);
-    drop(up_in);
-    drop(up_out);
+    let run_res = proxy.run(client_in, &mut client_out, up_in, up_out);
     handle.join().expect("fake upstream thread exited cleanly");
 
     let responses = String::from_utf8(client_out)
@@ -384,7 +390,7 @@ fn tools_call_permit_forwards_verbatim_relays_response_and_persists_receipt() {
             r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#,
             r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#,
             r#"{"jsonrpc":"2.0","id":2,"method":"ping"}"#,
-            r#"{"jsonrpc":"2.0","id":"call-1","method":"tools/call","params":{"name":"merge_pr","arguments":{"repo":"org/app","pr":42}}}"#,
+            r#"{ "method" : "tools/call", "params" : { "arguments" : { "pr" : 42, "repo" : "org/app" }, "name" : "merge_pr" }, "id" : "call-1", "jsonrpc" : "2.0" }"#,
         ],
     );
     res.expect("proxy session succeeded");
@@ -396,6 +402,13 @@ fn tools_call_permit_forwards_verbatim_relays_response_and_persists_receipt() {
     assert_eq!(
         state.recorded_calls()[0]["params"]["arguments"]["pr"],
         json!(42)
+    );
+    assert_eq!(
+        state.recorded_raw_frames().last().map(String::as_str),
+        Some(
+            r#"{ "method" : "tools/call", "params" : { "arguments" : { "pr" : 42, "repo" : "org/app" }, "name" : "merge_pr" }, "id" : "call-1", "jsonrpc" : "2.0" }"#
+        ),
+        "allowed tools/call frame must reach upstream byte-for-byte verbatim"
     );
 
     assert_eq!(responses.len(), 3);
@@ -969,22 +982,80 @@ fn build_pr_proxy(
     (proxy, verified, agent_kp)
 }
 
+struct SharedWriter(Arc<Mutex<Vec<u8>>>);
+
+impl Write for SharedWriter {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
 fn run_raw_proxy_io(
     proxy: &mut McpProxy<FixedClock>,
     client_bytes: &[u8],
     upstream_bytes: &[u8],
 ) -> (Result<(), ProxyError>, Vec<u8>, Vec<u8>) {
-    let mut client_in = BufReader::new(client_bytes);
+    let scripted: Vec<Vec<u8>> = if upstream_bytes.is_empty() {
+        Vec::new()
+    } else {
+        vec![upstream_bytes.to_vec()]
+    };
+    run_scripted_proxy_io(proxy, client_bytes, scripted)
+}
+
+fn run_scripted_proxy_io(
+    proxy: &mut McpProxy<FixedClock>,
+    client_bytes: &[u8],
+    scripted_replies: Vec<Vec<u8>>,
+) -> (Result<(), ProxyError>, Vec<u8>, Vec<u8>) {
+    let client_in = BufReader::new(Cursor::new(client_bytes.to_vec()));
     let mut client_out = Vec::new();
-    let mut upstream_in = Vec::new();
-    let mut upstream_out = BufReader::new(upstream_bytes);
-    let res = proxy.run(
-        &mut client_in,
-        &mut client_out,
-        &mut upstream_in,
-        &mut upstream_out,
-    );
-    (res, client_out, upstream_in)
+
+    if scripted_replies.is_empty() {
+        let up_buf = Arc::new(Mutex::new(Vec::new()));
+        let up_in = SharedWriter(Arc::clone(&up_buf));
+        let up_out = BufReader::new(Cursor::new(Vec::new()));
+        let res = proxy.run(client_in, &mut client_out, up_in, up_out);
+        let captured = up_buf.lock().unwrap().clone();
+        return (res, client_out, captured);
+    }
+
+    let (up_in_w, mut up_in_r) = mem_pipe();
+    let (mut up_out_w, up_out_r) = mem_pipe();
+    let captured = Arc::new(Mutex::new(Vec::new()));
+    let captured_bg = Arc::clone(&captured);
+
+    let bg = thread::spawn(move || {
+        let mut replies = scripted_replies.into_iter();
+        let mut line = Vec::new();
+        loop {
+            line.clear();
+            let n = up_in_r.read_until(b'\n', &mut line).unwrap_or(0);
+            if n == 0 {
+                break;
+            }
+            captured_bg.lock().unwrap().extend_from_slice(&line);
+            let is_request = serde_json::from_slice::<Value>(&line)
+                .ok()
+                .is_some_and(|v| v.get("method").is_some() && v.get("id").is_some());
+            if is_request {
+                if let Some(reply_bytes) = replies.next() {
+                    let _ = up_out_w.write_all(&reply_bytes);
+                    let _ = up_out_w.flush();
+                }
+            }
+        }
+    });
+
+    let res = proxy.run(client_in, &mut client_out, up_in_w, up_out_r);
+    let _ = bg.join();
+    let up_bytes = captured.lock().unwrap().clone();
+    (res, client_out, up_bytes)
 }
 
 #[test]
@@ -1046,7 +1117,7 @@ fn bare_cr_smuggling_rejected_on_client_and_upstream_and_crlf_normalized() {
     assert!(matches!(up_err, Err(ProxyError::UpstreamProtocol(_))));
     let parsed: Value = serde_json::from_str(std::str::from_utf8(&up_client_out).unwrap()).unwrap();
     assert_eq!(parsed["id"], json!(10));
-    assert_eq!(parsed["error"]["code"], json!(-32603));
+    assert_eq!(parsed["error"]["code"], json!(-32700));
 }
 
 #[test]
@@ -1057,6 +1128,9 @@ fn tools_list_rejects_error_null_and_dual_result_error_and_relays_valid_error() 
         "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"tools\":[{\"name\":\"delete_repo\"}]},\"error\":{\"code\":-1,\"message\":\"x\"}}\n",
         "{\"jsonrpc\":\"2.0\",\"id\":1,\"error\":null}\n",
         "{\"jsonrpc\":\"2.0\",\"id\":1,\"error\":{\"code\":1.5,\"message\":\"bad\"}}\n",
+        "{\"jsonrpc\":\"2.0\",\"id\":1,\"error\":{\"code\":-32601}}\n",
+        "{\"jsonrpc\":\"2.0\",\"id\":1,\"error\":{\"code\":-32601,\"message\":123}}\n",
+        "{\"jsonrpc\":\"2.0\",\"id\":1,\"error\":{\"code\":-32601,\"message\":null}}\n",
         "{\"jsonrpc\":\"2.0\",\"id\":1}\n",
     ];
 
@@ -1139,12 +1213,14 @@ fn upstream_server_requests_and_numeric_id_equivalence_correlate_strictly() {
         "{\"jsonrpc\":\"2.0\",\"id\":1.5,\"method\":\"ping\"}\n",
         "{\"jsonrpc\":\"2.0\",\"id\":18446744073709551617,\"method\":\"ping\"}\n"
     );
-    let equiv_resp = concat!(
-        "{\"jsonrpc\":\"2.0\",\"id\":1.50,\"result\":{}}\n",
-        "{\"jsonrpc\":\"2.0\",\"id\":18446744073709551617.0,\"result\":{}}\n"
+    let (eq_res, eq_out, _) = run_scripted_proxy_io(
+        &mut proxy,
+        equiv_req.as_bytes(),
+        vec![
+            b"{\"jsonrpc\":\"2.0\",\"id\":1.50,\"result\":{}}\n".to_vec(),
+            b"{\"jsonrpc\":\"2.0\",\"id\":18446744073709551617.0,\"result\":{}}\n".to_vec(),
+        ],
     );
-    let (eq_res, eq_out, _) =
-        run_raw_proxy_io(&mut proxy, equiv_req.as_bytes(), equiv_resp.as_bytes());
     eq_res.expect("numerically equivalent JSON-RPC ids must match");
     assert_eq!(String::from_utf8(eq_out).unwrap().lines().count(), 2);
 
@@ -1340,4 +1416,469 @@ fn subprocess_kills_blocked_upstream_without_hanging_on_client_eof_and_error() {
             "handfest-mcp hung waiting on blocked upstream (error={send_oversized_error}): {elapsed:?}"
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// Round 2 review-reforge regression tests
+// ---------------------------------------------------------------------------
+
+struct BoundedPipeWriter {
+    tx: mpsc::SyncSender<Vec<u8>>,
+    chunk_limit: usize,
+}
+
+impl Write for BoundedPipeWriter {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        let n = buf.len().min(self.chunk_limit);
+        self.tx
+            .send(buf[..n].to_vec())
+            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "bounded pipe closed"))?;
+        Ok(n)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+fn bounded_mem_pipe(
+    slots: usize,
+    chunk_limit: usize,
+) -> (BoundedPipeWriter, BufReader<PipeReader>) {
+    let (tx, rx) = mpsc::sync_channel(slots);
+    (
+        BoundedPipeWriter { tx, chunk_limit },
+        BufReader::new(PipeReader {
+            rx,
+            buf: Vec::new(),
+            pos: 0,
+        }),
+    )
+}
+
+#[test]
+fn idle_upstream_notifications_and_bidirectional_backpressure_never_deadlock() {
+    let (mut proxy, _, _) = build_pr_proxy("2026-06-01T00:00:00Z");
+    let (mut client_in_w, client_in_r) = mem_pipe();
+    let (mut client_out_w, mut client_out_r) = mem_pipe();
+    let (up_in_w, mut up_in_r) = mem_pipe();
+    let (mut up_out_w, up_out_r) = mem_pipe();
+
+    let proxy_thread =
+        thread::spawn(move || proxy.run(client_in_r, &mut client_out_w, up_in_w, up_out_r));
+
+    writeln!(
+        up_out_w,
+        r#"{{"jsonrpc":"2.0","method":"notifications/tools/list_changed"}}"#
+    )
+    .unwrap();
+    up_out_w.flush().unwrap();
+
+    let mut first_line = String::new();
+    client_out_r.read_line(&mut first_line).unwrap();
+    let notif: Value = serde_json::from_str(first_line.trim_end()).unwrap();
+    assert_eq!(notif["method"], json!("notifications/tools/list_changed"));
+
+    writeln!(client_in_w, r#"{{"jsonrpc":"2.0","id":1,"method":"ping"}}"#).unwrap();
+    let mut up_line = String::new();
+    up_in_r.read_line(&mut up_line).unwrap();
+    assert!(up_line.contains("\"method\":\"ping\""));
+    writeln!(up_out_w, r#"{{"jsonrpc":"2.0","id":1,"result":{{}}}}"#).unwrap();
+    let mut reply = String::new();
+    client_out_r.read_line(&mut reply).unwrap();
+    assert_eq!(
+        serde_json::from_str::<Value>(reply.trim_end()).unwrap()["id"],
+        json!(1)
+    );
+    drop(client_in_w);
+    proxy_thread
+        .join()
+        .unwrap()
+        .expect("idle notification session exited cleanly");
+
+    let (mut bp_proxy, _, _) = build_pr_proxy("2026-06-01T00:00:00Z");
+    let (up_in_w, mut up_in_r) = bounded_mem_pipe(2, 2048);
+    let (mut up_out_w, up_out_r) = bounded_mem_pipe(2, 2048);
+    let big_blob = "x".repeat(128 * 1024);
+    let big_req = format!(
+        "{{\"jsonrpc\":\"2.0\",\"id\":7,\"method\":\"ping\",\"params\":{{\"pad\":\"{big_blob}\"}}}}\n"
+    );
+
+    let upstream_bg = thread::spawn(move || {
+        let notif_pad = "n".repeat(4096);
+        for seq in 0..32 {
+            writeln!(
+                up_out_w,
+                "{{\"jsonrpc\":\"2.0\",\"method\":\"notifications/progress\",\"params\":{{\"seq\":{seq},\"pad\":\"{notif_pad}\"}}}}"
+            )
+            .unwrap();
+        }
+        up_out_w.flush().unwrap();
+
+        let mut req_line = String::new();
+        up_in_r.read_line(&mut req_line).unwrap();
+        assert!(req_line.contains("\"id\":7"));
+        writeln!(
+            up_out_w,
+            r#"{{"jsonrpc":"2.0","id":7,"result":{{"ok":true}}}}"#
+        )
+        .unwrap();
+        up_out_w.flush().unwrap();
+    });
+
+    let mut client_out = Vec::new();
+    let res = bp_proxy.run(
+        BufReader::new(Cursor::new(big_req.into_bytes())),
+        &mut client_out,
+        up_in_w,
+        up_out_r,
+    );
+    upstream_bg.join().unwrap();
+    res.expect("simultaneous bidirectional writes must complete without pipe deadlock");
+
+    let out_lines: Vec<Value> = String::from_utf8(client_out)
+        .unwrap()
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    assert_eq!(out_lines.len(), 33);
+    assert_eq!(out_lines[32]["id"], json!(7));
+    assert_eq!(out_lines[32]["result"]["ok"], json!(true));
+}
+
+#[test]
+fn pending_request_observes_cancellation_and_client_eof_on_silent_upstream() {
+    let (mut proxy, _, _) = build_pr_proxy("2026-06-01T00:00:00Z");
+    let (mut client_in_w, client_in_r) = mem_pipe();
+    let (mut client_out_w, mut client_out_r) = mem_pipe();
+    let (up_in_w, mut up_in_r) = mem_pipe();
+    let (mut up_out_w, up_out_r) = mem_pipe();
+
+    let proxy_thread =
+        thread::spawn(move || proxy.run(client_in_r, &mut client_out_w, up_in_w, up_out_r));
+
+    writeln!(client_in_w, r#"{{"jsonrpc":"2.0","id":1,"method":"ping"}}"#).unwrap();
+    let mut got_req1 = String::new();
+    up_in_r.read_line(&mut got_req1).unwrap();
+    assert!(got_req1.contains("\"id\":1"));
+
+    writeln!(
+        client_in_w,
+        r#"{{"jsonrpc":"2.0","method":"notifications/cancelled","params":{{"requestId":1}}}}"#
+    )
+    .unwrap();
+    writeln!(client_in_w, r#"{{"jsonrpc":"2.0","id":2,"method":"ping"}}"#).unwrap();
+
+    let mut got_cancel = String::new();
+    up_in_r.read_line(&mut got_cancel).unwrap();
+    assert!(got_cancel.contains("notifications/cancelled"));
+
+    let mut got_req2 = String::new();
+    up_in_r.read_line(&mut got_req2).unwrap();
+    assert!(got_req2.contains("\"id\":2"));
+
+    writeln!(
+        up_out_w,
+        r#"{{"jsonrpc":"2.0","id":2,"result":{{"pong":2}}}}"#
+    )
+    .unwrap();
+    let mut resp2 = String::new();
+    client_out_r.read_line(&mut resp2).unwrap();
+    let parsed2: Value = serde_json::from_str(resp2.trim_end()).unwrap();
+    assert_eq!(parsed2["id"], json!(2));
+    assert_eq!(parsed2["result"]["pong"], json!(2));
+
+    drop(client_in_w);
+    proxy_thread
+        .join()
+        .unwrap()
+        .expect("cancelled pending request must not hang shutdown");
+
+    #[cfg(unix)]
+    {
+        let dir = tempdir().unwrap();
+        let (root_path, child_path, policy_path, ledger_path, _mid_kp, agent_kp, _chain) =
+            write_pr_chain_fixtures(dir.path());
+        let started = Instant::now();
+        let mut child = Command::new(env!("CARGO_BIN_EXE_handfest-mcp"))
+            .args([
+                "--chain",
+                root_path.to_str().unwrap(),
+                child_path.to_str().unwrap(),
+                "--ledger",
+                ledger_path.to_str().unwrap(),
+                "--actor-key",
+                &agent_kp.key_id().to_string(),
+                "--policy-map",
+                policy_path.to_str().unwrap(),
+                "--now",
+                "2026-06-01T00:00:00Z",
+                "--",
+                "sh",
+                "-c",
+                "IFS= read -r _; exec sleep 30",
+            ])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn handfest-mcp with silent pending child");
+
+        {
+            let mut stdin = child.stdin.take().unwrap();
+            writeln!(stdin, r#"{{"jsonrpc":"2.0","id":1,"method":"ping"}}"#).unwrap();
+        }
+        let output = child.wait_with_output().expect("wait handfest-mcp");
+        let elapsed = started.elapsed();
+        assert!(
+            output.status.success(),
+            "expected clean EOF shutdown during silent pending request: stderr={}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "pending request hung shutdown on silent child: {elapsed:?}"
+        );
+    }
+}
+
+#[test]
+fn client_envelope_rejects_response_fields_and_primitive_params_without_forwarding() {
+    let (mut proxy, _, _) = build_pr_proxy("2026-06-01T00:00:00Z");
+    let bad_frames = concat!(
+        "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"ping\",\"result\":{}}\n",
+        "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"ping\",\"error\":{\"code\":-1,\"message\":\"x\"}}\n",
+        "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\",\"result\":null}\n",
+        "{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"ping\",\"params\":123}\n",
+        "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\",\"params\":\"bad\"}\n",
+        "{\"jsonrpc\":\"2.0\",\"id\":4,\"method\":\"ping\",\"params\":null}\n"
+    );
+
+    let (res, client_out, upstream_in) = run_raw_proxy_io(&mut proxy, bad_frames.as_bytes(), b"");
+    res.expect("invalid client envelopes rejected without fatal error");
+    assert!(
+        upstream_in.is_empty(),
+        "invalid client envelopes must never reach upstream: {:?}",
+        String::from_utf8_lossy(&upstream_in)
+    );
+
+    let responses: Vec<Value> = String::from_utf8(client_out)
+        .unwrap()
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    assert_eq!(responses.len(), 6);
+    assert_eq!(responses[0]["id"], json!(1));
+    assert_eq!(responses[1]["id"], json!(2));
+    assert_eq!(responses[2]["id"], Value::Null);
+    assert_eq!(responses[3]["id"], json!(3));
+    assert_eq!(responses[4]["id"], Value::Null);
+    assert_eq!(responses[5]["id"], json!(4));
+    for resp in &responses {
+        assert_eq!(resp["error"]["code"], json!(-32600));
+    }
+}
+
+#[test]
+fn unicode_whitespace_and_blank_frames_rejected_on_client_and_upstream() {
+    let (mut proxy, _, _) = build_pr_proxy("2026-06-01T00:00:00Z");
+    let bad_client = concat!(
+        "\u{00A0}{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"ping\"}\n",
+        "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"ping\"}\u{00A0}\n",
+        "\u{FEFF}{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"ping\"}\n",
+        "\u{00A0}\n",
+        "   \n"
+    );
+    let (res, client_out, upstream_in) = run_raw_proxy_io(&mut proxy, bad_client.as_bytes(), b"");
+    res.expect("unicode whitespace client frames rejected cleanly");
+    assert!(
+        upstream_in.is_empty(),
+        "invalid whitespace frames must not forward"
+    );
+
+    let responses: Vec<Value> = String::from_utf8(client_out)
+        .unwrap()
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    assert_eq!(
+        responses.len(),
+        5,
+        "no invalid whitespace frame may be silently skipped"
+    );
+    for resp in &responses {
+        assert_eq!(resp["id"], Value::Null);
+        assert_eq!(resp["error"]["code"], json!(-32700));
+    }
+
+    let bad_upstreams = [
+        "\u{00A0}{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{}}\n",
+        "\u{00A0}\n",
+        "   \n",
+    ];
+    for raw_up in bad_upstreams {
+        let (mut p, _, _) = build_pr_proxy("2026-06-01T00:00:00Z");
+        let (up_res, up_out, _) = run_raw_proxy_io(
+            &mut p,
+            b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"ping\"}\n",
+            raw_up.as_bytes(),
+        );
+        assert!(
+            matches!(up_res, Err(ProxyError::UpstreamProtocol(_))),
+            "expected UpstreamProtocol for upstream {raw_up:?}, got {up_res:?}"
+        );
+        let parsed: Value =
+            serde_json::from_str(std::str::from_utf8(&up_out).unwrap().trim()).unwrap();
+        assert_eq!(parsed["id"], json!(1));
+        assert_eq!(parsed["error"]["code"], json!(-32603));
+    }
+}
+
+#[test]
+fn tools_list_hides_tools_for_expired_not_yet_valid_and_unbound_proof_chains() {
+    let req = b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/list\",\"params\":{}}\n";
+    let upstream =
+        b"{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"tools\":[{\"name\":\"merge_pr\"}]}}\n";
+
+    let (mut expired_proxy, _, _) = build_pr_proxy("2027-01-01T00:00:00Z");
+    let (res, out, _) = run_raw_proxy_io(&mut expired_proxy, req, upstream);
+    res.expect("expired tools/list succeeds with empty list");
+    let parsed: Value = serde_json::from_str(std::str::from_utf8(&out).unwrap().trim()).unwrap();
+    assert_eq!(parsed["result"]["tools"], json!([]));
+
+    let (mut early_proxy, _, _) = build_pr_proxy("2025-12-31T23:59:59Z");
+    let (res, out, _) = run_raw_proxy_io(&mut early_proxy, req, upstream);
+    res.expect("early tools/list succeeds with empty list");
+    let parsed: Value = serde_json::from_str(std::str::from_utf8(&out).unwrap().trim()).unwrap();
+    assert_eq!(parsed["result"]["tools"], json!([]));
+
+    let (_, mut bad_signer_chain, agent_kp) = build_pr_proxy("2026-06-01T00:00:00Z");
+    let rogue_kp = Ed25519Keypair::generate();
+    bad_signer_chain[0].proof.signer_key = rogue_kp.key_id();
+    let now = parse_rfc3339_utc("2026-06-01T00:00:00Z").unwrap();
+    let mut bad_signer_proxy = McpProxy::new(
+        bad_signer_chain,
+        agent_kp.key_id(),
+        pr_policy_map(),
+        SqliteLedger::open_in_memory().unwrap(),
+        FixedClock::new(now),
+    )
+    .unwrap();
+    let (res, out, _) = run_raw_proxy_io(&mut bad_signer_proxy, req, upstream);
+    res.expect("mismatched signer tools/list succeeds with empty list");
+    let parsed: Value = serde_json::from_str(std::str::from_utf8(&out).unwrap().trim()).unwrap();
+    assert_eq!(parsed["result"]["tools"], json!([]));
+
+    let (_, mut bad_kind_chain, agent_kp2) = build_pr_proxy("2026-06-01T00:00:00Z");
+    bad_kind_chain[0].proof.actor_kind = ActorKind::Service;
+    let mut bad_kind_proxy = McpProxy::new(
+        bad_kind_chain,
+        agent_kp2.key_id(),
+        pr_policy_map(),
+        SqliteLedger::open_in_memory().unwrap(),
+        FixedClock::new(now),
+    )
+    .unwrap();
+    let (res, out, _) = run_raw_proxy_io(&mut bad_kind_proxy, req, upstream);
+    res.expect("mismatched actor_kind tools/list succeeds with empty list");
+    let parsed: Value = serde_json::from_str(std::str::from_utf8(&out).unwrap().trim()).unwrap();
+    assert_eq!(parsed["result"]["tools"], json!([]));
+}
+
+#[derive(Default)]
+struct InMemoryLedger {
+    receipts: Vec<DecisionReceipt>,
+}
+
+impl ReceiptLedger for InMemoryLedger {
+    type Error = io::Error;
+
+    fn evaluate_and_record(
+        &mut self,
+        chain: &[VerifiedMandate],
+        request: &ActionRequest,
+        facts: &VerifiedFacts,
+        now: i64,
+    ) -> Result<(Verdict, DecisionReceipt), Self::Error> {
+        let prev = self.receipts.last().map(|r| r.receipt_hash);
+        let (verdict, receipt) = authorize(chain, request, facts, &QuotaSnapshot::new(), now, prev);
+        self.receipts.push(receipt.clone());
+        Ok((verdict, receipt))
+    }
+}
+
+struct StubVerifier {
+    verified_hops: Vec<VerifiedMandate>,
+}
+
+impl AnchorVerifier for StubVerifier {
+    fn verify(&self, signed: &SignedMandate) -> Result<VerifiedMandate, AnchorError> {
+        self.verified_hops
+            .iter()
+            .find(|vm| {
+                try_render_canonical(&vm.ast)
+                    .map(|c| c == signed.canonical_words)
+                    .unwrap_or(false)
+            })
+            .cloned()
+            .ok_or_else(|| AnchorError::InvalidSignature("stub verifier rejected".to_string()))
+    }
+}
+
+#[test]
+fn custom_receipt_ledger_and_anchor_verifier_work_without_sqlite_or_ed25519() {
+    let root_kp = Ed25519Keypair::generate();
+    let mid_kp = Ed25519Keypair::generate();
+    let agent_kp = Ed25519Keypair::generate();
+    let valid_from = parse_rfc3339_utc("2026-01-01T00:00:00Z").unwrap();
+    let valid_until = parse_rfc3339_utc("2027-01-01T00:00:00Z").unwrap();
+    let now = parse_rfc3339_utc("2026-06-01T00:00:00Z").unwrap();
+
+    let (mut signed, expected_verified) =
+        build_pr_chain(&root_kp, &mid_kp, &agent_kp, valid_from, valid_until);
+    signed[0].signature_hex = "00".repeat(64);
+    let stub = StubVerifier {
+        verified_hops: expected_verified,
+    };
+    let verified = verify_mandate_chain_with(&stub, &signed).expect("custom verifier succeeds");
+
+    let mut proxy = McpProxy::new(
+        verified,
+        agent_kp.key_id(),
+        pr_policy_map(),
+        InMemoryLedger::default(),
+        FixedClock::new(now),
+    )
+    .unwrap();
+
+    let (up_in, up_out, state, handle) = spawn_fake_upstream(vec![
+        json!({"name": "merge_pr"}),
+        json!({"name": "delete_repo"}),
+    ]);
+    let client_frames = concat!(
+        "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/list\",\"params\":{}}\n",
+        "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\",\"params\":{\"name\":\"merge_pr\",\"arguments\":{\"repo\":\"org/app\"}}}\n",
+        "{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"tools/call\",\"params\":{\"name\":\"delete_repo\",\"arguments\":{\"repo\":\"org/app\"}}}\n"
+    );
+    let mut client_out = Vec::new();
+    proxy
+        .run(
+            BufReader::new(Cursor::new(client_frames.as_bytes().to_vec())),
+            &mut client_out,
+            up_in,
+            up_out,
+        )
+        .expect("custom ledger proxy session succeeded");
+    handle.join().unwrap();
+
+    assert_eq!(state.calls(), 1);
+    assert_eq!(proxy.ledger().receipts.len(), 2);
+    assert_eq!(proxy.ledger().receipts[0].verdict, Verdict::Permit);
+    assert!(matches!(
+        proxy.ledger().receipts[1].verdict,
+        Verdict::Deny { .. }
+    ));
 }

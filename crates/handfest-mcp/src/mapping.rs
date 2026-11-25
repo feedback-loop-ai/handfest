@@ -6,7 +6,8 @@ use std::fs;
 use std::path::Path;
 
 use handfest_core::ast::{
-    is_valid_field_path, is_valid_ident, is_valid_quoted_str, parse_rfc3339_utc, KeyId, Scalar,
+    is_valid_field_path, is_valid_ident, is_valid_quoted_str, parse_rfc3339_utc, ActionPat, KeyId,
+    Scalar,
 };
 use handfest_core::gate::{ActionRequest, VerifiedFacts};
 use serde::{Deserialize, Serialize};
@@ -489,7 +490,7 @@ fn invalid_arg(tool_name: &str, arg_key: &str, detail: &str) -> MappingError {
 }
 
 fn is_valid_concrete_action(action: &str) -> bool {
-    !action.is_empty() && action.split('.').all(is_valid_ident)
+    ActionPat::parse(action).is_ok_and(|pat| !pat.is_wildcard())
 }
 
 #[cfg(test)]
@@ -590,14 +591,25 @@ mod tests {
             Err(MappingError::UnmappedTool(_))
         ));
         // Duplicate JSON keys rejected
-        assert!(ToolPolicyMap::from_json_str(
-            r#"{"tools":{"a":{"action":"x.y","resource_kind":"r","static_resource_id":"1"},"a":{"action":"x.z","resource_kind":"r","static_resource_id":"2"}}}"#
-        )
-        .is_err());
+        assert!(matches!(
+            ToolPolicyMap::from_json_str(
+                r#"{"tools":{"a":{"action":"x.y","resource_kind":"r","static_resource_id":"1"},"a":{"action":"x.z","resource_kind":"r","static_resource_id":"2"}}}"#
+            ),
+            Err(MappingError::InvalidJson(msg)) if msg.contains("duplicate JSON object key")
+        ));
         // Both resource_id_arg and static_resource_id rejected
-        assert!(ToolPolicyMap::from_json_str(
-            r#"{"tools":{"a":{"action":"x.y","resource_kind":"r","resource_id_arg":"id","static_resource_id":"1"}}}"#
-        )
-        .is_err());
+        assert!(matches!(
+            ToolPolicyMap::from_json_str(
+                r#"{"tools":{"a":{"action":"x.y","resource_kind":"r","resource_id_arg":"id","static_resource_id":"1"}}}"#
+            ),
+            Err(MappingError::InvalidPolicy(msg)) if msg.contains("cannot declare both")
+        ));
+        // Wildcard action rejected via handfest_core::ast::ActionPat delegation
+        assert!(matches!(
+            ToolPolicyMap::from_json_str(
+                r#"{"tools":{"a":{"action":"x.*","resource_kind":"r","static_resource_id":"1"}}}"#
+            ),
+            Err(MappingError::InvalidPolicy(msg)) if msg.contains("invalid concrete action")
+        ));
     }
 }

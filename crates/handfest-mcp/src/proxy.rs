@@ -2,218 +2,66 @@
 
 use std::collections::BTreeMap;
 use std::fmt;
-use std::io::{BufRead, Write};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::io::Write;
+use std::time::Duration;
 
-use handfest_anchors::{verify_chain, AnchorError, SignedMandate};
-use handfest_core::ast::{is_valid_quoted_str, KeyId};
+use handfest_core::ast::{is_valid_quoted_str, is_valid_timestamp, KeyId};
 use handfest_core::gate::{ActionRequest, VerifiedFacts, VerifiedMandate};
-use handfest_core::lattice::subsumes;
 use handfest_core::Verdict;
-use handfest_ledger::{LedgerError, SqliteLedger};
+use handfest_ledger::SqliteLedger;
 
-use crate::exact_json::{parse_exact_json, ExactJson};
+use crate::adapters::validate_verified_chain;
+pub use crate::adapters::{
+    verify_mandate_chain, verify_mandate_chain_with, Clock, FixedClock, ProxyError, ReceiptLedger,
+    SystemClock,
+};
+use crate::exact_json::ExactJson;
 use crate::framing::{
-    extract_request_id, fail_upstream_protocol, forward_and_read_response, read_bounded_line,
-    write_denied_response, write_jsonrpc_error, write_raw_line, JsonRpcId, LineReadError, ProxyIo,
-    JSONRPC_INTERNAL_ERROR, JSONRPC_INVALID_REQUEST, JSONRPC_PARSE_ERROR,
+    fail_upstream_protocol, write_denied_response, write_jsonrpc_error, write_raw_line, JsonRpcId,
+    JSONRPC_INTERNAL_ERROR,
 };
 use crate::mapping::{MappingError, ToolPolicy, ToolPolicyMap};
+use crate::session::{dispatch_to_upstream, DispatchCtx, PendingKind};
 
 /// Default maximum JSON-RPC line length in bytes (1 MiB).
 pub const DEFAULT_MAX_LINE_BYTES: usize = 1024 * 1024;
 
+/// Default grace period for draining a pending upstream response after client EOF.
+pub const DEFAULT_SHUTDOWN_TIMEOUT: Duration = Duration::from_millis(500);
+
 /// JSON-RPC 2.0 application error code returned when a `HANDFEST v1` policy denies a call.
 pub const HANDFEST_DENIED_ERROR_CODE: i32 = -32001;
 
-const ALLOWED_NOTIFICATION_METHODS: &[&str] = &[
-    "notifications/initialized",
-    "notifications/cancelled",
-    "notifications/roots/list_changed",
-];
-
-/// Wall-clock abstraction supplying UTC Unix seconds for authorization evaluation.
-pub trait Clock {
-    /// Returns the current UTC timestamp in Unix seconds.
-    fn now_unix(&self) -> i64;
-}
-
-/// Production wall-clock backed by [`SystemTime::now`].
-#[derive(Debug, Default, Clone, Copy)]
-pub struct SystemClock;
-
-impl Clock for SystemClock {
-    fn now_unix(&self) -> i64 {
-        let dur = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default();
-        i64::try_from(dur.as_secs()).unwrap_or(i64::MAX)
-    }
-}
-
-/// Deterministic fixed-timestamp clock for tests and replay.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct FixedClock {
-    now_unix: i64,
-}
-
-impl FixedClock {
-    /// Creates a clock that always returns `now_unix` (UTC Unix seconds).
-    #[must_use]
-    pub const fn new(now_unix: i64) -> Self {
-        Self { now_unix }
-    }
-}
-
-impl Clock for FixedClock {
-    fn now_unix(&self) -> i64 {
-        self.now_unix
-    }
-}
-
-/// Errors returned while validating chains, constructing [`McpProxy`], or running the proxy loop.
-#[derive(Debug)]
-pub enum ProxyError {
-    Anchor(AnchorError),
-    InvalidChain(String),
-    Mapping(MappingError),
-    Ledger(LedgerError),
-    Io(std::io::Error),
-    FrameTooLarge { max_bytes: usize },
-    UpstreamFrameTooLarge { max_bytes: usize },
-    UpstreamEof,
-    UpstreamProtocol(String),
-}
-
-impl fmt::Display for ProxyError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Anchor(err) => write!(f, "mandate signature verification failed: {err}"),
-            Self::InvalidChain(msg) => write!(f, "invalid mandate chain: {msg}"),
-            Self::Mapping(err) => write!(f, "policy mapping error: {err}"),
-            Self::Ledger(err) => write!(f, "ledger error: {err}"),
-            Self::Io(err) => write!(f, "I/O error: {err}"),
-            Self::FrameTooLarge { max_bytes } => {
-                write!(
-                    f,
-                    "client JSON-RPC frame exceeded limit of {max_bytes} bytes"
-                )
-            }
-            Self::UpstreamFrameTooLarge { max_bytes } => {
-                write!(
-                    f,
-                    "upstream JSON-RPC frame exceeded limit of {max_bytes} bytes"
-                )
-            }
-            Self::UpstreamEof => f.write_str("upstream MCP server closed stdout unexpectedly"),
-            Self::UpstreamProtocol(msg) => write!(f, "upstream MCP protocol error: {msg}"),
-        }
-    }
-}
-
-impl std::error::Error for ProxyError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            Self::Anchor(err) => Some(err),
-            Self::Mapping(err) => Some(err),
-            Self::Ledger(err) => Some(err),
-            Self::Io(err) => Some(err),
-            Self::InvalidChain(_)
-            | Self::FrameTooLarge { .. }
-            | Self::UpstreamFrameTooLarge { .. }
-            | Self::UpstreamEof
-            | Self::UpstreamProtocol(_) => None,
-        }
-    }
-}
-
-impl From<AnchorError> for ProxyError {
-    fn from(err: AnchorError) -> Self {
-        Self::Anchor(err)
-    }
-}
-
-impl From<MappingError> for ProxyError {
-    fn from(err: MappingError) -> Self {
-        Self::Mapping(err)
-    }
-}
-
-impl From<LedgerError> for ProxyError {
-    fn from(err: LedgerError) -> Self {
-        Self::Ledger(err)
-    }
-}
-
-impl From<std::io::Error> for ProxyError {
-    fn from(err: std::io::Error) -> Self {
-        Self::Io(err)
-    }
-}
-
-/// Verifies every Ed25519 signature in `signed` via `handfest_anchors::verify_chain` AND
-/// verifies root parent absence plus monotonic lattice narrowing (`subsumes`) across every hop.
-pub fn verify_mandate_chain(signed: &[SignedMandate]) -> Result<Vec<VerifiedMandate>, ProxyError> {
-    let verified = verify_chain(signed)?;
-    validate_verified_chain(&verified)?;
-    Ok(verified)
-}
-
-fn validate_verified_chain(verified: &[VerifiedMandate]) -> Result<(), ProxyError> {
-    if verified.is_empty() {
-        return Err(ProxyError::InvalidChain(
-            "mandate chain must contain at least one mandate".to_string(),
-        ));
-    }
-    if verified[0].ast.parent().is_some() {
-        return Err(ProxyError::InvalidChain(
-            "root mandate must not declare a PARENT digest".to_string(),
-        ));
-    }
-    for (hop, vm) in verified.iter().enumerate() {
-        vm.ast.try_mandate_id().map_err(|err| {
-            ProxyError::InvalidChain(format!("hop {hop}: invalid mandate AST: {err}"))
-        })?;
-    }
-    for (hop, pair) in verified.windows(2).enumerate() {
-        subsumes(&pair[0].ast, &pair[1].ast).map_err(|err| {
-            ProxyError::InvalidChain(format!(
-                "attenuation check failed at hop {hop} -> {}: {err}",
-                hop + 1
-            ))
-        })?;
-    }
-    Ok(())
-}
-
 /// Fail-closed MCP stdio JSON-RPC 2.0 proxy enforcing a verified `HANDFEST v1` mandate chain.
-pub struct McpProxy<C: Clock> {
-    verified_chain: Vec<VerifiedMandate>,
-    actor_key: KeyId,
-    policy_map: ToolPolicyMap,
-    ledger: SqliteLedger,
-    clock: C,
-    max_line_bytes: usize,
+pub struct McpProxy<C: Clock, L: ReceiptLedger = SqliteLedger> {
+    pub(crate) verified_chain: Vec<VerifiedMandate>,
+    pub(crate) actor_key: KeyId,
+    pub(crate) policy_map: ToolPolicyMap,
+    pub(crate) ledger: L,
+    pub(crate) clock: C,
+    pub(crate) max_line_bytes: usize,
+    pub(crate) shutdown_timeout: Duration,
 }
 
-impl<C: Clock> fmt::Debug for McpProxy<C> {
+impl<C: Clock, L: ReceiptLedger> fmt::Debug for McpProxy<C, L> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("McpProxy")
             .field("chain_len", &self.verified_chain.len())
             .field("actor_key", &self.actor_key)
             .field("mapped_tools", &self.policy_map.tools.len())
             .field("max_line_bytes", &self.max_line_bytes)
+            .field("shutdown_timeout", &self.shutdown_timeout)
             .finish_non_exhaustive()
     }
 }
 
-impl<C: Clock> McpProxy<C> {
-    /// Constructs a validated [`McpProxy`] over a verified mandate chain and [`SqliteLedger`].
+impl<C: Clock, L: ReceiptLedger> McpProxy<C, L> {
+    /// Constructs a validated [`McpProxy`] over a verified mandate chain and [`ReceiptLedger`].
     pub fn new(
         verified_chain: Vec<VerifiedMandate>,
         actor_key: KeyId,
         policy_map: ToolPolicyMap,
-        ledger: SqliteLedger,
+        ledger: L,
         clock: C,
     ) -> Result<Self, ProxyError> {
         validate_verified_chain(&verified_chain)?;
@@ -228,6 +76,7 @@ impl<C: Clock> McpProxy<C> {
             ledger,
             clock,
             max_line_bytes: DEFAULT_MAX_LINE_BYTES,
+            shutdown_timeout: DEFAULT_SHUTDOWN_TIMEOUT,
         })
     }
 
@@ -242,259 +91,38 @@ impl<C: Clock> McpProxy<C> {
         Ok(self)
     }
 
-    /// Borrows the underlying [`SqliteLedger`].
+    /// Overrides the grace period for draining a pending upstream response after client EOF.
     #[must_use]
-    pub const fn ledger(&self) -> &SqliteLedger {
+    pub const fn with_shutdown_timeout(mut self, shutdown_timeout: Duration) -> Self {
+        self.shutdown_timeout = shutdown_timeout;
+        self
+    }
+
+    /// Borrows the underlying [`ReceiptLedger`].
+    #[must_use]
+    pub const fn ledger(&self) -> &L {
         &self.ledger
     }
 
-    /// Mutably borrows the underlying [`SqliteLedger`].
+    /// Mutably borrows the underlying [`ReceiptLedger`].
     #[must_use]
-    pub fn ledger_mut(&mut self) -> &mut SqliteLedger {
+    pub fn ledger_mut(&mut self) -> &mut L {
         &mut self.ledger
     }
 
-    /// Consumes the proxy and returns its underlying [`SqliteLedger`].
+    /// Consumes the proxy and returns its underlying [`ReceiptLedger`].
     #[must_use]
-    pub fn into_ledger(self) -> SqliteLedger {
+    pub fn into_ledger(self) -> L {
         self.ledger
     }
 
-    /// Runs the newline-delimited JSON-RPC 2.0 proxy loop until client EOF or fatal framing error.
-    pub fn run<CR, CW, UR, UW>(
+    pub(crate) fn handle_tools_call<CW: Write>(
         &mut self,
-        client_in: &mut CR,
-        client_out: &mut CW,
-        upstream_in: &mut UW,
-        upstream_out: &mut UR,
-    ) -> Result<(), ProxyError>
-    where
-        CR: BufRead,
-        CW: Write,
-        UR: BufRead,
-        UW: Write,
-    {
-        let mut io = ProxyIo {
-            client_out,
-            upstream_in,
-            upstream_out,
-        };
-        loop {
-            let line = match read_bounded_line(client_in, self.max_line_bytes) {
-                Ok(Some(raw)) => raw,
-                Ok(None) => return Ok(()),
-                Err(LineReadError::TooLong) => {
-                    let _ = write_jsonrpc_error(
-                        io.client_out,
-                        None,
-                        JSONRPC_INVALID_REQUEST,
-                        &format!(
-                            "handfest rejected JSON-RPC frame exceeding {} bytes",
-                            self.max_line_bytes
-                        ),
-                        None,
-                    );
-                    return Err(ProxyError::FrameTooLarge {
-                        max_bytes: self.max_line_bytes,
-                    });
-                }
-                Err(LineReadError::BareCr) => {
-                    write_jsonrpc_error(
-                        io.client_out,
-                        None,
-                        JSONRPC_PARSE_ERROR,
-                        "bare carriage return (0x0D) is not permitted in JSON-RPC stdio frame",
-                        None,
-                    )?;
-                    continue;
-                }
-                Err(LineReadError::InvalidUtf8) => {
-                    write_jsonrpc_error(
-                        io.client_out,
-                        None,
-                        JSONRPC_PARSE_ERROR,
-                        "invalid UTF-8 in JSON-RPC frame",
-                        None,
-                    )?;
-                    continue;
-                }
-                Err(LineReadError::Io(err)) => return Err(ProxyError::Io(err)),
-            };
-
-            let trimmed = line.trim();
-            if trimmed.is_empty() {
-                continue;
-            }
-            self.handle_client_frame(trimmed, &mut io)?;
-        }
-    }
-
-    fn handle_client_frame<CW, UR, UW>(
-        &mut self,
+        req_id: JsonRpcId,
+        obj: &BTreeMap<String, ExactJson>,
         raw_frame: &str,
-        io: &mut ProxyIo<'_, CW, UR, UW>,
-    ) -> Result<(), ProxyError>
-    where
-        CW: Write,
-        UR: BufRead,
-        UW: Write,
-    {
-        let parsed = match parse_exact_json(raw_frame) {
-            Ok(val) => val,
-            Err(err) => {
-                return write_jsonrpc_error(
-                    io.client_out,
-                    None,
-                    JSONRPC_PARSE_ERROR,
-                    &format!("invalid JSON-RPC frame: {err}"),
-                    None,
-                );
-            }
-        };
-
-        let Some(obj) = parsed.as_object() else {
-            return write_jsonrpc_error(
-                io.client_out,
-                None,
-                JSONRPC_INVALID_REQUEST,
-                "JSON-RPC frame must be a JSON object",
-                None,
-            );
-        };
-
-        let id = match extract_request_id(obj) {
-            Ok(id) => id,
-            Err(msg) => {
-                return write_jsonrpc_error(
-                    io.client_out,
-                    None,
-                    JSONRPC_INVALID_REQUEST,
-                    &msg,
-                    None,
-                );
-            }
-        };
-
-        if obj.get("jsonrpc").and_then(ExactJson::as_str) != Some("2.0") {
-            return write_jsonrpc_error(
-                io.client_out,
-                id.as_ref(),
-                JSONRPC_INVALID_REQUEST,
-                "jsonrpc version must be \"2.0\"",
-                None,
-            );
-        }
-
-        let Some(method) = obj.get("method").and_then(ExactJson::as_str) else {
-            return write_jsonrpc_error(
-                io.client_out,
-                id.as_ref(),
-                JSONRPC_INVALID_REQUEST,
-                "missing or non-string JSON-RPC method",
-                None,
-            );
-        };
-
-        let normalized_frame = parsed.to_json_string();
-        match id {
-            None => handle_notification(method, &normalized_frame, io.upstream_in),
-            Some(req_id) => self.handle_request(&req_id, method, obj, &normalized_frame, io),
-        }
-    }
-
-    fn handle_request<CW, UR, UW>(
-        &mut self,
-        req_id: &JsonRpcId,
-        method: &str,
-        obj: &BTreeMap<String, ExactJson>,
-        normalized_frame: &str,
-        io: &mut ProxyIo<'_, CW, UR, UW>,
-    ) -> Result<(), ProxyError>
-    where
-        CW: Write,
-        UR: BufRead,
-        UW: Write,
-    {
-        match method {
-            "initialize" | "ping" => {
-                let response =
-                    forward_and_read_response(req_id, normalized_frame, self.max_line_bytes, io)?;
-                write_raw_line(io.client_out, &ExactJson::Object(response).to_json_string())
-            }
-            "tools/list" => self.handle_tools_list(req_id, normalized_frame, io),
-            "tools/call" => self.handle_tools_call(req_id, obj, normalized_frame, io),
-            other => {
-                let mut data = BTreeMap::new();
-                data.insert(
-                    "reason".to_string(),
-                    ExactJson::Str(format!("method '{other}' is not in proxy allowlist")),
-                );
-                write_jsonrpc_error(
-                    io.client_out,
-                    Some(req_id),
-                    HANDFEST_DENIED_ERROR_CODE,
-                    &format!("handfest denied: method '{other}' is not permitted"),
-                    Some(&ExactJson::Object(data)),
-                )
-            }
-        }
-    }
-
-    fn handle_tools_list<CW, UR, UW>(
-        &self,
-        req_id: &JsonRpcId,
-        normalized_frame: &str,
-        io: &mut ProxyIo<'_, CW, UR, UW>,
-    ) -> Result<(), ProxyError>
-    where
-        CW: Write,
-        UR: BufRead,
-        UW: Write,
-    {
-        let mut resp_obj =
-            forward_and_read_response(req_id, normalized_frame, self.max_line_bytes, io)?;
-
-        // `forward_and_read_response` already proved `result` XOR valid `error` object.
-        if resp_obj.contains_key("error") {
-            return write_raw_line(io.client_out, &ExactJson::Object(resp_obj).to_json_string());
-        }
-
-        let Some(tools) = resp_obj
-            .get_mut("result")
-            .and_then(ExactJson::as_object_mut)
-            .and_then(|res| res.get_mut("tools"))
-            .and_then(ExactJson::as_array_mut)
-        else {
-            return fail_upstream_protocol(
-                io.client_out,
-                req_id,
-                "malformed upstream tools/list response: missing result.tools array".to_string(),
-            );
-        };
-
-        tools.retain(|entry| {
-            entry
-                .as_object()
-                .and_then(|obj| obj.get("name"))
-                .and_then(ExactJson::as_str)
-                .is_some_and(|name| self.is_tool_permitted(name))
-        });
-
-        write_raw_line(io.client_out, &ExactJson::Object(resp_obj).to_json_string())
-    }
-
-    fn handle_tools_call<CW, UR, UW>(
-        &mut self,
-        req_id: &JsonRpcId,
-        obj: &BTreeMap<String, ExactJson>,
-        normalized_frame: &str,
-        io: &mut ProxyIo<'_, CW, UR, UW>,
-    ) -> Result<(), ProxyError>
-    where
-        CW: Write,
-        UR: BufRead,
-        UW: Write,
-    {
+        ctx: &mut DispatchCtx<'_, CW>,
+    ) -> Result<(), ProxyError> {
         let now = self.clock.now_unix();
         let (tool_name, arguments) = match extract_tool_call_params(obj) {
             Ok(parts) => parts,
@@ -505,7 +133,7 @@ impl<C: Clock> McpProxy<C> {
                     resource_kind: format!("mcp_tool:{reason}"),
                     resource_id: "invalid_params".to_string(),
                 };
-                return self.record_denial_and_respond(req_id, &denial_req, now, io.client_out);
+                return self.record_denial_and_respond(&req_id, &denial_req, now, ctx.client_out);
             }
         };
 
@@ -523,7 +151,12 @@ impl<C: Clock> McpProxy<C> {
                         arguments,
                         &err,
                     );
-                    return self.record_denial_and_respond(req_id, &denial_req, now, io.client_out);
+                    return self.record_denial_and_respond(
+                        &req_id,
+                        &denial_req,
+                        now,
+                        ctx.client_out,
+                    );
                 }
             };
 
@@ -535,29 +168,62 @@ impl<C: Clock> McpProxy<C> {
                 Ok(outcome) => outcome,
                 Err(err) => {
                     write_jsonrpc_error(
-                        io.client_out,
-                        Some(req_id),
+                        ctx.client_out,
+                        Some(&req_id),
                         JSONRPC_INTERNAL_ERROR,
                         &format!("handfest ledger evaluation failed: {err}"),
                         None,
                     )?;
-                    return Err(ProxyError::Ledger(err));
+                    return Err(ProxyError::Ledger(Box::new(err)));
                 }
             };
 
         match verdict {
-            Verdict::Permit => {
-                let response =
-                    forward_and_read_response(req_id, normalized_frame, self.max_line_bytes, io)?;
-                write_raw_line(io.client_out, &ExactJson::Object(response).to_json_string())
-            }
+            Verdict::Permit => dispatch_to_upstream(req_id, PendingKind::Normal, raw_frame, ctx),
             Verdict::Deny { reason } => write_denied_response(
-                io.client_out,
-                req_id,
+                ctx.client_out,
+                &req_id,
                 &reason,
                 &receipt.receipt_hash.to_string(),
             ),
         }
+    }
+
+    pub(crate) fn relay_filtered_tools_list<CW: Write>(
+        &self,
+        req_id: &JsonRpcId,
+        evaluated_at: i64,
+        mut resp_obj: BTreeMap<String, ExactJson>,
+        raw_line: &str,
+        client_out: &mut CW,
+    ) -> Result<(), ProxyError> {
+        // `classify_upstream_frame` already proved `result` XOR valid `error` object.
+        if resp_obj.contains_key("error") {
+            return write_raw_line(client_out, raw_line);
+        }
+
+        let Some(tools) = resp_obj
+            .get_mut("result")
+            .and_then(ExactJson::as_object_mut)
+            .and_then(|res| res.get_mut("tools"))
+            .and_then(ExactJson::as_array_mut)
+        else {
+            return fail_upstream_protocol(
+                client_out,
+                Some(req_id),
+                "malformed upstream tools/list response: missing result.tools array".to_string(),
+            );
+        };
+
+        tools.retain(|entry| {
+            entry
+                .as_object()
+                .and_then(|obj| obj.get("name"))
+                .and_then(ExactJson::as_str)
+                .is_some_and(|name| self.is_tool_permitted(name, evaluated_at))
+        });
+
+        write_raw_line(client_out, &ExactJson::Object(resp_obj).to_json_string())
     }
 
     fn record_denial_and_respond<CW: Write>(
@@ -567,12 +233,15 @@ impl<C: Clock> McpProxy<C> {
         now: i64,
         client_out: &mut CW,
     ) -> Result<(), ProxyError> {
-        let (verdict, receipt) = self.ledger.evaluate_and_record(
-            &self.verified_chain,
-            denial_request,
-            &VerifiedFacts::new(),
-            now,
-        )?;
+        let (verdict, receipt) = self
+            .ledger
+            .evaluate_and_record(
+                &self.verified_chain,
+                denial_request,
+                &VerifiedFacts::new(),
+                now,
+            )
+            .map_err(|err| ProxyError::Ledger(Box::new(err)))?;
         match verdict {
             Verdict::Deny { reason } => write_denied_response(
                 client_out,
@@ -586,7 +255,23 @@ impl<C: Clock> McpProxy<C> {
         }
     }
 
-    fn is_tool_permitted(&self, tool_name: &str) -> bool {
+    fn chain_proofs_valid_at(&self, now: i64) -> bool {
+        if !is_valid_timestamp(now) {
+            return false;
+        }
+        self.verified_chain.iter().all(|vm| {
+            &vm.proof.signer_key == vm.ast.from().key()
+                && vm.proof.actor_kind == vm.ast.from().kind()
+                && vm.proof.valid_from < vm.proof.valid_until
+                && now >= vm.proof.valid_from
+                && now < vm.proof.valid_until
+        })
+    }
+
+    fn is_tool_permitted(&self, tool_name: &str, now: i64) -> bool {
+        if !self.chain_proofs_valid_at(now) {
+            return false;
+        }
         let Some(policy) = self.policy_map.get(tool_name) else {
             return false;
         };
@@ -664,16 +349,4 @@ fn extract_tool_call_params(
         return Err("tools/call params.name must not be empty".to_string());
     }
     Ok((name, params.get("arguments")))
-}
-
-fn handle_notification<UW: Write>(
-    method: &str,
-    normalized_frame: &str,
-    upstream_in: &mut UW,
-) -> Result<(), ProxyError> {
-    if ALLOWED_NOTIFICATION_METHODS.contains(&method) {
-        write_raw_line(upstream_in, normalized_frame)?;
-    }
-    // Disallowed notifications (including notification `tools/call`) are dropped without forwarding.
-    Ok(())
 }

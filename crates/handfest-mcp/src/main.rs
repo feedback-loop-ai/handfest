@@ -8,10 +8,12 @@ use std::thread;
 use std::time::Duration;
 
 use clap::Parser;
-use handfest_anchors::SignedMandate;
+use handfest_anchors::{AnchorVerifier, Ed25519Verifier, SignedMandate};
 use handfest_core::ast::{parse_rfc3339_utc, KeyId};
 use handfest_ledger::SqliteLedger;
-use handfest_mcp::{verify_mandate_chain, Clock, FixedClock, McpProxy, SystemClock, ToolPolicyMap};
+use handfest_mcp::{
+    verify_mandate_chain_with, Clock, FixedClock, McpProxy, SystemClock, ToolPolicyMap,
+};
 
 const CHILD_EXIT_GRACE_POLLS: usize = 20;
 const CHILD_EXIT_POLL_INTERVAL: Duration = Duration::from_millis(10);
@@ -103,6 +105,10 @@ impl Drop for ChildGuard {
     }
 }
 
+fn default_anchor_verifier() -> impl AnchorVerifier {
+    Ed25519Verifier
+}
+
 fn main() -> ExitCode {
     let cli = Cli::parse();
     match run(cli) {
@@ -124,7 +130,8 @@ fn run(cli: Cli) -> Result<(), String> {
     }
 
     let signed_chain = load_signed_mandates(&cli.chain)?;
-    let verified_chain = verify_mandate_chain(&signed_chain)
+    let verifier = default_anchor_verifier();
+    let verified_chain = verify_mandate_chain_with(&verifier, &signed_chain)
         .map_err(|err| format!("startup mandate chain verification failed: {err}"))?;
 
     let actor_key = KeyId::parse(&cli.actor_key)
@@ -156,7 +163,7 @@ fn run(cli: Cli) -> Result<(), String> {
         .spawn()
         .map_err(|err| format!("failed to spawn upstream '{upstream_cmd}': {err}"))?;
 
-    let mut upstream_in = child
+    let upstream_in = child
         .stdin
         .take()
         .ok_or_else(|| "failed to capture upstream stdin pipe".to_string())?;
@@ -166,22 +173,12 @@ fn run(cli: Cli) -> Result<(), String> {
         .ok_or_else(|| "failed to capture upstream stdout pipe".to_string())?;
     let mut guard = ChildGuard::new(child);
 
-    let stdin = io::stdin();
+    let client_in = BufReader::new(io::stdin());
     let stdout = io::stdout();
-    let mut client_in = BufReader::new(stdin.lock());
     let mut client_out = BufWriter::new(stdout.lock());
-    let mut upstream_out = BufReader::new(child_stdout);
+    let upstream_out = BufReader::new(child_stdout);
 
-    let run_result = proxy.run(
-        &mut client_in,
-        &mut client_out,
-        &mut upstream_in,
-        &mut upstream_out,
-    );
-
-    // Close unbuffered upstream stdin immediately (cannot block on flush) before reaping child.
-    drop(upstream_in);
-    drop(upstream_out);
+    let run_result = proxy.run(client_in, &mut client_out, upstream_in, upstream_out);
     guard.shutdown(run_result.is_ok());
 
     run_result.map_err(|err| err.to_string())

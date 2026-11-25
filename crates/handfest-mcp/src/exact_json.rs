@@ -57,6 +57,26 @@ impl ExactJson {
     }
 }
 
+/// Structured errors returned by exact JSON numeric canonicalization.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum NumberError {
+    InvalidSyntax(String),
+    ExponentOutOfRange(String),
+    ExponentOverflow,
+}
+
+impl std::fmt::Display for NumberError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InvalidSyntax(msg) => f.write_str(msg),
+            Self::ExponentOutOfRange(exp) => write!(f, "JSON number exponent '{exp}' out of range"),
+            Self::ExponentOverflow => f.write_str("JSON number exponent overflow"),
+        }
+    }
+}
+
+impl std::error::Error for NumberError {}
+
 /// Exact canonical base-10 value of an RFC 8259 JSON numeric literal (`(-1)^neg * sig * 10^exp`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum CanonicalJsonNumber {
@@ -69,16 +89,31 @@ pub(crate) enum CanonicalJsonNumber {
 }
 
 /// Normalizes a valid RFC 8259 JSON number token for exact numeric equivalence (no `f64`).
-pub(crate) fn canonicalize_json_number(raw: &str) -> Result<CanonicalJsonNumber, String> {
+///
+/// Both JSON-RPC numeric ID comparison and exact `Decimal` fact parsing share this single
+/// normalization path so exponent/significand semantics can never drift.
+pub(crate) fn canonicalize_json_number(raw: &str) -> Result<CanonicalJsonNumber, NumberError> {
     let (mant_part, exp_str) = split_exponent(raw)?;
     let (neg, unsigned_mant) = match mant_part.strip_prefix('-') {
         Some(rest) => (true, rest),
         None => (false, mant_part),
     };
     let (int_digits, frac_digits) = match unsigned_mant.split_once('.') {
-        Some((i, f)) => (i, f),
+        Some((i, f)) => {
+            if f.is_empty() || !f.bytes().all(|b| b.is_ascii_digit()) {
+                return Err(NumberError::InvalidSyntax(format!(
+                    "invalid fractional digits in '{raw}'"
+                )));
+            }
+            (i, f)
+        }
         None => (unsigned_mant, ""),
     };
+    if int_digits.is_empty() || !int_digits.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(NumberError::InvalidSyntax(format!(
+            "invalid integer digits in '{raw}'"
+        )));
+    }
 
     let mut digits = String::with_capacity(int_digits.len() + frac_digits.len());
     digits.push_str(int_digits);
@@ -92,18 +127,19 @@ pub(crate) fn canonicalize_json_number(raw: &str) -> Result<CanonicalJsonNumber,
     let exp: i128 = match exp_str {
         Some(s) => s
             .parse()
-            .map_err(|_| format!("JSON number exponent '{s}' out of range"))?,
+            .map_err(|_| NumberError::ExponentOutOfRange(s.to_string()))?,
         None => 0,
     };
-    let frac_len =
-        i128::try_from(frac_digits.len()).map_err(|_| "fractional length overflow".to_string())?;
+    let frac_len = i128::try_from(frac_digits.len()).map_err(|_| NumberError::ExponentOverflow)?;
     let sig_digits = trimmed_leading.trim_end_matches('0');
     let trailing_zeros = i128::try_from(trimmed_leading.len() - sig_digits.len())
-        .map_err(|_| "trailing zero count overflow".to_string())?;
+        .map_err(|_| NumberError::ExponentOverflow)?;
+    // Combine `trailing_zeros - frac_len` before adding to `exp` so equivalent spellings such as
+    // `1.0e<i128::MIN>` and `1e<i128::MIN>` never suffer spurious intermediate underflow/overflow.
+    let exp_delta = trailing_zeros - frac_len;
     let net_exp = exp
-        .checked_sub(frac_len)
-        .and_then(|v| v.checked_add(trailing_zeros))
-        .ok_or_else(|| "JSON number exponent overflow".to_string())?;
+        .checked_add(exp_delta)
+        .ok_or(NumberError::ExponentOverflow)?;
 
     Ok(CanonicalJsonNumber::NonZero {
         neg,
@@ -212,45 +248,17 @@ pub(crate) fn parse_decimal_str(raw: &str) -> Result<Decimal, String> {
 
 /// Parses a JSON numeric literal (plain or scientific notation) into an exact `Decimal`.
 pub(crate) fn parse_json_decimal(raw: &str) -> Result<Decimal, String> {
-    let (mant_part, exp_str) = split_exponent(raw)?;
-    let (neg, unsigned_mant) = match mant_part.strip_prefix('-') {
-        Some(rest) => (true, rest),
-        None => (false, mant_part),
-    };
-    let (int_digits, frac_digits) = match unsigned_mant.split_once('.') {
-        Some((i, f)) => (i, f),
-        None => (unsigned_mant, ""),
-    };
-
-    let mut digits = String::with_capacity(int_digits.len() + frac_digits.len());
-    digits.push_str(int_digits);
-    digits.push_str(frac_digits);
-    let trimmed_leading = digits.trim_start_matches('0');
-    if trimmed_leading.is_empty() {
-        return Ok(Decimal::ZERO);
+    match canonicalize_json_number(raw).map_err(|err| err.to_string())? {
+        CanonicalJsonNumber::Zero => Ok(Decimal::ZERO),
+        CanonicalJsonNumber::NonZero {
+            neg,
+            sig_digits,
+            exp,
+        } => build_decimal(neg, &sig_digits, exp),
     }
-
-    let exp: i64 = match exp_str {
-        Some(s) => s
-            .parse()
-            .map_err(|_| format!("exponent '{s}' out of range"))?,
-        None => 0i64,
-    };
-
-    let frac_len =
-        i64::try_from(frac_digits.len()).map_err(|_| "fractional length overflow".to_string())?;
-    let trimmed = trimmed_leading.trim_end_matches('0');
-    let trailing_zeros = i64::try_from(trimmed_leading.len() - trimmed.len())
-        .map_err(|_| "trailing zero count overflow".to_string())?;
-    let net_exp = exp
-        .checked_sub(frac_len)
-        .and_then(|v| v.checked_add(trailing_zeros))
-        .ok_or_else(|| "decimal exponent overflow".to_string())?;
-
-    build_decimal(neg, trimmed, net_exp)
 }
 
-fn split_exponent(raw: &str) -> Result<(&str, Option<&str>), String> {
+fn split_exponent(raw: &str) -> Result<(&str, Option<&str>), NumberError> {
     let Some(exp_pos) = raw.find(['e', 'E']) else {
         return Ok((raw, None));
     };
@@ -258,12 +266,14 @@ fn split_exponent(raw: &str) -> Result<(&str, Option<&str>), String> {
     let exp_str = &exp_part[1..];
     let exp_digits = exp_str.strip_prefix(['+', '-']).unwrap_or(exp_str);
     if exp_digits.is_empty() || !exp_digits.bytes().all(|b| b.is_ascii_digit()) {
-        return Err(format!("invalid exponent '{exp_str}'"));
+        return Err(NumberError::InvalidSyntax(format!(
+            "invalid exponent '{exp_str}'"
+        )));
     }
     Ok((mant, Some(exp_str)))
 }
 
-fn build_decimal(neg: bool, trimmed_digits: &str, net_exp: i64) -> Result<Decimal, String> {
+fn build_decimal(neg: bool, trimmed_digits: &str, net_exp: i128) -> Result<Decimal, String> {
     let mut acc: u128 = 0;
     for b in trimmed_digits.bytes() {
         acc = acc
@@ -283,15 +293,13 @@ fn build_decimal(neg: bool, trimmed_digits: &str, net_exp: i64) -> Result<Decima
         }
         0u8
     } else {
-        let neg_exp = net_exp
-            .checked_neg()
-            .ok_or_else(|| "decimal scale overflow".to_string())?;
-        if neg_exp > i64::from(MAX_DECIMAL_SCALE) {
+        let abs_exp = net_exp.unsigned_abs();
+        if abs_exp > u128::from(MAX_DECIMAL_SCALE) {
             return Err(format!(
-                "scale {neg_exp} exceeds maximum {MAX_DECIMAL_SCALE}"
+                "scale {abs_exp} exceeds maximum {MAX_DECIMAL_SCALE}"
             ));
         }
-        u8::try_from(neg_exp).map_err(|_| "decimal scale overflow".to_string())?
+        u8::try_from(abs_exp).map_err(|_| "decimal scale overflow".to_string())?
     };
 
     let mantissa = signed_from_u128(neg, acc).ok_or_else(|| "decimal overflow".to_string())?;
@@ -515,7 +523,54 @@ mod tests {
             canonicalize_json_number("9007199254740992").unwrap(),
             canonicalize_json_number("9007199254740993").unwrap()
         );
-        assert!(canonicalize_json_number("1e9999999999999999999999999999999999999999").is_err());
+        assert_eq!(
+            canonicalize_json_number("1e9999999999999999999999999999999999999999"),
+            Err(NumberError::ExponentOutOfRange(
+                "9999999999999999999999999999999999999999".to_string()
+            ))
+        );
+
+        let min_exp_one = format!("1e{}", i128::MIN);
+        let min_exp_one_dot_zero = format!("1.0e{}", i128::MIN);
+        assert_eq!(
+            canonicalize_json_number(&min_exp_one_dot_zero),
+            canonicalize_json_number(&min_exp_one)
+        );
+        assert_eq!(
+            canonicalize_json_number(&min_exp_one_dot_zero),
+            Ok(CanonicalJsonNumber::NonZero {
+                neg: false,
+                sig_digits: "1".to_string(),
+                exp: i128::MIN,
+            })
+        );
+
+        let max_exp_tenth = format!("0.1e{}", i128::MAX);
+        let max_exp_minus_one = format!("1e{}", i128::MAX - 1);
+        assert_eq!(
+            canonicalize_json_number(&max_exp_tenth),
+            canonicalize_json_number(&max_exp_minus_one)
+        );
+
+        assert_eq!(
+            canonicalize_json_number(&format!("10e{}", i128::MAX)),
+            Err(NumberError::ExponentOverflow)
+        );
+        assert_eq!(
+            canonicalize_json_number(&format!("0.1e{}", i128::MIN)),
+            Err(NumberError::ExponentOverflow)
+        );
+        assert_eq!(
+            parse_json_decimal("1.500e+2"),
+            Ok(Decimal::parse("150.0").unwrap())
+        );
+        assert_eq!(
+            parse_json_decimal(&min_exp_one_dot_zero),
+            Err(format!(
+                "scale {} exceeds maximum {MAX_DECIMAL_SCALE}",
+                i128::MIN.unsigned_abs()
+            ))
+        );
     }
 
     #[test]

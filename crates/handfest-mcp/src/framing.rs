@@ -1,11 +1,10 @@
-//! Bounded newline-delimited JSON-RPC 2.0 stdio framing and response correlation helpers.
+//! Bounded newline-delimited JSON-RPC 2.0 stdio framing and envelope validation helpers.
 
 use std::collections::BTreeMap;
 use std::io::{BufRead, Write};
 
 use crate::exact_json::{
-    canonicalize_json_number, is_valid_json_int, parse_exact_json, write_json_string,
-    CanonicalJsonNumber, ExactJson,
+    canonicalize_json_number, is_valid_json_int, write_json_string, CanonicalJsonNumber, ExactJson,
 };
 use crate::proxy::{ProxyError, HANDFEST_DENIED_ERROR_CODE};
 
@@ -13,14 +12,6 @@ pub(crate) const JSONRPC_PARSE_ERROR: i32 = -32700;
 pub(crate) const JSONRPC_INVALID_REQUEST: i32 = -32600;
 pub(crate) const JSONRPC_METHOD_NOT_FOUND: i32 = -32601;
 pub(crate) const JSONRPC_INTERNAL_ERROR: i32 = -32603;
-
-const MAX_UPSTREAM_INTERLEAVED_MESSAGES: usize = 1024;
-
-pub(crate) struct ProxyIo<'a, CW, UR, UW> {
-    pub(crate) client_out: &'a mut CW,
-    pub(crate) upstream_in: &'a mut UW,
-    pub(crate) upstream_out: &'a mut UR,
-}
 
 #[derive(Debug, Clone)]
 pub(crate) enum JsonRpcId {
@@ -64,10 +55,36 @@ pub(crate) enum LineReadError {
     Io(std::io::Error),
 }
 
-enum UpstreamFrame<'a> {
+#[derive(Debug)]
+pub(crate) struct ClientEnvelope<'a> {
+    pub(crate) id: Option<JsonRpcId>,
+    pub(crate) method: &'a str,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct ClientEnvelopeError {
+    pub(crate) id: Option<JsonRpcId>,
+    pub(crate) message: String,
+}
+
+pub(crate) enum UpstreamFrame<'a> {
     Notification,
     ServerRequest { id: JsonRpcId, method: &'a str },
     Response { id: JsonRpcId },
+}
+
+pub(crate) fn extract_id_value(val: &ExactJson) -> Result<JsonRpcId, String> {
+    match val {
+        ExactJson::Str(s) => Ok(JsonRpcId::Str(s.clone())),
+        ExactJson::Number(raw) => {
+            let canonical = canonicalize_json_number(raw).map_err(|err| err.to_string())?;
+            Ok(JsonRpcId::Number {
+                raw: raw.clone(),
+                canonical,
+            })
+        }
+        _ => Err("JSON-RPC id must be a string or number".to_string()),
+    }
 }
 
 pub(crate) fn extract_request_id(
@@ -75,100 +92,59 @@ pub(crate) fn extract_request_id(
 ) -> Result<Option<JsonRpcId>, String> {
     match obj.get("id") {
         None => Ok(None),
-        Some(ExactJson::Str(s)) => Ok(Some(JsonRpcId::Str(s.clone()))),
-        Some(ExactJson::Number(raw)) => {
-            let canonical = canonicalize_json_number(raw)?;
-            Ok(Some(JsonRpcId::Number {
-                raw: raw.clone(),
-                canonical,
-            }))
-        }
-        Some(_) => Err("JSON-RPC id must be a string or number".to_string()),
+        Some(val) => extract_id_value(val).map(Some),
     }
 }
 
-pub(crate) fn forward_and_read_response<CW, UR, UW>(
-    expected_id: &JsonRpcId,
-    normalized_frame: &str,
-    max_line_bytes: usize,
-    io: &mut ProxyIo<'_, CW, UR, UW>,
-) -> Result<BTreeMap<String, ExactJson>, ProxyError>
-where
-    CW: Write,
-    UR: BufRead,
-    UW: Write,
-{
-    write_raw_line(io.upstream_in, normalized_frame)?;
+/// Validates a client JSON-RPC 2.0 request or notification envelope strictly.
+pub(crate) fn validate_client_envelope(
+    obj: &BTreeMap<String, ExactJson>,
+) -> Result<ClientEnvelope<'_>, ClientEnvelopeError> {
+    let id =
+        extract_request_id(obj).map_err(|message| ClientEnvelopeError { id: None, message })?;
 
-    for _ in 0..=MAX_UPSTREAM_INTERLEAVED_MESSAGES {
-        let line = read_upstream_line(expected_id, max_line_bytes, io.client_out, io.upstream_out)?;
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-        let parsed = match parse_exact_json(trimmed) {
-            Ok(val) => val,
-            Err(err) => {
-                return fail_upstream_protocol(
-                    io.client_out,
-                    expected_id,
-                    format!("invalid upstream JSON: {err}"),
-                );
-            }
-        };
-        let ExactJson::Object(obj) = parsed else {
-            return fail_upstream_protocol(
-                io.client_out,
-                expected_id,
-                "upstream frame must be a JSON object".to_string(),
-            );
-        };
+    if obj.get("jsonrpc").and_then(ExactJson::as_str) != Some("2.0") {
+        return Err(ClientEnvelopeError {
+            id,
+            message: "jsonrpc version must be \"2.0\"".to_string(),
+        });
+    }
 
-        let frame = match classify_upstream_frame(&obj) {
-            Ok(frame) => frame,
-            Err(detail) => return fail_upstream_protocol(io.client_out, expected_id, detail),
-        };
+    if obj.contains_key("result") || obj.contains_key("error") {
+        return Err(ClientEnvelopeError {
+            id,
+            message: "client request/notification must not contain result or error".to_string(),
+        });
+    }
 
-        match frame {
-            UpstreamFrame::Notification => {
-                write_raw_line(io.client_out, &ExactJson::Object(obj).to_json_string())?;
-            }
-            UpstreamFrame::ServerRequest { id, method } => {
-                let msg =
-                    format!("handfest-mcp does not support server-to-client request '{method}'");
-                write_jsonrpc_error(
-                    io.upstream_in,
-                    Some(&id),
-                    JSONRPC_METHOD_NOT_FOUND,
-                    &msg,
-                    None,
-                )?;
-            }
-            UpstreamFrame::Response { id: resp_id } if &resp_id == expected_id => {
-                return Ok(obj);
-            }
-            UpstreamFrame::Response { id: other_id } => {
-                return fail_upstream_protocol(
-                    io.client_out,
-                    expected_id,
-                    format!(
-                        "response id mismatch: expected {}, got {}",
-                        expected_id.to_json_literal(),
-                        other_id.to_json_literal()
-                    ),
-                );
-            }
+    let Some(method) = obj.get("method").and_then(ExactJson::as_str) else {
+        return Err(ClientEnvelopeError {
+            id,
+            message: "missing or non-string JSON-RPC method".to_string(),
+        });
+    };
+    if method.is_empty() {
+        return Err(ClientEnvelopeError {
+            id,
+            message: "JSON-RPC method must not be empty".to_string(),
+        });
+    }
+
+    if let Some(params) = obj.get("params") {
+        if !matches!(params, ExactJson::Object(_) | ExactJson::Array(_)) {
+            return Err(ClientEnvelopeError {
+                id,
+                message: "JSON-RPC params must be a JSON object or array".to_string(),
+            });
         }
     }
 
-    fail_upstream_protocol(
-        io.client_out,
-        expected_id,
-        "upstream exceeded maximum interleaved messages before responding".to_string(),
-    )
+    Ok(ClientEnvelope { id, method })
 }
 
-fn classify_upstream_frame(obj: &BTreeMap<String, ExactJson>) -> Result<UpstreamFrame<'_>, String> {
+pub(crate) fn classify_upstream_frame(
+    obj: &BTreeMap<String, ExactJson>,
+) -> Result<UpstreamFrame<'_>, String> {
     if obj.get("jsonrpc").and_then(ExactJson::as_str) != Some("2.0") {
         return Err("upstream frame jsonrpc version must be \"2.0\"".to_string());
     }
@@ -180,10 +156,21 @@ fn classify_upstream_frame(obj: &BTreeMap<String, ExactJson>) -> Result<Upstream
         let Some(method) = method_val.as_str() else {
             return Err("upstream frame method must be a string".to_string());
         };
+        if method.is_empty() {
+            return Err("upstream frame method must not be empty".to_string());
+        }
         if has_result || has_error {
             return Err(
                 "upstream request/notification must not contain result or error".to_string(),
             );
+        }
+        if let Some(params) = obj.get("params") {
+            if !matches!(params, ExactJson::Object(_) | ExactJson::Array(_)) {
+                return Err(
+                    "upstream request/notification params must be a JSON object or array"
+                        .to_string(),
+                );
+            }
         }
         return match extract_request_id(obj)? {
             None => Ok(UpstreamFrame::Notification),
@@ -230,63 +217,22 @@ fn is_valid_jsonrpc_error_object(val: &ExactJson) -> bool {
     valid_code && valid_message
 }
 
-pub(crate) fn fail_upstream_protocol<T, CW: Write>(
+pub(crate) fn fail_upstream_error<T, CW: Write>(
     client_out: &mut CW,
-    expected_id: &JsonRpcId,
+    expected_id: Option<&JsonRpcId>,
+    code: i32,
     detail: String,
 ) -> Result<T, ProxyError> {
-    let _ = write_jsonrpc_error(
-        client_out,
-        Some(expected_id),
-        JSONRPC_INTERNAL_ERROR,
-        &detail,
-        None,
-    );
+    let _ = write_jsonrpc_error(client_out, expected_id, code, &detail, None);
     Err(ProxyError::UpstreamProtocol(detail))
 }
 
-fn read_upstream_line<CW: Write, UR: BufRead>(
-    expected_id: &JsonRpcId,
-    max_line_bytes: usize,
+pub(crate) fn fail_upstream_protocol<T, CW: Write>(
     client_out: &mut CW,
-    upstream_out: &mut UR,
-) -> Result<String, ProxyError> {
-    match read_bounded_line(upstream_out, max_line_bytes) {
-        Ok(Some(raw)) => Ok(raw),
-        Ok(None) => {
-            let _ = write_jsonrpc_error(
-                client_out,
-                Some(expected_id),
-                JSONRPC_INTERNAL_ERROR,
-                "upstream MCP server closed stdout before responding",
-                None,
-            );
-            Err(ProxyError::UpstreamEof)
-        }
-        Err(LineReadError::TooLong) => {
-            let _ = write_jsonrpc_error(
-                client_out,
-                Some(expected_id),
-                JSONRPC_INTERNAL_ERROR,
-                &format!("upstream response exceeded {max_line_bytes} bytes"),
-                None,
-            );
-            Err(ProxyError::UpstreamFrameTooLarge {
-                max_bytes: max_line_bytes,
-            })
-        }
-        Err(LineReadError::BareCr) => fail_upstream_protocol(
-            client_out,
-            expected_id,
-            "upstream emitted bare carriage return (0x0D) in JSON-RPC frame".to_string(),
-        ),
-        Err(LineReadError::InvalidUtf8) => fail_upstream_protocol(
-            client_out,
-            expected_id,
-            "upstream emitted non-UTF-8 JSON-RPC frame".to_string(),
-        ),
-        Err(LineReadError::Io(err)) => Err(ProxyError::Io(err)),
-    }
+    expected_id: Option<&JsonRpcId>,
+    detail: String,
+) -> Result<T, ProxyError> {
+    fail_upstream_error(client_out, expected_id, JSONRPC_INTERNAL_ERROR, detail)
 }
 
 pub(crate) fn write_denied_response<W: Write>(
@@ -310,13 +256,12 @@ pub(crate) fn write_denied_response<W: Write>(
     )
 }
 
-pub(crate) fn write_jsonrpc_error<W: Write>(
-    out: &mut W,
+pub(crate) fn format_jsonrpc_error_line(
     id: Option<&JsonRpcId>,
     code: i32,
     message: &str,
     data: Option<&ExactJson>,
-) -> Result<(), ProxyError> {
+) -> String {
     let id_json = id.map_or_else(|| "null".to_string(), JsonRpcId::to_json_literal);
     let mut err_fields = BTreeMap::new();
     err_fields.insert("code".to_string(), ExactJson::Number(code.to_string()));
@@ -325,7 +270,17 @@ pub(crate) fn write_jsonrpc_error<W: Write>(
         err_fields.insert("data".to_string(), d.clone());
     }
     let error_json = ExactJson::Object(err_fields).to_json_string();
-    let line = format!(r#"{{"jsonrpc":"2.0","id":{id_json},"error":{error_json}}}"#);
+    format!(r#"{{"jsonrpc":"2.0","id":{id_json},"error":{error_json}}}"#)
+}
+
+pub(crate) fn write_jsonrpc_error<W: Write>(
+    out: &mut W,
+    id: Option<&JsonRpcId>,
+    code: i32,
+    message: &str,
+    data: Option<&ExactJson>,
+) -> Result<(), ProxyError> {
+    let line = format_jsonrpc_error_line(id, code, message, data);
     write_raw_line(out, &line)
 }
 
@@ -393,6 +348,8 @@ pub(crate) fn read_bounded_line<R: BufRead>(
 #[cfg(test)]
 mod tests {
     use std::io::Cursor;
+
+    use crate::exact_json::parse_exact_json;
 
     use super::*;
 
@@ -462,5 +419,67 @@ mod tests {
             canonical: canonicalize_json_number("18446744073709551617").unwrap(),
         };
         assert_ne!(big_a, big_b);
+    }
+
+    #[test]
+    fn error_object_guard_requires_integer_code_and_string_message() {
+        let valid = parse_exact_json(r#"{"code":-32601,"message":"not found"}"#).unwrap();
+        assert!(is_valid_jsonrpc_error_object(&valid));
+
+        let missing_msg = parse_exact_json(r#"{"code":-32601}"#).unwrap();
+        assert!(!is_valid_jsonrpc_error_object(&missing_msg));
+
+        let non_string_msg = parse_exact_json(r#"{"code":-32601,"message":42}"#).unwrap();
+        assert!(!is_valid_jsonrpc_error_object(&non_string_msg));
+
+        let null_msg = parse_exact_json(r#"{"code":-32601,"message":null}"#).unwrap();
+        assert!(!is_valid_jsonrpc_error_object(&null_msg));
+
+        let float_code = parse_exact_json(r#"{"code":1.5,"message":"bad"}"#).unwrap();
+        assert!(!is_valid_jsonrpc_error_object(&float_code));
+    }
+
+    #[test]
+    fn client_envelope_rejects_response_fields_and_primitive_params() {
+        let bad_cases = [
+            (
+                r#"{"jsonrpc":"2.0","id":1,"method":"ping","result":{}}"#,
+                "client request/notification must not contain result or error",
+            ),
+            (
+                r#"{"jsonrpc":"2.0","id":1,"method":"ping","error":{"code":-1,"message":"x"}}"#,
+                "client request/notification must not contain result or error",
+            ),
+            (
+                r#"{"jsonrpc":"2.0","method":"notifications/initialized","result":null}"#,
+                "client request/notification must not contain result or error",
+            ),
+            (
+                r#"{"jsonrpc":"2.0","id":2,"method":"ping","params":123}"#,
+                "JSON-RPC params must be a JSON object or array",
+            ),
+            (
+                r#"{"jsonrpc":"2.0","method":"notifications/initialized","params":"bad"}"#,
+                "JSON-RPC params must be a JSON object or array",
+            ),
+            (
+                r#"{"jsonrpc":"2.0","id":3,"method":"ping","params":null}"#,
+                "JSON-RPC params must be a JSON object or array",
+            ),
+        ];
+
+        for (raw, expected_msg) in bad_cases {
+            let parsed = parse_exact_json(raw).unwrap();
+            let err = validate_client_envelope(parsed.as_object().unwrap()).unwrap_err();
+            assert_eq!(err.message, expected_msg, "input: {raw}");
+        }
+
+        let valid_obj =
+            parse_exact_json(r#"{"jsonrpc":"2.0","id":1,"method":"ping","params":{}}"#).unwrap();
+        assert!(validate_client_envelope(valid_obj.as_object().unwrap()).is_ok());
+
+        let valid_arr =
+            parse_exact_json(r#"{"jsonrpc":"2.0","id":1,"method":"ping","params":[1]}"#).unwrap();
+        assert!(validate_client_envelope(valid_arr.as_object().unwrap()).is_ok());
     }
 }
