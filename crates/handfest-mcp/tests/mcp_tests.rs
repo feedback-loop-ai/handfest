@@ -1215,28 +1215,30 @@ fn upstream_server_requests_and_numeric_id_equivalence_correlate_strictly() {
     assert_eq!(upstream_frames[2]["error"]["code"], json!(-32601));
 
     let equiv_req = concat!(
-        "{\"jsonrpc\":\"2.0\",\"id\":1.5,\"method\":\"ping\"}\n",
-        "{\"jsonrpc\":\"2.0\",\"id\":18446744073709551617,\"method\":\"ping\"}\n"
+        "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"ping\"}\n",
+        "{\"jsonrpc\":\"2.0\",\"id\":9007199254740991,\"method\":\"ping\"}\n",
+        "{\"jsonrpc\":\"2.0\",\"id\":-9007199254740991,\"method\":\"ping\"}\n"
     );
     let (eq_res, eq_out, _) = run_scripted_proxy_io(
         &mut proxy,
         equiv_req.as_bytes(),
         vec![
-            b"{\"jsonrpc\":\"2.0\",\"id\":1.50,\"result\":{}}\n".to_vec(),
-            b"{\"jsonrpc\":\"2.0\",\"id\":18446744073709551617.0,\"result\":{}}\n".to_vec(),
+            b"{\"jsonrpc\":\"2.0\",\"id\":1.0,\"result\":{}}\n".to_vec(),
+            b"{\"jsonrpc\":\"2.0\",\"id\":9007199254740991.0,\"result\":{}}\n".to_vec(),
+            b"{\"jsonrpc\":\"2.0\",\"id\":-9.007199254740991e15,\"result\":{}}\n".to_vec(),
         ],
     );
-    eq_res.expect("numerically equivalent JSON-RPC ids must match");
-    assert_eq!(String::from_utf8(eq_out).unwrap().lines().count(), 2);
+    eq_res.expect("numerically equivalent safe-integer JSON-RPC ids must match");
+    assert_eq!(String::from_utf8(eq_out).unwrap().lines().count(), 3);
 
     let (mismatch_res, mismatch_out, _) = run_raw_proxy_io(
         &mut proxy,
-        b"{\"jsonrpc\":\"2.0\",\"id\":18446744073709551617,\"method\":\"ping\"}\n",
-        b"{\"jsonrpc\":\"2.0\",\"id\":18446744073709551616,\"result\":{}}\n",
+        b"{\"jsonrpc\":\"2.0\",\"id\":9007199254740991,\"method\":\"ping\"}\n",
+        b"{\"jsonrpc\":\"2.0\",\"id\":9007199254740990,\"result\":{}}\n",
     );
     assert!(matches!(mismatch_res, Err(ProxyError::UpstreamProtocol(_))));
     let mismatch_str = String::from_utf8(mismatch_out).unwrap();
-    assert!(mismatch_str.contains("\"id\":18446744073709551617"));
+    assert!(mismatch_str.contains("\"id\":9007199254740991"));
     assert!(mismatch_str.contains("-32603"));
 }
 
@@ -1250,9 +1252,10 @@ fn tools_list_lossless_serialization_and_deep_nesting() {
         nested_schema = format!("{{\"nested\":{nested_schema}}}");
     }
 
-    let req = "{\"jsonrpc\":\"2.0\",\"id\":18446744073709551617,\"method\":\"tools/list\",\"params\":{}}\n";
+    let req =
+        "{\"jsonrpc\":\"2.0\",\"id\":9007199254740991,\"method\":\"tools/list\",\"params\":{}}\n";
     let upstream_resp = format!(
-        "{{\"jsonrpc\":\"2.0\",\"id\":18446744073709551617,\"result\":{{\"tools\":[{{\"name\":\"merge_pr\",\"inputSchema\":{nested_schema}}},{{\"name\":\"delete_repo\",\"inputSchema\":{{}}}}]}}}}\n"
+        "{{\"jsonrpc\":\"2.0\",\"id\":9007199254740991,\"result\":{{\"tools\":[{{\"name\":\"merge_pr\",\"inputSchema\":{nested_schema}}},{{\"name\":\"delete_repo\",\"inputSchema\":{{}}}}]}}}}\n"
     );
 
     let (res, client_out, _) =
@@ -1265,8 +1268,12 @@ fn tools_list_lossless_serialization_and_deep_nesting() {
         "decimal constant must not round through f64: {raw_out}"
     );
     assert!(
-        raw_out.contains("\"id\":18446744073709551617"),
-        "large integer id must not round through f64: {raw_out}"
+        raw_out.contains("\"bigId\":18446744073709551617"),
+        "large integer payload must not round through f64: {raw_out}"
+    );
+    assert!(
+        raw_out.contains("\"id\":9007199254740991"),
+        "max safe integer id must be preserved verbatim: {raw_out}"
     );
     assert!(
         raw_out.contains("\"bigId\":18446744073709551617"),

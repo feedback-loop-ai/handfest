@@ -16,6 +16,7 @@ use crate::session::MAX_QUEUED_CLIENT_FRAMES;
 
 const EVENT_CHANNEL_BOUND: usize = 64;
 
+#[derive(Debug)]
 pub(crate) enum IoEvent {
     ClientLine(Result<Option<String>, LineReadError>),
     UpstreamLine(Result<Option<String>, LineReadError>),
@@ -23,6 +24,7 @@ pub(crate) enum IoEvent {
     UpstreamWriteFailed,
 }
 
+#[derive(Debug)]
 pub(crate) enum RecvOutcome {
     Event(IoEvent),
     Timeout,
@@ -96,12 +98,16 @@ impl DuplexTransport {
                     break;
                 }
             }
-            drop(upstream_in);
             let failed = final_res.is_err();
-            let _ = writer_done_tx.send(final_res);
-            drop(upstream_rx);
             if failed {
+                let _ = writer_done_tx.send(final_res);
+                drop(upstream_rx);
                 let _ = up_write_tx.try_send(IoEvent::UpstreamWriteFailed);
+                drop(upstream_in);
+            } else {
+                drop(upstream_in);
+                let _ = writer_done_tx.send(final_res);
+                drop(upstream_rx);
             }
         });
 
@@ -142,16 +148,16 @@ impl DuplexTransport {
         }
     }
 
-    /// Non-blockingly drains all currently queued transport events from `event_rx` into the FIFO
-    /// `buffered_events` buffer (preserving order for `recv_event`) and reports whether an
-    /// upstream EOF (`UpstreamLine(Ok(None))`) or writer failure (`UpstreamWriteFailed`) is
-    /// already queued, even behind buffered upstream notifications.
+    /// Non-blockingly drains queued transport events from `event_rx` into the FIFO
+    /// `buffered_events` buffer (capped at `EVENT_CHANNEL_BOUND` to preserve channel backpressure
+    /// and FIFO order for `recv_event`) and reports whether an upstream terminal event
+    /// (`UpstreamLine(Ok(None) | Err(_))` or `UpstreamWriteFailed`) is already queued, even
+    /// behind buffered upstream notifications.
     pub(crate) fn poll_upstream_eof(&mut self) -> bool {
-        const MAX_POLL_DRAIN: usize = EVENT_CHANNEL_BOUND + 3;
         if self.buffered_events.iter().any(is_upstream_terminal_event) {
             return true;
         }
-        for _ in 0..MAX_POLL_DRAIN {
+        while self.buffered_events.len() < EVENT_CHANNEL_BOUND {
             match self.event_rx.try_recv() {
                 Ok(ev) => {
                     let terminal = is_upstream_terminal_event(&ev);
@@ -164,6 +170,19 @@ impl DuplexTransport {
             }
         }
         false
+    }
+
+    pub(crate) fn take_upstream_read_error(&mut self) -> Option<LineReadError> {
+        let mut found = None;
+        let mut remaining = VecDeque::with_capacity(self.buffered_events.len());
+        while let Some(ev) = self.buffered_events.pop_front() {
+            match ev {
+                IoEvent::UpstreamLine(Err(err)) if found.is_none() => found = Some(err),
+                other => remaining.push_back(other),
+            }
+        }
+        self.buffered_events = remaining;
+        found
     }
 
     pub(crate) fn has_pending_upstream(&self) -> bool {
@@ -260,7 +279,7 @@ impl DuplexTransport {
 const fn is_upstream_terminal_event(ev: &IoEvent) -> bool {
     matches!(
         ev,
-        IoEvent::UpstreamLine(Ok(None)) | IoEvent::UpstreamWriteFailed
+        IoEvent::UpstreamLine(Ok(None) | Err(_)) | IoEvent::UpstreamWriteFailed
     )
 }
 
@@ -288,6 +307,8 @@ mod tests {
 
     struct BurstLineReader {
         remaining: usize,
+        emitted: usize,
+        milestones: Vec<(usize, mpsc::SyncSender<()>)>,
         ready_tx: Option<mpsc::SyncSender<()>>,
         eof_gate_rx: Option<mpsc::Receiver<()>>,
         buf: Vec<u8>,
@@ -298,6 +319,8 @@ mod tests {
         fn new(lines: usize, ready_tx: mpsc::SyncSender<()>) -> Self {
             Self {
                 remaining: lines,
+                emitted: 0,
+                milestones: Vec::new(),
                 ready_tx: Some(ready_tx),
                 eof_gate_rx: None,
                 buf: Vec::new(),
@@ -310,13 +333,25 @@ mod tests {
             ready_tx: mpsc::SyncSender<()>,
             eof_gate_rx: mpsc::Receiver<()>,
         ) -> Self {
-            Self {
-                remaining: lines,
-                ready_tx: Some(ready_tx),
-                eof_gate_rx: Some(eof_gate_rx),
-                buf: Vec::new(),
-                pos: 0,
-            }
+            let mut r = Self::new(lines, ready_tx);
+            r.eof_gate_rx = Some(eof_gate_rx);
+            r
+        }
+
+        fn with_milestone(mut self, after_lines: usize, tx: mpsc::SyncSender<()>) -> Self {
+            self.milestones.push((after_lines, tx));
+            self
+        }
+
+        fn notify_milestones(&mut self) {
+            let emitted = self.emitted;
+            self.milestones.retain(|(at, tx)| {
+                let pending = emitted < *at;
+                if !pending {
+                    let _ = tx.send(());
+                }
+                pending
+            });
         }
     }
 
@@ -328,11 +363,16 @@ mod tests {
                     return Ok(0);
                 }
                 self.remaining -= 1;
+                self.emitted += 1;
                 if self.remaining == 0 {
                     let _ = self.ready_tx.take().map(|tx| tx.send(()));
                 }
-                self.buf =
-                    b"{\"jsonrpc\":\"2.0\",\"method\":\"notifications/progress\"}\n".to_vec();
+                self.notify_milestones();
+                self.buf = format!(
+                    "{{\"jsonrpc\":\"2.0\",\"method\":\"notifications/progress\",\"params\":{{\"id\":\"n{}\"}}}}\n",
+                    self.emitted
+                )
+                .into_bytes();
                 self.pos = 0;
             }
             let n = (self.buf.len() - self.pos).min(out.len());
@@ -613,11 +653,16 @@ mod tests {
             transport.recv_event(Some(expired)),
             RecvOutcome::Timeout
         ));
-        for _ in 0..4 {
-            assert!(matches!(
-                transport.recv_event(Some(Instant::now() + Duration::from_secs(2))),
-                RecvOutcome::Event(IoEvent::UpstreamLine(Ok(Some(_))))
-            ));
+        for expected in ["n1", "n2", "n3", "n4"] {
+            match transport.recv_event(Some(Instant::now() + Duration::from_secs(2))) {
+                RecvOutcome::Event(IoEvent::UpstreamLine(Ok(Some(line)))) => {
+                    assert!(
+                        line.contains(&format!("\"id\":\"{expected}\"")),
+                        "expected FIFO notification {expected}, got {line}"
+                    );
+                }
+                other => panic!("expected notification {expected}, got {other:?}"),
+            }
         }
         assert!(matches!(
             transport.recv_event(Some(Instant::now() + Duration::from_secs(2))),
@@ -673,5 +718,74 @@ mod tests {
             transport.take_writer_error(),
             ProxyError::Io(ref err) if err.raw_os_error() == Some(RAW_OS_CODE)
         ));
+    }
+
+    #[test]
+    fn poll_upstream_eof_bounds_buffered_events_to_event_channel_bound() {
+        let (phase1_tx, phase1_rx) = mpsc::sync_channel(1);
+        let (phase2_tx, phase2_rx) = mpsc::sync_channel(1);
+        let (all_tx, _all_rx) = mpsc::sync_channel(1);
+        let (_eof_gate_tx, eof_gate_rx) = mpsc::sync_channel(1);
+        let (_client_hold_tx, client_hold_rx) = mpsc::sync_channel(1);
+        let reader = BurstLineReader::gated(EVENT_CHANNEL_BOUND * 4, all_tx, eof_gate_rx)
+            .with_milestone(EVENT_CHANNEL_BOUND, phase1_tx)
+            .with_milestone(EVENT_CHANNEL_BOUND * 2, phase2_tx);
+        let mut transport = DuplexTransport::start(
+            BufReader::new(BlockingEofReader(client_hold_rx)),
+            Vec::<u8>::new(),
+            BufReader::new(reader),
+            1024,
+        );
+        phase1_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("burst 1");
+        assert!(!transport.poll_upstream_eof());
+        assert!(transport.buffered_events.len() <= EVENT_CHANNEL_BOUND);
+
+        phase2_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("burst 2");
+        for _ in 0..8 {
+            assert!(!transport.poll_upstream_eof());
+            assert!(transport.buffered_events.len() <= EVENT_CHANNEL_BOUND);
+        }
+        assert_eq!(transport.buffered_events.len(), EVENT_CHANNEL_BOUND);
+
+        let first = transport.recv_event(Some(Instant::now() + Duration::from_secs(2)));
+        assert!(
+            matches!(first, RecvOutcome::Event(IoEvent::UpstreamLine(Ok(Some(ref l)))) if l.contains("\"id\":\"n1\""))
+        );
+        assert!(!transport.poll_upstream_eof());
+        assert_eq!(transport.buffered_events.len(), EVENT_CHANNEL_BOUND);
+    }
+
+    #[test]
+    fn poll_upstream_eof_detects_upstream_read_error_as_terminal_and_extracts_it() {
+        let (_client_hold_tx, client_hold_rx) = mpsc::sync_channel(1);
+        let payload = concat!(
+            r#"{"jsonrpc":"2.0","method":"notifications/progress","params":{"id":"n1"}}"#,
+            "\n",
+            "bad\rline\n"
+        );
+        let mut transport = DuplexTransport::start(
+            BufReader::new(BlockingEofReader(client_hold_rx)),
+            Vec::<u8>::new(),
+            BufReader::new(Cursor::new(payload.as_bytes().to_vec())),
+            1024,
+        );
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !transport.poll_upstream_eof() {
+            assert!(
+                Instant::now() < deadline,
+                "poll_upstream_eof failed to detect UpstreamLine(Err(BareCr))"
+            );
+            thread::yield_now();
+        }
+        assert!(matches!(
+            transport.take_upstream_read_error(),
+            Some(LineReadError::BareCr)
+        ));
+        assert!(transport.take_upstream_read_error().is_none());
     }
 }

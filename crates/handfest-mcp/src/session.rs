@@ -405,11 +405,11 @@ impl<C: Clock, L: ReceiptLedger> McpProxy<C, L> {
     ) -> Result<(), ProxyError> {
         match method {
             "initialize" | "ping" => {
-                dispatch_to_upstream(req_id, PendingKind::Normal, raw_frame, ctx)
+                self.dispatch_to_upstream(req_id, PendingKind::Normal, raw_frame, ctx)
             }
             "tools/list" => {
                 let evaluated_at = self.clock.now_unix();
-                dispatch_to_upstream(
+                self.dispatch_to_upstream(
                     req_id,
                     PendingKind::ToolsList { evaluated_at },
                     raw_frame,
@@ -450,34 +450,14 @@ impl<C: Clock, L: ReceiptLedger> McpProxy<C, L> {
                 }
                 return Ok(());
             }
-            Err(LineReadError::TooLong) => {
-                let _ = write_jsonrpc_error(
-                    client_out,
+            Err(err) => {
+                return fail_upstream_line_read(
+                    err,
+                    self.max_line_bytes,
                     state.active_id(),
-                    JSONRPC_INTERNAL_ERROR,
-                    &format!("upstream response exceeded {} bytes", self.max_line_bytes),
-                    None,
-                );
-                return Err(ProxyError::UpstreamFrameTooLarge {
-                    max_bytes: self.max_line_bytes,
-                });
-            }
-            Err(LineReadError::BareCr) => {
-                return fail_upstream_error(
                     client_out,
-                    state.active_id(),
-                    JSONRPC_PARSE_ERROR,
-                    "upstream emitted bare carriage return (0x0D) in JSON-RPC frame".to_string(),
                 );
             }
-            Err(LineReadError::InvalidUtf8) => {
-                return fail_upstream_protocol(
-                    client_out,
-                    state.active_id(),
-                    "upstream emitted non-UTF-8 JSON-RPC frame".to_string(),
-                );
-            }
-            Err(LineReadError::Io(err)) => return Err(ProxyError::Io(err)),
         };
 
         let parsed = match parse_exact_json(&raw_line) {
@@ -564,36 +544,80 @@ impl<C: Clock, L: ReceiptLedger> McpProxy<C, L> {
             }
         }
     }
-}
-
-pub(crate) fn ensure_upstream_alive<CW: Write>(
-    req_id: &JsonRpcId,
-    ctx: &mut DispatchCtx<'_, CW>,
-) -> Result<(), ProxyError> {
-    if let Some(err) = ctx.transport.poll_writer_error() {
-        return Err(err);
-    }
-    if ctx.state.upstream_eof || ctx.transport.poll_upstream_eof() {
+    pub(crate) fn ensure_upstream_alive<CW: Write>(
+        &self,
+        req_id: &JsonRpcId,
+        ctx: &mut DispatchCtx<'_, CW>,
+    ) -> Result<(), ProxyError> {
         if let Some(err) = ctx.transport.poll_writer_error() {
             return Err(err);
         }
-        ctx.state.upstream_eof = true;
-        return emit_upstream_eof(ctx.client_out, Some(req_id));
+        let terminal = ctx.state.upstream_eof || ctx.transport.poll_upstream_eof();
+        if let Some(err) = ctx.transport.poll_writer_error() {
+            return Err(err);
+        }
+        if terminal {
+            if let Some(read_err) = ctx.transport.take_upstream_read_error() {
+                return fail_upstream_line_read(
+                    read_err,
+                    self.max_line_bytes,
+                    Some(req_id),
+                    ctx.client_out,
+                );
+            }
+            ctx.state.upstream_eof = true;
+            return emit_upstream_eof(ctx.client_out, Some(req_id));
+        }
+        Ok(())
     }
-    Ok(())
+
+    pub(crate) fn dispatch_to_upstream<CW: Write>(
+        &self,
+        req_id: JsonRpcId,
+        kind: PendingKind,
+        raw_frame: &str,
+        ctx: &mut DispatchCtx<'_, CW>,
+    ) -> Result<(), ProxyError> {
+        self.ensure_upstream_alive(&req_id, ctx)?;
+        ctx.transport.send_upstream(raw_frame.to_string())?;
+        ctx.state.active_request = Some(PendingRequest { id: req_id, kind });
+        ctx.state.interleaved_count = 0;
+        Ok(())
+    }
 }
 
-pub(crate) fn dispatch_to_upstream<CW: Write>(
-    req_id: JsonRpcId,
-    kind: PendingKind,
-    raw_frame: &str,
-    ctx: &mut DispatchCtx<'_, CW>,
+fn fail_upstream_line_read<CW: Write>(
+    err: LineReadError,
+    max_line_bytes: usize,
+    req_id: Option<&JsonRpcId>,
+    client_out: &mut CW,
 ) -> Result<(), ProxyError> {
-    ensure_upstream_alive(&req_id, ctx)?;
-    ctx.transport.send_upstream(raw_frame.to_string())?;
-    ctx.state.active_request = Some(PendingRequest { id: req_id, kind });
-    ctx.state.interleaved_count = 0;
-    Ok(())
+    match err {
+        LineReadError::TooLong => {
+            let _ = write_jsonrpc_error(
+                client_out,
+                req_id,
+                JSONRPC_INTERNAL_ERROR,
+                &format!("upstream response exceeded {max_line_bytes} bytes"),
+                None,
+            );
+            Err(ProxyError::UpstreamFrameTooLarge {
+                max_bytes: max_line_bytes,
+            })
+        }
+        LineReadError::BareCr => fail_upstream_error(
+            client_out,
+            req_id,
+            JSONRPC_PARSE_ERROR,
+            "upstream emitted bare carriage return (0x0D) in JSON-RPC frame".to_string(),
+        ),
+        LineReadError::InvalidUtf8 => fail_upstream_protocol(
+            client_out,
+            req_id,
+            "upstream emitted non-UTF-8 JSON-RPC frame".to_string(),
+        ),
+        LineReadError::Io(io_err) => Err(ProxyError::Io(io_err)),
+    }
 }
 
 fn classify_client_line(raw_line: String) -> QueuedClientItem {

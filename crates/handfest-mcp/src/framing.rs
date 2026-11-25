@@ -13,20 +13,19 @@ pub(crate) const JSONRPC_INVALID_REQUEST: i32 = -32600;
 pub(crate) const JSONRPC_METHOD_NOT_FOUND: i32 = -32601;
 pub(crate) const JSONRPC_INTERNAL_ERROR: i32 = -32603;
 
+const MAX_SAFE_JSONRPC_ID: i64 = (1_i64 << 53) - 1;
+
 #[derive(Debug, Clone)]
 pub(crate) enum JsonRpcId {
     Str(String),
-    Number {
-        raw: String,
-        canonical: CanonicalJsonNumber,
-    },
+    Number { raw: String, value: i64 },
 }
 
 impl PartialEq for JsonRpcId {
     fn eq(&self, other: &Self) -> bool {
         match (self, other) {
             (Self::Str(a), Self::Str(b)) => a == b,
-            (Self::Number { canonical: a, .. }, Self::Number { canonical: b, .. }) => a == b,
+            (Self::Number { value: a, .. }, Self::Number { value: b, .. }) => a == b,
             (Self::Str(_), Self::Number { .. }) | (Self::Number { .. }, Self::Str(_)) => false,
         }
     }
@@ -77,13 +76,57 @@ pub(crate) fn extract_id_value(val: &ExactJson) -> Result<JsonRpcId, String> {
     match val {
         ExactJson::Str(s) => Ok(JsonRpcId::Str(s.clone())),
         ExactJson::Number(raw) => {
-            let canonical = canonicalize_json_number(raw).map_err(|err| err.to_string())?;
+            let value = parse_safe_jsonrpc_id_int(raw)?;
             Ok(JsonRpcId::Number {
                 raw: raw.clone(),
-                canonical,
+                value,
             })
         }
         _ => Err("JSON-RPC id must be a string or number".to_string()),
+    }
+}
+
+fn parse_safe_jsonrpc_id_int(raw: &str) -> Result<i64, String> {
+    match canonicalize_json_number(raw).map_err(|err| err.to_string())? {
+        CanonicalJsonNumber::Zero => Ok(0),
+        CanonicalJsonNumber::NonZero {
+            neg,
+            sig_digits,
+            exp,
+        } => {
+            if exp < 0 {
+                return Err(
+                    "JSON-RPC numeric id must be an exact integer without fractional part"
+                        .to_string(),
+                );
+            }
+            // MAX_SAFE_JSONRPC_ID = 9_007_199_254_740_991 has 16 decimal digits.
+            // Because `sig_digits` is non-empty, `exp >= 16` or `sig_digits.len() + exp > 16`
+            // is strictly >= 10^16 > MAX_SAFE_JSONRPC_ID.
+            const MAX_SAFE_DIGITS: usize = 16;
+            let exp_usize = match usize::try_from(exp) {
+                Ok(e) if e < MAX_SAFE_DIGITS => e,
+                _ => {
+                    return Err(
+                        "JSON-RPC numeric id outside IEEE-754 safe integer range".to_string()
+                    );
+                }
+            };
+            if sig_digits.len() > MAX_SAFE_DIGITS - exp_usize {
+                return Err("JSON-RPC numeric id outside IEEE-754 safe integer range".to_string());
+            }
+            let mut value: i64 = 0;
+            for b in sig_digits.bytes() {
+                value = value * 10 + i64::from(b - b'0');
+            }
+            for _ in 0..exp_usize {
+                value *= 10;
+            }
+            if value > MAX_SAFE_JSONRPC_ID {
+                return Err("JSON-RPC numeric id outside IEEE-754 safe integer range".to_string());
+            }
+            Ok(if neg { -value } else { value })
+        }
     }
 }
 
@@ -260,6 +303,15 @@ fn is_valid_jsonrpc_error_object(val: &ExactJson) -> bool {
     let Some(err_obj) = val.as_object() else {
         return false;
     };
+    if reject_unknown_keys(
+        err_obj,
+        &["code", "message", "data"],
+        "JSON-RPC error object",
+    )
+    .is_err()
+    {
+        return false;
+    }
     let valid_code = matches!(
         err_obj.get("code"),
         Some(ExactJson::Number(raw)) if is_valid_json_int(raw)
@@ -517,34 +569,77 @@ mod tests {
     }
 
     #[test]
-    fn jsonrpc_id_compares_numbers_losslessly_and_distinguishes_strings() {
-        let id_15 = JsonRpcId::Number {
-            raw: "1.5".to_string(),
-            canonical: canonicalize_json_number("1.5").unwrap(),
-        };
-        let id_150 = JsonRpcId::Number {
-            raw: "1.50".to_string(),
-            canonical: canonicalize_json_number("1.50").unwrap(),
-        };
-        let id_str = JsonRpcId::Str("1.5".to_string());
-        assert_eq!(id_15, id_150);
-        assert_ne!(id_15, id_str);
+    fn jsonrpc_id_restricts_numbers_to_exact_ieee754_safe_integers() {
+        let id_1 = extract_id_value(&ExactJson::Number("1".to_string())).unwrap();
+        let id_1_0 = extract_id_value(&ExactJson::Number("1.0".to_string())).unwrap();
+        let id_1e0 = extract_id_value(&ExactJson::Number("1e0".to_string())).unwrap();
+        let id_str = JsonRpcId::Str("1".to_string());
+        assert_eq!(id_1, id_1_0);
+        assert_eq!(id_1, id_1e0);
+        assert_ne!(id_1, id_str);
 
-        let big_a = JsonRpcId::Number {
-            raw: "18446744073709551616".to_string(),
-            canonical: canonicalize_json_number("18446744073709551616").unwrap(),
-        };
-        let big_b = JsonRpcId::Number {
-            raw: "18446744073709551617".to_string(),
-            canonical: canonicalize_json_number("18446744073709551617").unwrap(),
-        };
-        assert_ne!(big_a, big_b);
+        let zero_a = extract_id_value(&ExactJson::Number("0".to_string())).unwrap();
+        let zero_b = extract_id_value(&ExactJson::Number("-0.0".to_string())).unwrap();
+        assert_eq!(zero_a, zero_b);
+
+        let max_safe =
+            extract_id_value(&ExactJson::Number("9007199254740991".to_string())).unwrap();
+        let max_safe_sci =
+            extract_id_value(&ExactJson::Number("9.007199254740991e15".to_string())).unwrap();
+        let max_safe_minus_one =
+            extract_id_value(&ExactJson::Number("9007199254740990".to_string())).unwrap();
+        assert_eq!(max_safe, max_safe_sci);
+        assert_ne!(max_safe, max_safe_minus_one);
+
+        let min_safe =
+            extract_id_value(&ExactJson::Number("-9007199254740991".to_string())).unwrap();
+        assert_ne!(min_safe, max_safe);
+
+        let hundred = extract_id_value(&ExactJson::Number("1e2".to_string())).unwrap();
+        let hundred_plain = extract_id_value(&ExactJson::Number("100".to_string())).unwrap();
+        assert_eq!(hundred, hundred_plain);
+
+        for fractional in [
+            "1.5",
+            "1.0000000000000001",
+            "1e-400",
+            "-0.1",
+            "9007199254740991.5",
+        ] {
+            let err = extract_id_value(&ExactJson::Number(fractional.to_string())).unwrap_err();
+            assert_eq!(
+                err, "JSON-RPC numeric id must be an exact integer without fractional part",
+                "fractional id {fractional} must fail"
+            );
+        }
+
+        for out_of_range in [
+            "9007199254740992",
+            "9007199254740993",
+            "-9007199254740992",
+            "10000000000000000",
+            "10000000000000001",
+            "1e16",
+            "18446744073709551617",
+            "1e100000000000000000000",
+        ] {
+            let err = extract_id_value(&ExactJson::Number(out_of_range.to_string())).unwrap_err();
+            assert_eq!(
+                err, "JSON-RPC numeric id outside IEEE-754 safe integer range",
+                "out-of-range id {out_of_range} must fail"
+            );
+        }
     }
 
     #[test]
-    fn error_object_guard_requires_integer_code_and_string_message() {
+    fn error_object_guard_requires_closed_keys_integer_code_and_string_message() {
         let valid = parse_exact_json(r#"{"code":-32601,"message":"not found"}"#).unwrap();
         assert!(is_valid_jsonrpc_error_object(&valid));
+
+        let valid_with_data =
+            parse_exact_json(r#"{"code":-32601,"message":"not found","data":{"detail":1}}"#)
+                .unwrap();
+        assert!(is_valid_jsonrpc_error_object(&valid_with_data));
 
         let missing_msg = parse_exact_json(r#"{"code":-32601}"#).unwrap();
         assert!(!is_valid_jsonrpc_error_object(&missing_msg));
@@ -557,6 +652,20 @@ mod tests {
 
         let float_code = parse_exact_json(r#"{"code":1.5,"message":"bad"}"#).unwrap();
         assert!(!is_valid_jsonrpc_error_object(&float_code));
+
+        let smuggled_and_extra = parse_exact_json(
+            r#"{"code":-32601,"CODE":"not_an_int","message":"fail","extra":true}"#,
+        )
+        .unwrap();
+        assert!(!is_valid_jsonrpc_error_object(&smuggled_and_extra));
+
+        let smuggled_only =
+            parse_exact_json(r#"{"code":-32601,"CODE":"not_an_int","message":"fail"}"#).unwrap();
+        assert!(!is_valid_jsonrpc_error_object(&smuggled_only));
+
+        let extra_only =
+            parse_exact_json(r#"{"code":-32601,"message":"fail","extra":true}"#).unwrap();
+        assert!(!is_valid_jsonrpc_error_object(&extra_only));
     }
 
     #[test]

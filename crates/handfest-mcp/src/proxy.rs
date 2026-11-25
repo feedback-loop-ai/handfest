@@ -21,7 +21,7 @@ use crate::framing::{
     write_denied_response, write_jsonrpc_error, write_raw_line, JsonRpcId, JSONRPC_INTERNAL_ERROR,
 };
 use crate::mapping::{denial_resource_id, ToolPolicyMap};
-use crate::session::{dispatch_to_upstream, ensure_upstream_alive, DispatchCtx, PendingKind};
+use crate::session::{DispatchCtx, PendingKind};
 
 /// Default maximum JSON-RPC line length in bytes (1 MiB).
 pub const DEFAULT_MAX_LINE_BYTES: usize = 1024 * 1024;
@@ -168,7 +168,7 @@ impl<C: Clock, L: ReceiptLedger> McpProxy<C, L> {
                 }
             };
 
-        ensure_upstream_alive(&req_id, ctx)?;
+        self.ensure_upstream_alive(&req_id, ctx)?;
 
         let (verdict, receipt) =
             match self
@@ -189,7 +189,9 @@ impl<C: Clock, L: ReceiptLedger> McpProxy<C, L> {
             };
 
         match verdict {
-            Verdict::Permit => dispatch_to_upstream(req_id, PendingKind::Normal, raw_frame, ctx),
+            Verdict::Permit => {
+                self.dispatch_to_upstream(req_id, PendingKind::Normal, raw_frame, ctx)
+            }
             Verdict::Deny { reason } => write_denied_response(
                 ctx.client_out,
                 &req_id,
