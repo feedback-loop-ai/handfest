@@ -5,22 +5,22 @@ use std::fmt;
 use std::io::Write;
 use std::time::Duration;
 
-use handfest_core::ast::{is_valid_quoted_str, is_valid_timestamp, KeyId};
-use handfest_core::gate::{ActionRequest, VerifiedFacts, VerifiedMandate};
+use handfest_core::ast::{is_valid_quoted_str, is_valid_timestamp, KeyId, MandateId};
+use handfest_core::gate::{ActionRequest, VerifiedMandate};
 use handfest_core::Verdict;
+pub use handfest_ledger::ReceiptLedger;
 use handfest_ledger::SqliteLedger;
 
 use crate::adapters::validate_verified_chain;
 pub use crate::adapters::{
-    verify_mandate_chain, verify_mandate_chain_with, Clock, FixedClock, ProxyError, ReceiptLedger,
-    SystemClock,
+    verify_mandate_chain, verify_mandate_chain_with, Clock, FixedClock, ProxyError, SystemClock,
 };
 use crate::exact_json::ExactJson;
 use crate::framing::{
     fail_upstream_protocol, write_denied_response, write_jsonrpc_error, write_raw_line, JsonRpcId,
     JSONRPC_INTERNAL_ERROR,
 };
-use crate::mapping::{MappingError, ToolPolicy, ToolPolicyMap};
+use crate::mapping::{ToolPolicy, ToolPolicyMap};
 use crate::session::{dispatch_to_upstream, DispatchCtx, PendingKind};
 
 /// Default maximum JSON-RPC line length in bytes (1 MiB).
@@ -35,6 +35,7 @@ pub const HANDFEST_DENIED_ERROR_CODE: i32 = -32001;
 /// Fail-closed MCP stdio JSON-RPC 2.0 proxy enforcing a verified `HANDFEST v1` mandate chain.
 pub struct McpProxy<C: Clock, L: ReceiptLedger = SqliteLedger> {
     pub(crate) verified_chain: Vec<VerifiedMandate>,
+    pub(crate) chain_ids: Vec<MandateId>,
     pub(crate) actor_key: KeyId,
     pub(crate) policy_map: ToolPolicyMap,
     pub(crate) ledger: L,
@@ -64,13 +65,14 @@ impl<C: Clock, L: ReceiptLedger> McpProxy<C, L> {
         ledger: L,
         clock: C,
     ) -> Result<Self, ProxyError> {
-        validate_verified_chain(&verified_chain)?;
+        let chain_ids = validate_verified_chain(&verified_chain)?;
         actor_key
             .validate()
             .map_err(|err| ProxyError::InvalidChain(format!("invalid actor_key: {err}")))?;
         policy_map.validate()?;
         Ok(Self {
             verified_chain,
+            chain_ids,
             actor_key,
             policy_map,
             ledger,
@@ -130,10 +132,16 @@ impl<C: Clock, L: ReceiptLedger> McpProxy<C, L> {
                 let denial_req = ActionRequest {
                     actor_key: self.actor_key.clone(),
                     action: "mcp.invalid_params".to_string(),
-                    resource_kind: format!("mcp_tool:{reason}"),
+                    resource_kind: "mcp_tool".to_string(),
                     resource_id: "invalid_params".to_string(),
                 };
-                return self.record_denial_and_respond(&req_id, &denial_req, now, ctx.client_out);
+                return self.record_denial_and_respond(
+                    &req_id,
+                    &denial_req,
+                    now,
+                    reason,
+                    ctx.client_out,
+                );
             }
         };
 
@@ -149,12 +157,12 @@ impl<C: Clock, L: ReceiptLedger> McpProxy<C, L> {
                         &self.policy_map,
                         tool_name,
                         arguments,
-                        &err,
                     );
                     return self.record_denial_and_respond(
                         &req_id,
                         &denial_req,
                         now,
+                        err.to_string(),
                         ctx.client_out,
                     );
                 }
@@ -174,7 +182,7 @@ impl<C: Clock, L: ReceiptLedger> McpProxy<C, L> {
                         &format!("handfest ledger evaluation failed: {err}"),
                         None,
                     )?;
-                    return Err(ProxyError::Ledger(Box::new(err)));
+                    return Err(ProxyError::Ledger(err));
                 }
             };
 
@@ -231,78 +239,111 @@ impl<C: Clock, L: ReceiptLedger> McpProxy<C, L> {
         req_id: &JsonRpcId,
         denial_request: &ActionRequest,
         now: i64,
+        mapping_reason: String,
         client_out: &mut CW,
     ) -> Result<(), ProxyError> {
-        let (verdict, receipt) = self
-            .ledger
-            .evaluate_and_record(
-                &self.verified_chain,
-                denial_request,
-                &VerifiedFacts::new(),
-                now,
-            )
-            .map_err(|err| ProxyError::Ledger(Box::new(err)))?;
-        match verdict {
-            Verdict::Deny { reason } => write_denied_response(
-                client_out,
-                req_id,
-                &reason,
-                &receipt.receipt_hash.to_string(),
-            ),
-            Verdict::Permit => Err(ProxyError::UpstreamProtocol(
-                "internal invariant violation: denial request evaluated to Permit".to_string(),
-            )),
-        }
+        let reason = match self.check_chain_at(now) {
+            Ok(()) => mapping_reason,
+            Err(chain_reason) => chain_reason,
+        };
+        let receipt = match self.ledger.record_denial(
+            self.chain_ids.clone(),
+            denial_request,
+            now,
+            reason.clone(),
+        ) {
+            Ok(receipt) => receipt,
+            Err(err) => {
+                write_jsonrpc_error(
+                    client_out,
+                    Some(req_id),
+                    JSONRPC_INTERNAL_ERROR,
+                    &format!("handfest ledger denial recording failed: {err}"),
+                    None,
+                )?;
+                return Err(ProxyError::Ledger(err));
+            }
+        };
+        write_denied_response(
+            client_out,
+            req_id,
+            &reason,
+            &receipt.receipt_hash.to_string(),
+        )
     }
 
-    fn chain_proofs_valid_at(&self, now: i64) -> bool {
+    fn check_chain_at(&self, now: i64) -> Result<(), String> {
         if !is_valid_timestamp(now) {
-            return false;
+            return Err(format!(
+                "timestamp {now} outside 0000-01-01T00:00:00Z..=9999-12-31T23:59:59Z"
+            ));
         }
-        self.verified_chain.iter().all(|vm| {
-            &vm.proof.signer_key == vm.ast.from().key()
-                && vm.proof.actor_kind == vm.ast.from().kind()
-                && vm.proof.valid_from < vm.proof.valid_until
-                && now >= vm.proof.valid_from
-                && now < vm.proof.valid_until
-        })
+        for (hop, vm) in self.verified_chain.iter().enumerate() {
+            if &vm.proof.signer_key != vm.ast.from().key() {
+                return Err(format!(
+                    "hop {hop}: proof signer key {} does not match mandate FROM key {}",
+                    vm.proof.signer_key,
+                    vm.ast.from().key()
+                ));
+            }
+            if vm.proof.actor_kind != vm.ast.from().kind() {
+                return Err(format!(
+                    "hop {hop}: proof actor kind {:?} does not match mandate FROM kind {:?}",
+                    vm.proof.actor_kind,
+                    vm.ast.from().kind()
+                ));
+            }
+            if vm.proof.valid_from >= vm.proof.valid_until {
+                return Err(format!(
+                    "hop {hop}: invalid anchor proof validity window [{}..{})",
+                    vm.proof.valid_from, vm.proof.valid_until
+                ));
+            }
+            if now < vm.proof.valid_from || now >= vm.proof.valid_until {
+                return Err(format!(
+                    "hop {hop}: timestamp {now} outside anchor proof validity window [{}..{})",
+                    vm.proof.valid_from, vm.proof.valid_until
+                ));
+            }
+        }
+        if let Some(leaf) = self.verified_chain.last() {
+            if leaf.ast.to().key() != &self.actor_key {
+                return Err(format!(
+                    "request actor key {} does not match leaf mandate TO key {}",
+                    self.actor_key,
+                    leaf.ast.to().key()
+                ));
+            }
+        }
+        Ok(())
     }
 
     fn is_tool_permitted(&self, tool_name: &str, now: i64) -> bool {
-        if !self.chain_proofs_valid_at(now) {
+        if self.check_chain_at(now).is_err() {
             return false;
         }
         let Some(policy) = self.policy_map.get(tool_name) else {
             return false;
         };
-        let Some(leaf) = self.verified_chain.last() else {
-            return false;
-        };
-        if leaf.ast.to().key() != &self.actor_key {
-            return false;
-        }
         self.verified_chain
             .iter()
             .all(|vm| vm.ast.allow().iter().any(|pat| pat.matches(&policy.action)))
     }
 }
 
-/// Builds a guaranteed-denial [`ActionRequest`] that preserves the actual mapped action when the
-/// tool is configured in `policy_map` and records the exact mapping failure in `resource_kind`.
+/// Builds an [`ActionRequest`] for pre-gate mapping denials, preserving the configured mapped
+/// action and resource metadata when the tool is present in `policy_map`.
 fn build_mapping_denial_request(
     actor_key: &KeyId,
     policy_map: &ToolPolicyMap,
     tool_name: &str,
     arguments: Option<&ExactJson>,
-    err: &MappingError,
 ) -> ActionRequest {
     match policy_map.get(tool_name) {
         Some(policy) => ActionRequest {
             actor_key: actor_key.clone(),
             action: policy.action.clone(),
-            // Colon is forbidden in `is_valid_ident`, guaranteeing `Verdict::Deny` even under
-            // wildcard mandates while preserving the real mapped action and exact error detail.
-            resource_kind: format!("{}:{err}", policy.resource_kind),
+            resource_kind: policy.resource_kind.clone(),
             resource_id: best_effort_resource_id(tool_name, policy, arguments),
         },
         None => ActionRequest {

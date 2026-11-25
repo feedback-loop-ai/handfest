@@ -1,13 +1,13 @@
-//! Pluggable runtime abstractions (clock, ledger, anchor chain verification) and proxy errors.
+//! Pluggable runtime abstractions (clock, anchor chain verification) and proxy errors.
 
 use std::fmt;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use handfest_anchors::{AnchorError, AnchorVerifier, Ed25519Verifier, SignedMandate};
-use handfest_core::gate::{ActionRequest, DecisionReceipt, VerifiedFacts, VerifiedMandate};
+use handfest_core::ast::MandateId;
+use handfest_core::gate::VerifiedMandate;
 use handfest_core::lattice::subsumes;
-use handfest_core::Verdict;
-use handfest_ledger::{LedgerError, SqliteLedger};
+use handfest_ledger::LedgerError;
 
 use crate::mapping::MappingError;
 
@@ -50,43 +50,13 @@ impl Clock for FixedClock {
     }
 }
 
-/// Pluggable receipt and quota persistence abstraction consumed by [`crate::McpProxy`].
-pub trait ReceiptLedger {
-    /// Backend-specific persistence or integrity error.
-    type Error: std::error::Error + Send + Sync + 'static;
-
-    /// Atomically evaluates `chain` against `request` and `facts` at UTC timestamp `now`,
-    /// persists the hash-chained `DecisionReceipt`, and updates quotas on `Permit`.
-    fn evaluate_and_record(
-        &mut self,
-        chain: &[VerifiedMandate],
-        request: &ActionRequest,
-        facts: &VerifiedFacts,
-        now: i64,
-    ) -> Result<(Verdict, DecisionReceipt), Self::Error>;
-}
-
-impl ReceiptLedger for SqliteLedger {
-    type Error = LedgerError;
-
-    fn evaluate_and_record(
-        &mut self,
-        chain: &[VerifiedMandate],
-        request: &ActionRequest,
-        facts: &VerifiedFacts,
-        now: i64,
-    ) -> Result<(Verdict, DecisionReceipt), Self::Error> {
-        Self::evaluate_and_record(self, chain, request, facts, now)
-    }
-}
-
 /// Errors returned while validating chains, constructing [`crate::McpProxy`], or running the loop.
 #[derive(Debug)]
 pub enum ProxyError {
     Anchor(AnchorError),
     InvalidChain(String),
     Mapping(MappingError),
-    Ledger(Box<dyn std::error::Error + Send + Sync>),
+    Ledger(LedgerError),
     Io(std::io::Error),
     FrameTooLarge { max_bytes: usize },
     UpstreamFrameTooLarge { max_bytes: usize },
@@ -125,7 +95,7 @@ impl std::error::Error for ProxyError {
         match self {
             Self::Anchor(err) => Some(err),
             Self::Mapping(err) => Some(err),
-            Self::Ledger(err) => Some(err.as_ref()),
+            Self::Ledger(err) => Some(err),
             Self::Io(err) => Some(err),
             Self::InvalidChain(_)
             | Self::FrameTooLarge { .. }
@@ -150,7 +120,7 @@ impl From<MappingError> for ProxyError {
 
 impl From<LedgerError> for ProxyError {
     fn from(err: LedgerError) -> Self {
-        Self::Ledger(Box::new(err))
+        Self::Ledger(err)
     }
 }
 
@@ -179,7 +149,7 @@ pub fn verify_mandate_chain_with<V: AnchorVerifier + ?Sized>(
         })?;
         verified.push(vm);
     }
-    validate_verified_chain(&verified)?;
+    let _ = validate_verified_chain(&verified)?;
     Ok(verified)
 }
 
@@ -188,7 +158,9 @@ pub fn verify_mandate_chain(signed: &[SignedMandate]) -> Result<Vec<VerifiedMand
     verify_mandate_chain_with(&Ed25519Verifier, signed)
 }
 
-pub(crate) fn validate_verified_chain(verified: &[VerifiedMandate]) -> Result<(), ProxyError> {
+pub(crate) fn validate_verified_chain(
+    verified: &[VerifiedMandate],
+) -> Result<Vec<MandateId>, ProxyError> {
     if verified.is_empty() {
         return Err(ProxyError::InvalidChain(
             "mandate chain must contain at least one mandate".to_string(),
@@ -199,10 +171,12 @@ pub(crate) fn validate_verified_chain(verified: &[VerifiedMandate]) -> Result<()
             "root mandate must not declare a PARENT digest".to_string(),
         ));
     }
+    let mut chain_ids = Vec::with_capacity(verified.len());
     for (hop, vm) in verified.iter().enumerate() {
-        vm.ast.try_mandate_id().map_err(|err| {
+        let mid = vm.ast.try_mandate_id().map_err(|err| {
             ProxyError::InvalidChain(format!("hop {hop}: invalid mandate AST: {err}"))
         })?;
+        chain_ids.push(mid);
     }
     for (hop, pair) in verified.windows(2).enumerate() {
         subsumes(&pair[0].ast, &pair[1].ast).map_err(|err| {
@@ -212,5 +186,5 @@ pub(crate) fn validate_verified_chain(verified: &[VerifiedMandate]) -> Result<()
             ))
         })?;
     }
-    Ok(())
+    Ok(chain_ids)
 }

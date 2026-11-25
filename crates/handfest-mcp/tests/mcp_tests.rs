@@ -10,16 +10,17 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use handfest_anchors::{AnchorError, AnchorVerifier, Ed25519Keypair, SignedMandate};
-use handfest_core::ast::parse_rfc3339_utc;
+use handfest_core::ast::{parse_rfc3339_utc, KeyId, MandateId};
 use handfest_core::cnl::{parse_mandate, try_render_canonical};
 use handfest_core::gate::{
-    authorize, ActionRequest, DecisionReceipt, QuotaSnapshot, VerifiedFacts, VerifiedMandate,
+    authorize, build_denial_receipt, ActionRequest, DecisionReceipt, QuotaSnapshot, VerifiedFacts,
+    VerifiedMandate,
 };
 use handfest_core::{ActorKind, Verdict};
-use handfest_ledger::SqliteLedger;
+use handfest_ledger::{LedgerError, ReceiptLedger, SqliteLedger, TrackRecord};
 use handfest_mcp::{
     verify_mandate_chain, verify_mandate_chain_with, FactSpec, FactType, FixedClock, McpProxy,
-    ProxyError, ReceiptLedger, ToolPolicy, ToolPolicyMap, TypedScalar, HANDFEST_DENIED_ERROR_CODE,
+    ProxyError, ToolPolicy, ToolPolicyMap, TypedScalar, HANDFEST_DENIED_ERROR_CODE,
 };
 use serde_json::{json, Value};
 use tempfile::tempdir;
@@ -513,6 +514,10 @@ fn tools_call_deny_without_forwarding_lossless_decimal_and_quotas() {
         assert!(receipt_hash.starts_with("sha256:"));
         assert!(resp["error"]["data"]["reason"].as_str().is_some());
     }
+    assert_eq!(
+        responses[1]["error"]["data"]["reason"],
+        json!("unmapped MCP tool 'unmapped_tool'")
+    );
 
     assert_eq!(
         responses[3]["result"]["content"][0]["text"],
@@ -1329,34 +1334,33 @@ fn mapping_failure_receipt_records_mapped_action_and_invalid_empty_object_return
     assert_eq!(deny["id"], json!(1));
     assert_eq!(deny["error"]["code"], json!(HANDFEST_DENIED_ERROR_CODE));
     let reason = deny["error"]["data"]["reason"].as_str().unwrap();
-    assert!(
-        reason.contains("tool 'merge_pr': missing required resource_id argument 'repo'"),
-        "unexpected denial reason: {reason}"
-    );
-    assert!(
-        !reason.contains("mcp.unmapped") && !reason.contains("invalid concrete action"),
-        "misleading unmapped/action error in reason: {reason}"
+    assert_eq!(
+        reason,
+        "tool 'merge_pr': missing required resource_id argument 'repo'"
     );
 
     let expected_receipt = DecisionReceipt {
         chain_ids,
         actor_key: agent_kp.key_id(),
         action: "git.pr.merge".to_string(),
-        resource: "repo:tool 'merge_pr': missing required resource_id argument 'repo' \"merge_pr\""
-            .to_string(),
+        resource: "repo \"merge_pr\"".to_string(),
         timestamp: now,
         verdict: Verdict::Deny {
             reason: reason.to_string(),
         },
-        receipt_hash: handfest_core::ast::MandateId([0u8; 32]),
+        receipt_hash: MandateId([0u8; 32]),
         prev_receipt_hash: None,
     };
     assert_eq!(
         deny["error"]["data"]["receipt_hash"].as_str().unwrap(),
         expected_receipt.compute_hash().to_string(),
-        "recorded SQLite receipt must commit to mapped action 'git.pr.merge' and exact reason"
+        "recorded SQLite receipt must commit to mapped action 'git.pr.merge', resource, and exact reason"
     );
     assert_eq!(proxy.ledger().verify_integrity().unwrap(), 1);
+    let tr = proxy.ledger().track_record(&agent_kp.key_id()).unwrap();
+    assert_eq!(tr.total_decisions, 1);
+    assert_eq!(tr.permits, 0);
+    assert_eq!(tr.denies, 1);
 }
 
 #[cfg(unix)]
@@ -1794,19 +1798,86 @@ struct InMemoryLedger {
 }
 
 impl ReceiptLedger for InMemoryLedger {
-    type Error = io::Error;
-
     fn evaluate_and_record(
         &mut self,
         chain: &[VerifiedMandate],
         request: &ActionRequest,
         facts: &VerifiedFacts,
         now: i64,
-    ) -> Result<(Verdict, DecisionReceipt), Self::Error> {
+    ) -> Result<(Verdict, DecisionReceipt), LedgerError> {
         let prev = self.receipts.last().map(|r| r.receipt_hash);
         let (verdict, receipt) = authorize(chain, request, facts, &QuotaSnapshot::new(), now, prev);
         self.receipts.push(receipt.clone());
         Ok((verdict, receipt))
+    }
+
+    fn record_denial(
+        &mut self,
+        chain_ids: Vec<MandateId>,
+        request: &ActionRequest,
+        now: i64,
+        reason: String,
+    ) -> Result<DecisionReceipt, LedgerError> {
+        let prev = self.receipts.last().map(|r| r.receipt_hash);
+        let receipt = build_denial_receipt(
+            chain_ids,
+            request.actor_key.clone(),
+            request.action.clone(),
+            request.resource_kind.clone(),
+            request.resource_id.clone(),
+            now,
+            reason,
+            prev,
+        )
+        .map_err(|err| LedgerError::Integrity(err.to_string()))?;
+        self.receipts.push(receipt.clone());
+        Ok(receipt)
+    }
+
+    fn track_record(&self, actor_key: &KeyId) -> Result<TrackRecord, LedgerError> {
+        let (_, rec) = self.audit_snapshot(Some(actor_key))?;
+        Ok(rec.expect("actor_key was provided"))
+    }
+
+    fn audit_snapshot(
+        &self,
+        actor_key: Option<&KeyId>,
+    ) -> Result<(usize, Option<TrackRecord>), LedgerError> {
+        let mut expected_prev = None;
+        for receipt in &self.receipts {
+            if receipt.prev_receipt_hash != expected_prev || !receipt.verify_hash() {
+                return Err(LedgerError::Integrity("broken in-memory chain".to_string()));
+            }
+            expected_prev = Some(receipt.receipt_hash);
+        }
+        let rec = actor_key.map(|key| {
+            let mut permits = 0u64;
+            let mut denies = 0u64;
+            let mut leaves = std::collections::BTreeSet::new();
+            let mut first = None::<i64>;
+            let mut last = None::<i64>;
+            for r in self.receipts.iter().filter(|r| &r.actor_key == key) {
+                match r.verdict {
+                    Verdict::Permit => permits += 1,
+                    Verdict::Deny { .. } => denies += 1,
+                }
+                if let Some(leaf) = r.chain_ids.last() {
+                    leaves.insert(*leaf);
+                }
+                first = Some(first.map_or(r.timestamp, |c| c.min(r.timestamp)));
+                last = Some(last.map_or(r.timestamp, |c| c.max(r.timestamp)));
+            }
+            TrackRecord {
+                actor_key: key.clone(),
+                total_decisions: permits + denies,
+                permits,
+                denies,
+                distinct_mandates: u64::try_from(leaves.len()).unwrap_or(u64::MAX),
+                first_timestamp: first,
+                last_timestamp: last,
+            }
+        });
+        Ok((self.receipts.len(), rec))
     }
 }
 
@@ -1861,7 +1932,8 @@ fn custom_receipt_ledger_and_anchor_verifier_work_without_sqlite_or_ed25519() {
     let client_frames = concat!(
         "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/list\",\"params\":{}}\n",
         "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\",\"params\":{\"name\":\"merge_pr\",\"arguments\":{\"repo\":\"org/app\"}}}\n",
-        "{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"tools/call\",\"params\":{\"name\":\"delete_repo\",\"arguments\":{\"repo\":\"org/app\"}}}\n"
+        "{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"tools/call\",\"params\":{\"name\":\"delete_repo\",\"arguments\":{\"repo\":\"org/app\"}}}\n",
+        "{\"jsonrpc\":\"2.0\",\"id\":4,\"method\":\"tools/call\",\"params\":{\"name\":\"merge_pr\",\"arguments\":{}}}\n"
     );
     let mut client_out = Vec::new();
     proxy
@@ -1875,10 +1947,23 @@ fn custom_receipt_ledger_and_anchor_verifier_work_without_sqlite_or_ed25519() {
     handle.join().unwrap();
 
     assert_eq!(state.calls(), 1);
-    assert_eq!(proxy.ledger().receipts.len(), 2);
+    assert_eq!(proxy.ledger().verify_integrity().unwrap(), 3);
     assert_eq!(proxy.ledger().receipts[0].verdict, Verdict::Permit);
     assert!(matches!(
         proxy.ledger().receipts[1].verdict,
         Verdict::Deny { .. }
     ));
+    let mapping_receipt = &proxy.ledger().receipts[2];
+    assert_eq!(mapping_receipt.action, "git.pr.merge");
+    assert_eq!(mapping_receipt.resource, "repo \"merge_pr\"");
+    assert_eq!(
+        mapping_receipt.verdict,
+        Verdict::Deny {
+            reason: "tool 'merge_pr': missing required resource_id argument 'repo'".to_string()
+        }
+    );
+    assert_eq!(
+        mapping_receipt.prev_receipt_hash,
+        Some(proxy.ledger().receipts[1].receipt_hash)
+    );
 }
