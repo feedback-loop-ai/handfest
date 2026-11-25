@@ -1,24 +1,28 @@
 //! Transactional rollback-journal SQLite implementation of [`ReceiptLedger`].
 
 use std::fmt;
-use std::fs;
-use std::path::Path;
+use std::fs::{self, File};
+use std::io::{self, Read};
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use handfest_core::ast::{KeyId, MandateId};
 use handfest_core::gate::{
-    authorize, ActionRequest, DecisionReceipt, VerifiedFacts, VerifiedMandate,
+    authorize, build_denial_receipt, ActionRequest, DecisionReceipt, VerifiedFacts, VerifiedMandate,
 };
 use handfest_core::Verdict;
 use rusqlite::{
     params, Connection, OpenFlags, OptionalExtension, Transaction, TransactionBehavior,
 };
 
-use crate::audit::{run_audit_tx, track_record_in_conn};
+use crate::audit::{run_audit_tx, run_verified_track_record};
 use crate::quotas::{apply_quota_updates, compute_quota_updates, load_quota_snapshot};
 use crate::{LedgerError, ReceiptLedger, TrackRecord};
 
 const BUSY_TIMEOUT_MS: u64 = 5_000;
+const SQLITE_HEADER_LEN: usize = 100;
+const SQLITE_HEADER_MAGIC: &[u8; 16] = b"SQLite format 3\0";
+const ROLLBACK_JOURNAL_HDR_LEN: usize = 28;
 
 const SCHEMA_SQL: &str = "
 CREATE TABLE IF NOT EXISTS receipts (
@@ -68,17 +72,32 @@ impl fmt::Debug for SqliteLedger {
 
 impl SqliteLedger {
     /// Opens (or creates) a rollback-journal SQLite ledger at `path`.
+    ///
+    /// Rejects empty or `":memory:"` paths (use [`Self::open_in_memory`] for ephemeral execution),
+    /// disables SQLite URI parsing, and verifies `PRAGMA journal_mode = DELETE`.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, LedgerError> {
-        let conn = Connection::open(path)?;
-        Self::init(conn)
+        let path = path.as_ref();
+        let raw_os = path.as_os_str();
+        if raw_os.is_empty() || raw_os == ":memory:" || is_sqlite_uri_path(raw_os) {
+            return Err(LedgerError::Storage(
+                "empty, ':memory:', or 'file:' URI path rejected by SqliteLedger::open; use open_in_memory() for ephemeral ledgers"
+                    .to_string(),
+            ));
+        }
+        let flags = OpenFlags::SQLITE_OPEN_READ_WRITE
+            | OpenFlags::SQLITE_OPEN_CREATE
+            | OpenFlags::SQLITE_OPEN_NO_MUTEX;
+        let conn = Connection::open_with_flags(path, flags)?;
+        Self::init(conn, "delete")
     }
 
     /// Opens an existing SQLite ledger in strict read-only mode.
     ///
     /// Never creates missing database files, never runs write PRAGMAs, never executes DDL, and
     /// never creates `-wal` or `-shm` sidecar files. Symlinks are resolved before opening, and a
-    /// read-only schema probe rejects corrupt files, uncheckpointed WAL snapshots, and hot
-    /// unrecovered rollback journals immediately.
+    /// pre-open 100-byte SQLite header + sidecar check rejects missing/truncated files, non-SQLite
+    /// files, WAL-format headers, non-empty `-wal` files, and hot unrecovered rollback journals
+    /// before SQLite opens the database.
     pub fn open_read_only(path: impl AsRef<Path>) -> Result<Self, LedgerError> {
         let path = path.as_ref();
         let canonical = fs::canonicalize(path).map_err(|err| {
@@ -87,10 +106,19 @@ impl SqliteLedger {
                 path.display()
             ))
         })?;
+        validate_read_only_files(&canonical)?;
+
         let flags = OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX;
         let conn = Connection::open_with_flags(&canonical, flags)?;
         conn.busy_timeout(Duration::from_millis(BUSY_TIMEOUT_MS))?;
         conn.pragma_update(None, "query_only", "ON")?;
+        let journal_mode: String = conn.query_row("PRAGMA journal_mode", [], |row| row.get(0))?;
+        if journal_mode.eq_ignore_ascii_case("wal") {
+            return Err(LedgerError::Integrity(format!(
+                "read-only ledger '{}' uses WAL mode; rollback-journal mode required",
+                canonical.display()
+            )));
+        }
         let _: Option<i64> = conn
             .query_row("SELECT 1 FROM sqlite_master LIMIT 1", [], |row| row.get(0))
             .optional()?;
@@ -100,12 +128,18 @@ impl SqliteLedger {
     /// Opens an in-memory SQLite ledger for testing or ephemeral execution.
     pub fn open_in_memory() -> Result<Self, LedgerError> {
         let conn = Connection::open_in_memory()?;
-        Self::init(conn)
+        Self::init(conn, "memory")
     }
 
-    fn init(conn: Connection) -> Result<Self, LedgerError> {
+    fn init(conn: Connection, expected_journal_mode: &str) -> Result<Self, LedgerError> {
         conn.busy_timeout(Duration::from_millis(BUSY_TIMEOUT_MS))?;
-        conn.pragma_update(None, "journal_mode", "DELETE")?;
+        let actual_mode: String =
+            conn.query_row("PRAGMA journal_mode = DELETE;", [], |row| row.get(0))?;
+        if !actual_mode.eq_ignore_ascii_case(expected_journal_mode) {
+            return Err(LedgerError::Storage(format!(
+                "failed to set SQLite journal_mode to '{expected_journal_mode}'; got '{actual_mode}'"
+            )));
+        }
         conn.pragma_update(None, "synchronous", "FULL")?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
         conn.execute_batch(SCHEMA_SQL)?;
@@ -127,7 +161,7 @@ impl SqliteLedger {
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
 
         let prev_receipt_hash = load_latest_receipt_hash(&tx)?;
-        let chain_ids = collect_valid_chain_ids(chain);
+        let chain_ids: Vec<MandateId> = chain.iter().map(|vm| vm.ast.mandate_id()).collect();
         let usage = load_quota_snapshot(&tx, &chain_ids)?;
 
         let (verdict, receipt) = authorize(chain, request, facts, &usage, now, prev_receipt_hash);
@@ -161,8 +195,40 @@ impl SqliteLedger {
     /// [`TrackRecord::distinct_mandates`] counts distinct leaf mandates (`chain_ids.last()`)
     /// across all `Permit` and `Deny` receipts for `actor_key` (excluding intermediate delegator
     /// and root mandates).
+    /// Atomically builds a pre-gate denial [`DecisionReceipt`] via
+    /// `handfest_core::gate::build_denial_receipt`, persists it linked to the current hash-chain
+    /// tip without modifying quotas, and returns the persisted receipt.
+    pub fn record_denial(
+        &mut self,
+        chain_ids: Vec<MandateId>,
+        request: &ActionRequest,
+        now: i64,
+        reason: String,
+    ) -> Result<DecisionReceipt, LedgerError> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+
+        let prev_receipt_hash = load_latest_receipt_hash(&tx)?;
+        let receipt = build_denial_receipt(
+            chain_ids,
+            request.actor_key.clone(),
+            request.action.clone(),
+            request.resource_kind.clone(),
+            request.resource_id.clone(),
+            now,
+            reason,
+            prev_receipt_hash,
+        )
+        .map_err(|err| LedgerError::Integrity(format!("invalid denial receipt: {err}")))?;
+
+        insert_receipt(&tx, &receipt, &request.resource_kind, &request.resource_id)?;
+        tx.commit()?;
+        Ok(receipt)
+    }
+
     pub fn track_record(&self, actor_key: &KeyId) -> Result<TrackRecord, LedgerError> {
-        track_record_in_conn(&self.conn, actor_key)
+        run_verified_track_record(&self.conn, actor_key)
     }
 
     /// Runs [`Self::verify_integrity`] and an optional [`Self::track_record`] projection inside a
@@ -185,6 +251,16 @@ impl ReceiptLedger for SqliteLedger {
         now: i64,
     ) -> Result<(Verdict, DecisionReceipt), LedgerError> {
         Self::evaluate_and_record(self, chain, request, facts, now)
+    }
+
+    fn record_denial(
+        &mut self,
+        chain_ids: Vec<MandateId>,
+        request: &ActionRequest,
+        now: i64,
+        reason: String,
+    ) -> Result<DecisionReceipt, LedgerError> {
+        Self::record_denial(self, chain_ids, request, now, reason)
     }
 
     fn track_record(&self, actor_key: &KeyId) -> Result<TrackRecord, LedgerError> {
@@ -215,15 +291,174 @@ fn load_latest_receipt_hash(tx: &Transaction<'_>) -> Result<Option<MandateId>, L
     }
 }
 
-fn collect_valid_chain_ids(chain: &[VerifiedMandate]) -> Vec<MandateId> {
-    let mut ids = Vec::with_capacity(chain.len());
-    for vm in chain {
-        match vm.ast.try_mandate_id() {
-            Ok(id) => ids.push(id),
-            Err(_) => break,
-        }
+fn is_sqlite_uri_path(raw: &std::ffi::OsStr) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        raw.as_bytes().starts_with(b"file:")
     }
-    ids
+    #[cfg(not(unix))]
+    {
+        raw.to_str().is_some_and(|s| s.starts_with("file:"))
+    }
+}
+
+fn validate_read_only_files(canonical: &Path) -> Result<(), LedgerError> {
+    let meta = fs::metadata(canonical).map_err(|err| {
+        LedgerError::Integrity(format!(
+            "failed to stat read-only ledger '{}': {err}",
+            canonical.display()
+        ))
+    })?;
+    if !meta.is_file() {
+        return Err(LedgerError::Integrity(format!(
+            "read-only ledger '{}' is not a regular file",
+            canonical.display()
+        )));
+    }
+    if meta.len() < SQLITE_HEADER_LEN as u64 {
+        return Err(LedgerError::Integrity(format!(
+            "read-only ledger '{}' is truncated ({} bytes; minimum {SQLITE_HEADER_LEN})",
+            canonical.display(),
+            meta.len()
+        )));
+    }
+
+    check_wal_sidecar(&append_suffix(canonical, "-wal"))?;
+    check_rollback_journal_sidecar(&append_suffix(canonical, "-journal"))?;
+
+    if !this_process_holds_posix_lock(&meta) {
+        inspect_sqlite_header(canonical)?;
+    }
+    Ok(())
+}
+
+fn inspect_sqlite_header(canonical: &Path) -> Result<(), LedgerError> {
+    let mut file = File::open(canonical).map_err(|err| {
+        LedgerError::Integrity(format!(
+            "failed to open read-only ledger '{}': {err}",
+            canonical.display()
+        ))
+    })?;
+    let mut header = [0u8; SQLITE_HEADER_LEN];
+    file.read_exact(&mut header).map_err(|err| {
+        LedgerError::Integrity(format!(
+            "failed to read 100-byte SQLite header of '{}': {err}",
+            canonical.display()
+        ))
+    })?;
+    if &header[..SQLITE_HEADER_MAGIC.len()] != SQLITE_HEADER_MAGIC {
+        return Err(LedgerError::Integrity(format!(
+            "read-only ledger '{}' does not start with SQLite header magic",
+            canonical.display()
+        )));
+    }
+    if header[18] == 2 || header[19] == 2 {
+        return Err(LedgerError::Integrity(format!(
+            "read-only ledger '{}' uses WAL format header (versions {}/{}); rollback-journal mode required",
+            canonical.display(),
+            header[18],
+            header[19]
+        )));
+    }
+    Ok(())
+}
+
+fn check_wal_sidecar(wal_path: &Path) -> Result<(), LedgerError> {
+    let meta = match fs::metadata(wal_path) {
+        Ok(meta) => meta,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(err) => {
+            return Err(LedgerError::Integrity(format!(
+                "cannot inspect WAL sidecar '{}': {err}",
+                wal_path.display()
+            )));
+        }
+    };
+    if !meta.is_file() || meta.len() > 0 {
+        return Err(LedgerError::Integrity(format!(
+            "non-empty or invalid WAL sidecar '{}' requires recovery before read-only audit",
+            wal_path.display()
+        )));
+    }
+    Ok(())
+}
+
+fn check_rollback_journal_sidecar(journal_path: &Path) -> Result<(), LedgerError> {
+    let meta = match fs::metadata(journal_path) {
+        Ok(meta) => meta,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(err) => {
+            return Err(LedgerError::Integrity(format!(
+                "cannot inspect rollback journal '{}': {err}",
+                journal_path.display()
+            )));
+        }
+    };
+    if !meta.is_file() {
+        return Err(LedgerError::Integrity(format!(
+            "invalid non-file rollback journal '{}'",
+            journal_path.display()
+        )));
+    }
+    if meta.len() == 0 {
+        return Ok(());
+    }
+    let mut file = File::open(journal_path).map_err(|err| {
+        LedgerError::Integrity(format!(
+            "cannot read non-empty rollback journal '{}': {err}",
+            journal_path.display()
+        ))
+    })?;
+    let mut hdr = [0u8; ROLLBACK_JOURNAL_HDR_LEN];
+    if file.read_exact(&mut hdr).is_err() || hdr.iter().any(|&b| b != 0) {
+        return Err(LedgerError::Integrity(format!(
+            "hot rollback journal '{}' requires recovery before read-only audit",
+            journal_path.display()
+        )));
+    }
+    Ok(())
+}
+
+fn append_suffix(path: &Path, suffix: &str) -> PathBuf {
+    let mut os = path.as_os_str().to_os_string();
+    os.push(suffix);
+    PathBuf::from(os)
+}
+
+#[cfg(target_os = "linux")]
+fn this_process_holds_posix_lock(meta: &fs::Metadata) -> bool {
+    use std::os::unix::fs::MetadataExt;
+
+    let dev = meta.dev();
+    let major = ((dev >> 8) & 0x0fff) | ((dev >> 32) & !0x0fff);
+    let minor = (dev & 0x00ff) | ((dev >> 12) & !0x00ff);
+    let dev_ino = format!("{major:02x}:{minor:02x}:{}", meta.ino());
+    fs::read_to_string("/proc/locks")
+        .ok()
+        .is_some_and(|contents| {
+            proc_locks_contains_pid_inode(&contents, std::process::id(), &dev_ino)
+        })
+}
+
+#[cfg(not(target_os = "linux"))]
+fn this_process_holds_posix_lock(_meta: &fs::Metadata) -> bool {
+    false
+}
+
+#[cfg(target_os = "linux")]
+fn proc_locks_contains_pid_inode(contents: &str, pid: u32, dev_ino: &str) -> bool {
+    let pid_str = pid.to_string();
+    contents.lines().any(|line| {
+        let mut parts = line.split_whitespace();
+        let _idx = parts.next();
+        let kind = parts.next();
+        let _mode = parts.next();
+        let _access = parts.next();
+        let lock_pid = parts.next();
+        let lock_dev_ino = parts.next();
+        kind == Some("POSIX") && lock_pid == Some(pid_str.as_str()) && lock_dev_ino == Some(dev_ino)
+    })
 }
 
 fn insert_receipt(
@@ -400,6 +635,115 @@ mod tests {
             matches!(err, LedgerError::Sqlite(_)),
             "expected Sqlite read-only refusal, got: {err}"
         );
+        assert!(err.to_string().contains("sqlite error"));
         assert!(std::error::Error::source(&err).is_some());
+    }
+
+    #[test]
+    fn init_rejects_unexpected_journal_mode_and_corrupt_latest_hash() {
+        let mem = Connection::open_in_memory().unwrap();
+        let err = SqliteLedger::init(mem, "delete").unwrap_err();
+        assert!(matches!(err, LedgerError::Storage(_)));
+        assert!(err.to_string().contains("ledger storage error"));
+        assert!(std::error::Error::source(&err).is_none());
+
+        let mut ledger = SqliteLedger::open_in_memory().unwrap();
+        let (chain, req, facts, now) = sample_chain_and_req();
+        ledger
+            .evaluate_and_record(&chain, &req, &facts, now)
+            .unwrap();
+        ledger
+            .conn
+            .execute("UPDATE receipts SET receipt_hash = 'not-a-hash'", [])
+            .unwrap();
+        assert!(matches!(
+            ledger.evaluate_and_record(&chain, &req, &facts, now + 1),
+            Err(LedgerError::Integrity(_))
+        ));
+    }
+
+    #[test]
+    fn read_only_header_and_sidecar_helpers_fail_closed_on_invalid_inputs() {
+        let dir = TempDir::new().unwrap();
+        let missing = dir.path().join("missing.sqlite");
+        assert!(matches!(
+            validate_read_only_files(&missing),
+            Err(LedgerError::Integrity(_))
+        ));
+        assert!(matches!(
+            inspect_sqlite_header(&missing),
+            Err(LedgerError::Integrity(_))
+        ));
+
+        let short = dir.path().join("short.sqlite");
+        fs::write(&short, b"short").unwrap();
+        assert!(matches!(
+            inspect_sqlite_header(&short),
+            Err(LedgerError::Integrity(_))
+        ));
+
+        let bad_magic = dir.path().join("bad_magic.sqlite");
+        fs::write(&bad_magic, [0u8; 128]).unwrap();
+        assert!(matches!(
+            inspect_sqlite_header(&bad_magic),
+            Err(LedgerError::Integrity(_))
+        ));
+
+        let dir_sidecar = dir.path().join("dir-journal");
+        fs::create_dir(&dir_sidecar).unwrap();
+        assert!(matches!(
+            check_wal_sidecar(&dir_sidecar),
+            Err(LedgerError::Integrity(_))
+        ));
+        assert!(matches!(
+            check_rollback_journal_sidecar(&dir_sidecar),
+            Err(LedgerError::Integrity(_))
+        ));
+
+        let empty_journal = dir.path().join("empty-journal");
+        fs::write(&empty_journal, b"").unwrap();
+        check_rollback_journal_sidecar(&empty_journal).unwrap();
+
+        let short_journal = dir.path().join("short-journal");
+        fs::write(&short_journal, [0u8; 10]).unwrap();
+        assert!(matches!(
+            check_rollback_journal_sidecar(&short_journal),
+            Err(LedgerError::Integrity(_))
+        ));
+
+        // Non-NotFound metadata error (regular file as parent directory -> ENOTDIR).
+        let impossible = short_journal.join("child");
+        assert!(matches!(
+            check_wal_sidecar(&impossible),
+            Err(LedgerError::Integrity(_))
+        ));
+        assert!(matches!(
+            check_rollback_journal_sidecar(&impossible),
+            Err(LedgerError::Integrity(_))
+        ));
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let unreadable = dir.path().join("unreadable-journal");
+            fs::write(&unreadable, [0u8; 32]).unwrap();
+            fs::set_permissions(&unreadable, fs::Permissions::from_mode(0o000)).unwrap();
+            let res = check_rollback_journal_sidecar(&unreadable);
+            let _ = fs::set_permissions(&unreadable, fs::Permissions::from_mode(0o644));
+            assert!(matches!(res, Err(LedgerError::Integrity(_))));
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn proc_locks_parser_matches_exact_posix_pid_and_inode() {
+        let sample = "\
+1: FLOCK  ADVISORY  WRITE 42 00:30:100 0 EOF\n\
+2: POSIX  ADVISORY  WRITE 99 00:30:100 0 1\n\
+3: POSIX  ADVISORY  READ 42 00:30:200 0 1\n\
+4: POSIX  ADVISORY  WRITE 42 00:30:100 1073741825 1073741825\n";
+        assert!(proc_locks_contains_pid_inode(sample, 42, "00:30:100"));
+        assert!(!proc_locks_contains_pid_inode(sample, 42, "00:30:999"));
+        assert!(!proc_locks_contains_pid_inode(sample, 7, "00:30:100"));
     }
 }

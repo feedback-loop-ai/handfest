@@ -8,7 +8,7 @@ mod sqlite;
 
 use std::fmt;
 
-use handfest_core::ast::KeyId;
+use handfest_core::ast::{KeyId, MandateId};
 use handfest_core::gate::{ActionRequest, DecisionReceipt, VerifiedFacts, VerifiedMandate};
 use serde::{Deserialize, Serialize};
 
@@ -21,6 +21,7 @@ use crate::codec::key_id_serde;
 #[derive(Debug)]
 pub enum LedgerError {
     Sqlite(rusqlite::Error),
+    Storage(String),
     Json(serde_json::Error),
     Integrity(String),
     QuotaAccounting(String),
@@ -30,6 +31,7 @@ impl fmt::Display for LedgerError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Sqlite(err) => write!(f, "sqlite error: {err}"),
+            Self::Storage(msg) => write!(f, "ledger storage error: {msg}"),
             Self::Json(err) => write!(f, "json serialization error: {err}"),
             Self::Integrity(msg) => write!(f, "ledger integrity error: {msg}"),
             Self::QuotaAccounting(msg) => write!(f, "quota accounting error: {msg}"),
@@ -42,7 +44,7 @@ impl std::error::Error for LedgerError {
         match self {
             Self::Sqlite(err) => Some(err),
             Self::Json(err) => Some(err),
-            Self::Integrity(_) | Self::QuotaAccounting(_) => None,
+            Self::Storage(_) | Self::Integrity(_) | Self::QuotaAccounting(_) => None,
         }
     }
 }
@@ -81,9 +83,11 @@ pub struct TrackRecord {
 /// - `evaluate_and_record` atomically loads prior quotas, evaluates via
 ///   `handfest_core::gate::authorize`, persists the hash-chained receipt, and updates quotas
 ///   across every `MandateId` in `chain` only on `Verdict::Permit`.
-/// - `verify_integrity` and `audit_snapshot` verify receipt continuity, receipt hashes, and
-///   quota state consistency inside a single atomic read snapshot, failing closed on any tamper
-///   or corruption.
+/// - `record_denial` atomically persists a hash-chained pre-gate denial receipt constructed via
+///   `handfest_core::gate::build_denial_receipt` without modifying quota counters.
+/// - `verify_integrity`, `track_record`, and `audit_snapshot` verify full cryptographic hash-chain
+///   continuity, exact `quota_calls` reconciliation, and structural `quota_sums` validity inside a
+///   single atomic read snapshot, failing closed on any tamper or corruption.
 pub trait ReceiptLedger {
     /// Atomically evaluates `chain` against `request` and `facts` at timestamp `now`, records the
     /// resulting hash-chained [`DecisionReceipt`], and on `Verdict::Permit` increments quotas
@@ -96,13 +100,32 @@ pub trait ReceiptLedger {
         now: i64,
     ) -> Result<(Verdict, DecisionReceipt), LedgerError>;
 
-    /// Verifies receipt ordering, hash-chain continuity from genesis to tip, every receipt hash,
-    /// and persisted quota consistency inside a single read snapshot.
+    /// Atomically builds a pre-gate denial receipt via
+    /// `handfest_core::gate::build_denial_receipt` linked to the current hash-chain tip and
+    /// persists it without modifying persisted quota counters.
+    fn record_denial(
+        &mut self,
+        chain_ids: Vec<MandateId>,
+        request: &ActionRequest,
+        now: i64,
+        reason: String,
+    ) -> Result<DecisionReceipt, LedgerError>;
+
+    /// Verifies schema integrity, contiguous receipt ordering, full cryptographic hash-chain
+    /// continuity from genesis to tip, every receipt hash, non-empty `chain_ids` on `Permit`
+    /// receipts, exact `quota_calls` reconciliation against persisted `Permit` receipts, and
+    /// structural `quota_sums` validation inside a single read snapshot.
+    ///
+    /// Note: `quota_sums` validation checks structural invariants (valid `MandateId` backed by at
+    /// least one persisted `Permit`, valid `unit`/`field` syntax, non-negative canonical `Decimal`
+    /// total, and no duplicate keys); exact sum totals depend on per-call runtime facts not stored
+    /// in receipts.
     fn verify_integrity(&self) -> Result<usize, LedgerError> {
         self.audit_snapshot(None).map(|(count, _)| count)
     }
 
-    /// Computes a [`TrackRecord`] projection for `actor_key` from persisted receipts.
+    /// Computes an integrity-verified [`TrackRecord`] projection for `actor_key` from persisted
+    /// receipts inside a single consistent read snapshot.
     fn track_record(&self, actor_key: &KeyId) -> Result<TrackRecord, LedgerError>;
 
     /// Verifies ledger integrity and optionally computes a [`TrackRecord`] projection for

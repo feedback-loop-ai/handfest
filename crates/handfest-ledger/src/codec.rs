@@ -113,3 +113,63 @@ fn write_escaped_receipt_quoted(out: &mut String, value: &str) {
     }
     out.push('"');
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_optional_mandate_id_handles_none_valid_and_invalid() {
+        assert_eq!(parse_optional_mandate_id(1, "prev", None).unwrap(), None);
+        let valid = MandateId::sha256(b"test");
+        assert_eq!(
+            parse_optional_mandate_id(1, "prev", Some(valid.to_string())).unwrap(),
+            Some(valid)
+        );
+        assert!(matches!(
+            parse_optional_mandate_id(1, "prev", Some("bad".to_string())),
+            Err(LedgerError::Integrity(_))
+        ));
+    }
+
+    #[test]
+    fn parse_chain_ids_json_rejects_malformed_json_and_bad_mandate_id() {
+        assert!(matches!(
+            parse_chain_ids_json(1, "not-json"),
+            Err(LedgerError::Integrity(_))
+        ));
+        assert!(matches!(
+            parse_chain_ids_json(1, r#"["not-a-mandate"]"#),
+            Err(LedgerError::Integrity(_))
+        ));
+    }
+
+    #[test]
+    fn parse_verdict_rejects_inconsistent_and_unknown_values() {
+        assert_eq!(parse_verdict(1, "permit", None).unwrap(), Verdict::Permit);
+        assert_eq!(
+            parse_verdict(1, "deny", Some("no".to_string())).unwrap(),
+            Verdict::Deny {
+                reason: "no".to_string()
+            }
+        );
+        assert!(matches!(
+            parse_verdict(1, "permit", Some("extra".to_string())),
+            Err(LedgerError::Integrity(_))
+        ));
+        assert!(matches!(
+            parse_verdict(1, "deny", None),
+            Err(LedgerError::Integrity(_))
+        ));
+        assert!(matches!(
+            parse_verdict(1, "maybe", None),
+            Err(LedgerError::Integrity(_))
+        ));
+    }
+
+    #[test]
+    fn format_resource_escapes_backslashes_quotes_and_control_chars() {
+        let formatted = format_resource("repo\\k\n\x07", "a\\b\"c\t");
+        assert_eq!(formatted, "repo\\\\k\\n\\u{7} \"a\\\\b\\\"c\\t\"");
+    }
+}
