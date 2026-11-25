@@ -2,7 +2,10 @@
 
 Thin, declarative, configuration-over-code integrations for vesting bounded `HANDFEST v1` authority into AI harnesses — **Claude Code**, **Codex**, **`dsh`**, and **Antigravity (`agy`)** — with zero harness-specific Rust code in `crates/`.
 
-> **Binary availability:** The `handfest` CLI (`handfest keygen`, `fmt`, `sign`, `verify`, `check`, `audit`) ships on `main` (`crates/handfest-cli`). The `handfest-mcp` stdio JSON-RPC 2.0 proxy ships with the MCP proxy crate (`crates/handfest-mcp`).
+> **Prerequisites & binary availability:**
+> - The `handfest` CLI (`handfest keygen`, `fmt`, `sign`, `verify`, `check`, `audit`) ships in this workspace (`crates/handfest-cli`).
+> - The `handfest-mcp` stdio JSON-RPC 2.0 proxy (`crates/handfest-mcp`) is **planned and not yet implemented in this repository**; the `mcp.example.json` and `codex/config.example.toml` templates target its planned CLI contract once that crate lands.
+> - **Python 3.10+** (`python3`, standard library only, invoked via `python3 -I` isolated mode) is required on `PATH` to run `plugins/claude-code/hooks/pre-tool-use.sh` and `plugins/tests/test-hooks.sh`.
 
 ## Architecture & Trust Boundary
 
@@ -54,13 +57,14 @@ Both `handfest-mcp --policy-map` and `plugins/claude-code/hooks/pre-tool-use.sh`
   - **Never hardcode dynamic runtime facts** (such as `resource.ci_status` or live PR approval counts) in `static_facts`; dynamic facts must be queried and injected by a trusted broker outside the model.
 - `context.time` is always supplied by the host clock and can never be overridden by tool arguments or static facts.
 
-[`policy-map.example.json`](policy-map.example.json) maps `@modelcontextprotocol/server-github`'s `merge_pull_request` tool (`repo`, `owner`, `pull_number`) to `git.pr.merge` on `repo` with `resource.owner`, `resource.pr`, and operator-pinned `resource.environment: "staging"`. Copy the policy map, hook script, signed mandates, and SQLite ledger to an outside-workspace directory (e.g. `/path/to/handfest-config/`) that the agent cannot modify.
+[`policy-map.example.json`](policy-map.example.json) maps `@modelcontextprotocol/server-github`'s `merge_pull_request` tool (`owner`, `repo`, `pullNumber`) to `git.pr.merge` on `repo` with `resource.owner`, `resource.pr`, and operator-pinned `resource.environment: "staging"`. Copy the policy map, hook script, signed mandates, and SQLite ledger to an outside-workspace directory (e.g. `/path/to/handfest-config/`) that the agent cannot modify.
 
 ## Harness Quickstarts
 
 ### Claude Code ([`plugins/claude-code/`](claude-code/))
 
-- **Non-MCP Hook (`PreToolUse`):** Copy [`pre-tool-use.sh`](claude-code/hooks/pre-tool-use.sh) and your non-MCP `ToolPolicyMap` to an outside-workspace location (`/path/to/handfest-config/`), export `HANDFEST_POLICY_MAP`, `HANDFEST_LEDGER`, `HANDFEST_CHAIN` (colon-separated root-to-leaf signed mandates), and `HANDFEST_ACTOR_KEY` (agent public `KeyId`), then merge [`claude-code/settings.example.json`](claude-code/settings.example.json) into `.claude/settings.json`.
+- **Non-MCP Hook (`PreToolUse`):** Requires **Python 3.10+** (`python3`) on `PATH`. Copy [`pre-tool-use.sh`](claude-code/hooks/pre-tool-use.sh) and your non-MCP `ToolPolicyMap` to an outside-workspace location (`/path/to/handfest-config/`), export `HANDFEST_POLICY_MAP`, `HANDFEST_LEDGER`, `HANDFEST_CHAIN` (colon-separated root-to-leaf signed mandates), and `HANDFEST_ACTOR_KEY` (agent public `KeyId`), then merge [`claude-code/settings.example.json`](claude-code/settings.example.json) into `.claude/settings.json`.
+  - `HANDFEST_LEDGER` must already exist on disk by default (the hook fails closed with `missing_ledger` exit `2` so deleted or unmounted ledgers cannot reset quotas). Set `HANDFEST_ALLOW_CREATE_LEDGER=1` only during initial ledger creation.
   - Scope `PreToolUse` `matcher` to explicit non-MCP tools (e.g. `"Bash|Write|Edit"`) rather than `".*"` so MCP tools already gated by `handfest-mcp` are never double-gated or double-charged in the SQLite ledger.
 - **MCP proxy (`.mcp.json`):** Copy [`claude-code/mcp.example.json`](claude-code/mcp.example.json) into your project's `.mcp.json` (separate from `.claude/settings.json`) to wrap upstream MCP servers via `handfest-mcp` using outside-workspace config paths.
 - **Drafting & audit skill:** Install [`claude-code/SKILL.md`](claude-code/SKILL.md) as a Claude Code `/handfest` skill.

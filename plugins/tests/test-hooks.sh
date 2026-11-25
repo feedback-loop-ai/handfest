@@ -47,6 +47,48 @@ if not eval(expr, {"__builtins__": {"isinstance": isinstance, "str": str, "int":
 PY_ASSERT
 }
 
+assert_strict_rfc8259_json_line() {
+  local label="$1" file_path="$2" expr="$3"
+  python3 -I - "$label" "$file_path" "$expr" <<'PY_STRICT'
+import json, re, sys, unicodedata
+label, file_path, expr = sys.argv[1], sys.argv[2], sys.argv[3]
+raw_bytes = open(file_path, "rb").read()
+try:
+    text = raw_bytes.decode("utf-8", errors="strict")
+except UnicodeDecodeError as exc:
+    sys.stderr.write(f"FAIL [{label}]: not valid UTF-8: {exc}\n")
+    sys.exit(1)
+lines = text.splitlines()
+if len(lines) != 1:
+    sys.stderr.write(f"FAIL [{label}]: expected single JSON line, got {len(lines)} lines:\n{text!r}\n")
+    sys.exit(1)
+if re.search(r"\\u[dD][89a-fA-F][0-9a-fA-F]{2}", lines[0]):
+    sys.stderr.write(f"FAIL [{label}]: escaped lone surrogate in JSON text: {lines[0]!r}\n")
+    sys.exit(1)
+try:
+    data = json.loads(lines[0])
+except Exception as exc:
+    sys.stderr.write(f"FAIL [{label}]: invalid JSON: {exc}\nraw: {lines[0]}\n")
+    sys.exit(1)
+stack = [data]
+while stack:
+    cur = stack.pop()
+    if isinstance(cur, str):
+        if any(unicodedata.category(c) == "Cs" for c in cur):
+            sys.stderr.write(f"FAIL [{label}]: lone surrogate found in decoded JSON string\n")
+            sys.exit(1)
+    elif isinstance(cur, dict):
+        for k, v in cur.items():
+            stack.append(k)
+            stack.append(v)
+    elif isinstance(cur, list):
+        stack.extend(cur)
+if not eval(expr, {"__builtins__": {"isinstance": isinstance, "str": str, "int": int, "bool": bool, "len": len}}, {"d": data}):
+    sys.stderr.write(f"FAIL [{label}]: assertion failed: {expr}\ndata: {data}\n")
+    sys.exit(1)
+PY_STRICT
+}
+
 run_hook() {
   local payload="$1"
   HOOK_RC=0
@@ -131,23 +173,23 @@ export HANDFEST_CHAIN="$ROOT_SIGNED"
 export HANDFEST_ACTOR_KEY="$AGENT_KEY"
 export HANDFEST_NOW="2026-11-24T18:30:00Z"
 
-# Test 1: Permitted call #1 via pre-tool-use.sh -> exit 0 + Permit receipt
-run_hook '{"hook_event_name":"PreToolUse","tool_name":"merge_pull_request","tool_input":{"owner":"feedback-loop-ai","repo":"handfest","pull_number":10}}'
+# Test 1: Permitted call #1 via pre-tool-use.sh (initial ledger bootstrap) -> exit 0 + Permit receipt
+HANDFEST_ALLOW_CREATE_LEDGER=1 run_hook '{"hook_event_name":"PreToolUse","tool_name":"merge_pull_request","tool_input":{"owner":"feedback-loop-ai","repo":"handfest","pullNumber":10}}'
 assert_eq "permit-1 rc" "$HOOK_RC" "0"
 assert_json "permit-1 stdout" "$HOOK_OUT" "d['verdict'] == 'permit' and d['hookSpecificOutput']['permissionDecision'] == 'allow' and isinstance(d['receipt_hash'], str) and d['receipt_hash'].startswith('sha256:')"
 pass "Permitted call #1 exited 0 and recorded Permit receipt"
 
 # Test 2: Out-of-scope resource -> exit 2 + mandate_denied + Deny receipt
-run_hook '{"hook_event_name":"PreToolUse","tool_name":"merge_pull_request","tool_input":{"owner":"feedback-loop-ai","repo":"secret-repo","pull_number":10}}'
+run_hook '{"hook_event_name":"PreToolUse","tool_name":"merge_pull_request","tool_input":{"owner":"feedback-loop-ai","repo":"secret-repo","pullNumber":10}}'
 assert_eq "out-of-scope repo rc" "$HOOK_RC" "2"
 assert_json "out-of-scope repo stderr" "$HOOK_ERR" "d['verdict'] == 'deny' and d['code'] == 'mandate_denied' and d['hookSpecificOutput']['permissionDecision'] == 'deny' and isinstance(d.get('receipt_hash'), str) and d['receipt_hash'].startswith('sha256:')"
 pass "Out-of-scope resource failed closed (exit 2) and recorded Deny receipt"
 
-# Test 3: Out-of-scope predicate (pull_number: 0 violates resource.pr >= 1) -> exit 2 + mandate_denied
-run_hook '{"hook_event_name":"PreToolUse","tool_name":"merge_pull_request","tool_input":{"owner":"feedback-loop-ai","repo":"handfest","pull_number":0}}'
+# Test 3: Out-of-scope predicate (pullNumber: 0 violates resource.pr >= 1) -> exit 2 + mandate_denied
+run_hook '{"hook_event_name":"PreToolUse","tool_name":"merge_pull_request","tool_input":{"owner":"feedback-loop-ai","repo":"handfest","pullNumber":0}}'
 assert_eq "out-of-scope predicate rc" "$HOOK_RC" "2"
 assert_json "out-of-scope predicate stderr" "$HOOK_ERR" "d['verdict'] == 'deny' and d['code'] == 'mandate_denied'"
-pass "Predicate violation (pull_number=0) failed closed (exit 2)"
+pass "Predicate violation (pullNumber=0) failed closed (exit 2)"
 
 # Test 4: Unmapped tool -> exit 2 + unmapped_tool
 run_hook '{"hook_event_name":"PreToolUse","tool_name":"Bash","tool_input":{"command":"rm -rf /"}}'
@@ -168,25 +210,25 @@ assert_json "empty stdin stderr" "$HOOK_ERR" "d['verdict'] == 'deny' and d['code
 pass "Empty stdin failed closed (exit 2)"
 
 # Test 7: Duplicate JSON keys in stdin -> exit 2 + invalid_input
-run_hook '{"tool_name":"merge_pull_request","tool_name":"Bash","tool_input":{"owner":"feedback-loop-ai","repo":"handfest","pull_number":10}}'
+run_hook '{"tool_name":"merge_pull_request","tool_name":"Bash","tool_input":{"owner":"feedback-loop-ai","repo":"handfest","pullNumber":10}}'
 assert_eq "dup keys rc" "$HOOK_RC" "2"
 assert_json "dup keys stderr" "$HOOK_ERR" "d['verdict'] == 'deny' and d['code'] == 'invalid_input'"
 pass "Duplicate JSON keys in stdin failed closed (exit 2)"
 
 # Test 8: Case-colliding keys in tool_input -> exit 2 + invalid_input
-run_hook '{"tool_name":"merge_pull_request","tool_input":{"owner":"feedback-loop-ai","repo":"handfest","Repo":"evil","pull_number":10}}'
+run_hook '{"tool_name":"merge_pull_request","tool_input":{"owner":"feedback-loop-ai","repo":"handfest","Repo":"evil","pullNumber":10}}'
 assert_eq "case-colliding keys rc" "$HOOK_RC" "2"
 assert_json "case-colliding keys stderr" "$HOOK_ERR" "d['verdict'] == 'deny' and d['code'] == 'invalid_input'"
 pass "Case-colliding argument keys failed closed (exit 2)"
 
-# Test 9: Type confusion (bool true passed for int pull_number) -> exit 2 + invalid_argument
-run_hook '{"tool_name":"merge_pull_request","tool_input":{"owner":"feedback-loop-ai","repo":"handfest","pull_number":true}}'
+# Test 9: Type confusion (bool true passed for int pullNumber) -> exit 2 + invalid_argument
+run_hook '{"tool_name":"merge_pull_request","tool_input":{"owner":"feedback-loop-ai","repo":"handfest","pullNumber":true}}'
 assert_eq "bool-as-int rc" "$HOOK_RC" "2"
 assert_json "bool-as-int stderr" "$HOOK_ERR" "d['verdict'] == 'deny' and d['code'] == 'invalid_argument'"
 pass "Bool-as-int type confusion failed closed (exit 2)"
 
 # Test 10: Missing required env vars -> each fails closed (exit 2 + missing_config)
-VALID_PAYLOAD='{"hook_event_name":"PreToolUse","tool_name":"merge_pull_request","tool_input":{"owner":"feedback-loop-ai","repo":"handfest","pull_number":10}}'
+VALID_PAYLOAD='{"hook_event_name":"PreToolUse","tool_name":"merge_pull_request","tool_input":{"owner":"feedback-loop-ai","repo":"handfest","pullNumber":10}}'
 for var in HANDFEST_POLICY_MAP HANDFEST_LEDGER HANDFEST_CHAIN HANDFEST_ACTOR_KEY; do
   HOOK_RC=0
   env -u "$var" "$HOOK" <<<"$VALID_PAYLOAD" >"$TMP_DIR/stdout.txt" 2>"$TMP_DIR/stderr.txt" || HOOK_RC=$?
@@ -271,7 +313,7 @@ cat <<'SPOOF_MAP_EOF' >"$SPOOF_ARG_MAP"
       "resource_id_arg": "repo",
       "arg_facts": {
         "owner": { "field": "resource.owner", "type": "str" },
-        "pull_number": { "field": "resource.pr", "type": "int" },
+        "pullNumber": { "field": "resource.pr", "type": "int" },
         "fake_time": { "field": "context.time", "type": "timestamp" },
         "claimed_env": { "field": "resource.environment", "type": "str" }
       },
@@ -293,7 +335,7 @@ cat <<'SPOOF_STATIC_EOF' >"$SPOOF_STATIC_MAP"
       "resource_id_arg": "repo",
       "arg_facts": {
         "owner": { "field": "resource.owner", "type": "str" },
-        "pull_number": { "field": "resource.pr", "type": "int" }
+        "pullNumber": { "field": "resource.pr", "type": "int" }
       },
       "static_facts": {
         "resource.environment": { "str": "staging" },
@@ -305,10 +347,10 @@ cat <<'SPOOF_STATIC_EOF' >"$SPOOF_STATIC_MAP"
 SPOOF_STATIC_EOF
 
 TIME_LEDGER="$TMP_DIR/time-ledger.sqlite"
-SPOOF_PAYLOAD='{"tool_name":"merge_pull_request","tool_input":{"owner":"feedback-loop-ai","repo":"handfest","pull_number":11,"fake_time":"2026-11-24T18:30:00Z","claimed_env":"prod"}}'
+SPOOF_PAYLOAD='{"tool_name":"merge_pull_request","tool_input":{"owner":"feedback-loop-ai","repo":"handfest","pullNumber":11,"fake_time":"2026-11-24T18:30:00Z","claimed_env":"prod"}}'
 HOOK_RC=0
 rm -f "$CAPTURED_FACTS"
-HANDFEST_BIN="$CAPTURE_SHIM" HANDFEST_LEDGER="$TIME_LEDGER" HANDFEST_CHAIN="$TIME_SIGNED" \
+HANDFEST_ALLOW_CREATE_LEDGER=1 HANDFEST_BIN="$CAPTURE_SHIM" HANDFEST_LEDGER="$TIME_LEDGER" HANDFEST_CHAIN="$TIME_SIGNED" \
   HANDFEST_POLICY_MAP="$SPOOF_ARG_MAP" HANDFEST_NOW="2026-11-24T21:00:00Z" \
   "$HOOK" <<<"$SPOOF_PAYLOAD" >"$TMP_DIR/stdout.txt" 2>"$TMP_DIR/stderr.txt" || HOOK_RC=$?
 assert_eq "clock spoof arg rc" "$HOOK_RC" "2"
@@ -333,7 +375,7 @@ assert_json "permit-2 stdout" "$(cat "$TMP_DIR/stdout.txt")" "d['verdict'] == 'p
 pass "Permitted call #2 exited 0 (and operator static_facts overrode argument fact)"
 
 # Test 15: 3rd permitted call fails closed on quota exhaustion (LIMIT 2 calls) -> exit 2
-run_hook '{"hook_event_name":"PreToolUse","tool_name":"merge_pull_request","tool_input":{"owner":"feedback-loop-ai","repo":"handfest","pull_number":12}}'
+run_hook '{"hook_event_name":"PreToolUse","tool_name":"merge_pull_request","tool_input":{"owner":"feedback-loop-ai","repo":"handfest","pullNumber":12}}'
 assert_eq "quota-exhausted rc" "$HOOK_RC" "2"
 assert_json "quota-exhausted stderr" "$HOOK_ERR" "d['verdict'] == 'deny' and d['code'] == 'mandate_denied' and 'quota' in d['reason'].lower()"
 pass "3rd call failed closed on quota exhaustion (LIMIT 2 calls)"
@@ -346,15 +388,15 @@ pass "handfest audit verified all 5 hash-chained receipts (2 permits, 3 denies)"
 # Test 17: Multi-hop delegation chain (HANDFEST_CHAIN=root:leaf) narrows scope and enforces leaf quota
 CHAIN_LEDGER="$TMP_DIR/chain-ledger.sqlite"
 HOOK_RC=0
-HANDFEST_LEDGER="$CHAIN_LEDGER" HANDFEST_CHAIN="$ROOT_SIGNED:$LEAF_SIGNED" HANDFEST_ACTOR_KEY="$LEAF_KEY" \
-  "$HOOK" <<<'{"tool_name":"merge_pull_request","tool_input":{"owner":"feedback-loop-ai","repo":"handfest","pull_number":42}}' \
+HANDFEST_ALLOW_CREATE_LEDGER=1 HANDFEST_LEDGER="$CHAIN_LEDGER" HANDFEST_CHAIN="$ROOT_SIGNED:$LEAF_SIGNED" HANDFEST_ACTOR_KEY="$LEAF_KEY" \
+  "$HOOK" <<<'{"tool_name":"merge_pull_request","tool_input":{"owner":"feedback-loop-ai","repo":"handfest","pullNumber":42}}' \
   >"$TMP_DIR/stdout.txt" 2>"$TMP_DIR/stderr.txt" || HOOK_RC=$?
 assert_eq "chain permit rc" "$HOOK_RC" "0"
 assert_json "chain permit stdout" "$(cat "$TMP_DIR/stdout.txt")" "d['verdict'] == 'permit'"
 
 HOOK_RC=0
 HANDFEST_LEDGER="$CHAIN_LEDGER" HANDFEST_CHAIN="$ROOT_SIGNED:$LEAF_SIGNED" HANDFEST_ACTOR_KEY="$LEAF_KEY" \
-  "$HOOK" <<<'{"tool_name":"merge_pull_request","tool_input":{"owner":"feedback-loop-ai","repo":"handfest","pull_number":42}}' \
+  "$HOOK" <<<'{"tool_name":"merge_pull_request","tool_input":{"owner":"feedback-loop-ai","repo":"handfest","pullNumber":42}}' \
   >"$TMP_DIR/stdout.txt" 2>"$TMP_DIR/stderr.txt" || HOOK_RC=$?
 assert_eq "chain quota rc" "$HOOK_RC" "2"
 assert_json "chain quota stderr" "$(cat "$TMP_DIR/stderr.txt")" "d['verdict'] == 'deny' and d['code'] == 'mandate_denied'"
@@ -389,46 +431,85 @@ for rel in json_files:
     assert "./plugins/" not in raw, f"{rel} must not use workspace-relative ./plugins/ paths"
     loaded[rel] = json.loads(raw, object_pairs_hook=no_dups)
 
-# Policy map must not hardcode dynamic resource.ci_status in static_facts
+# Policy map must match GitHub MCP merge_pull_request schema (owner, repo, pullNumber) and not hardcode dynamic resource.ci_status
 pm = loaded["plugins/policy-map.example.json"]
 assert "merge_pull_request" in pm["tools"]
 mpr = pm["tools"]["merge_pull_request"]
+assert mpr.get("resource_id_arg") == "repo"
+assert "owner" in mpr.get("arg_facts", {}) and "pullNumber" in mpr.get("arg_facts", {}), (
+    "policy-map merge_pull_request must map owner and pullNumber"
+)
+assert "pull_number" not in mpr.get("arg_facts", {}), "policy-map must use pullNumber, not pull_number"
 assert "resource.ci_status" not in mpr.get("static_facts", {}), "policy-map must not hardcode dynamic resource.ci_status"
 assert mpr["static_facts"].get("resource.environment") == {"str": "staging"}
 
+root_norm = os.path.normpath(root)
+def assert_safe_outside_path(p, loc):
+    assert p.startswith("/"), f"{loc} must be an absolute outside-workspace path: {p}"
+    assert ".." not in p.split("/"), f"{loc} must not contain '..' traversal: {p}"
+    resolved = os.path.normpath(p)
+    assert resolved.startswith("/path/to/handfest-config/"), (
+        f"{loc} resolved path '{resolved}' must stay under /path/to/handfest-config/"
+    )
+    assert resolved != root_norm and not resolved.startswith(root_norm + "/"), (
+        f"{loc} resolved path '{resolved}' must not point inside workspace '{root_norm}'"
+    )
+
 # Claude Code settings.example.json must separate mcpServers into mcp.example.json, use outside-workspace paths,
-# and scope PreToolUse matcher to explicit non-MCP tools (not '.*')
+# and scope PreToolUse matcher to explicit non-MCP tools (Bash, Write, Edit) while NOT matching MCP tools
 cc_settings = loaded["plugins/claude-code/settings.example.json"]
 assert "mcpServers" not in cc_settings, "mcpServers must live in plugins/claude-code/mcp.example.json"
 pre = cc_settings["hooks"]["PreToolUse"]
 assert len(pre) >= 1
 for entry in pre:
-    assert entry["matcher"] != ".*", "PreToolUse matcher must not be wildcard '.*'"
-    assert re.search(entry["matcher"], "mcp__github-handfest__merge_pull_request") is None, (
-        f"PreToolUse matcher '{entry['matcher']}' must not match MCP tool mcp__github-handfest__merge_pull_request"
+    matcher = entry["matcher"]
+    assert matcher != ".*", "PreToolUse matcher must not be wildcard '.*'"
+    for expected_tool in ("Bash", "Write", "Edit"):
+        assert re.fullmatch(matcher, expected_tool) is not None, (
+            f"PreToolUse matcher '{matcher}' must match '{expected_tool}'"
+        )
+    assert re.search(matcher, "mcp__github-handfest__merge_pull_request") is None, (
+        f"PreToolUse matcher '{matcher}' must not match MCP tool mcp__github-handfest__merge_pull_request"
     )
     for h in entry["hooks"]:
-        assert h["command"].startswith("/"), f"hook command must be an absolute path: {h['command']}"
-        assert h["command"].startswith("/path/to/handfest-config/"), f"hook command must be outside-workspace: {h['command']}"
+        assert_safe_outside_path(h["command"], "settings.example.json hook command")
 
-def assert_all_paths_absolute(node, loc):
+def assert_all_paths_safe(node, loc):
     if isinstance(node, dict):
         for k, v in node.items():
-            assert_all_paths_absolute(v, f"{loc}.{k}")
+            assert_all_paths_safe(v, f"{loc}.{k}")
     elif isinstance(node, list):
         for idx, v in enumerate(node):
-            assert_all_paths_absolute(v, f"{loc}[{idx}]")
+            assert_all_paths_safe(v, f"{loc}[{idx}]")
     elif isinstance(node, str) and ("/" in node or node.endswith(".sh") or node.endswith(".json") or node.endswith(".sqlite")):
-        assert node.startswith("/"), f"{loc} must be an absolute outside-workspace path: {node}"
+        assert_safe_outside_path(node, loc)
 
-assert_all_paths_absolute(cc_settings, "settings.example.json")
+assert_all_paths_safe(cc_settings, "settings.example.json")
+
+def assert_mcp_args_safe(args, loc):
+    assert "--" in args, f"{loc} must separate upstream server command with '--'"
+    proxy_args = args[:args.index("--")]
+    path_flags = {"--chain", "--ledger", "--policy-map"}
+    seen_flags = set()
+    i = 0
+    while i < len(proxy_args):
+        arg = proxy_args[i]
+        assert not arg.startswith("./"), f"{loc} contains relative path {arg}"
+        assert ".." not in arg.split("/"), f"{loc} contains '..' traversal in {arg}"
+        assert "plugins/policy-map.example.json" not in arg, f"{loc} must not point inside repo plugins/"
+        if arg in path_flags:
+            seen_flags.add(arg)
+            assert i + 1 < len(proxy_args), f"{loc} missing value after {arg}"
+            assert_safe_outside_path(proxy_args[i + 1], f"{loc} {arg}")
+            i += 2
+            continue
+        i += 1
+    assert seen_flags == path_flags, f"{loc} must include {sorted(path_flags)}, got {sorted(seen_flags)}"
 
 for mcp_rel in ("plugins/claude-code/mcp.example.json", "plugins/dsh/mcp.example.json", "plugins/agy/mcp.example.json"):
     srv = loaded[mcp_rel]["mcpServers"]["github-handfest"]
     assert srv["command"] == "handfest-mcp"
-    for arg in srv["args"]:
-        assert not arg.startswith("./"), f"{mcp_rel} contains relative path {arg}"
-        assert "plugins/policy-map.example.json" not in arg, f"{mcp_rel} must not point inside repo plugins/"
+    assert_mcp_args_safe(srv["args"], mcp_rel)
 
 try:
     import tomllib
@@ -439,9 +520,7 @@ if tomllib is not None:
     with open(os.path.join(root, "plugins/codex/config.example.toml"), "rb") as fh:
         cfg = tomllib.load(fh)
     assert "mcp_servers" in cfg and "github_handfest" in cfg["mcp_servers"]
-    for arg in cfg["mcp_servers"]["github_handfest"]["args"]:
-        assert not arg.startswith("./")
-        assert "plugins/policy-map.example.json" not in arg
+    assert_mcp_args_safe(cfg["mcp_servers"]["github_handfest"]["args"], "plugins/codex/config.example.toml")
 PY_CFG
 pass "All declarative JSON/TOML plugin example configs parsed cleanly and upheld security invariants"
 
@@ -489,7 +568,7 @@ PAY_MAP_EOF
 PAY_LEDGER="$TMP_DIR/pay-ledger.sqlite"
 HOOK_RC=0
 rm -f "$CAPTURED_FACTS"
-HANDFEST_BIN="$CAPTURE_SHIM" HANDFEST_POLICY_MAP="$PAY_MAP" HANDFEST_LEDGER="$PAY_LEDGER" HANDFEST_CHAIN="$PAY_SIGNED" \
+HANDFEST_ALLOW_CREATE_LEDGER=1 HANDFEST_BIN="$CAPTURE_SHIM" HANDFEST_POLICY_MAP="$PAY_MAP" HANDFEST_LEDGER="$PAY_LEDGER" HANDFEST_CHAIN="$PAY_SIGNED" \
   "$HOOK" <<<'{"tool_name":"charge_card","tool_input":{"currency":"USD","approved":true,"scheduled_at":"2026-11-24T18:30:00Z","amount":15}}' \
   >"$TMP_DIR/stdout.txt" 2>"$TMP_DIR/stderr.txt" || HOOK_RC=$?
 assert_eq "decimal int-15 permit rc" "$HOOK_RC" "0"
@@ -506,7 +585,13 @@ for amt_json in '0' '"1.0000000000000000000"' '"0.0000000000000000000000000001"'
     >"$TMP_DIR/stdout.txt" 2>"$TMP_DIR/stderr.txt" || HOOK_RC=$?
   assert_eq "decimal norm $amt_json rc" "$HOOK_RC" "0"
   assert_json "decimal norm $amt_json stdout" "$(cat "$TMP_DIR/stdout.txt")" "d['verdict'] == 'permit'"
-  if [[ "$amt_json" == *"$LONG_ZEROS"* ]]; then
+  if [[ "$amt_json" == "0" ]]; then
+    assert_json "decimal zero formatted" "$(cat "$CAPTURED_FACTS")" "d['resource.amount'] == {'decimal': '0.0'}"
+  elif [[ "$amt_json" == '"1.0000000000000000000"' ]]; then
+    assert_json "decimal trailing zeros formatted" "$(cat "$CAPTURED_FACTS")" "d['resource.amount'] == {'decimal': '1.0'}"
+  elif [[ "$amt_json" == '"0.0000000000000000000000000001"' ]]; then
+    assert_json "decimal scale 28 formatted" "$(cat "$CAPTURED_FACTS")" "d['resource.amount'] == {'decimal': '0.0000000000000000000000000001'}"
+  elif [[ "$amt_json" == *"$LONG_ZEROS"* ]]; then
     assert_json "decimal long trailing zeros formatted" "$(cat "$CAPTURED_FACTS")" "d['resource.amount'] == {'decimal': '1.0'}"
   fi
 done
@@ -650,7 +735,7 @@ cat <<'BAD_TYPE_EOF' >"$BAD_TYPE_MAP"
       "resource_kind": "repo",
       "resource_id_arg": "repo",
       "arg_facts": {
-        "pull_number": { "field": "resource.pr", "type": "INT" }
+        "pullNumber": { "field": "resource.pr", "type": "INT" }
       }
     }
   }
@@ -684,8 +769,8 @@ HYPHEN_SIGNED="$TMP_DIR/hyphen.signed.json"
 
 HYPHEN_LEDGER="$TMP_DIR/hyphen-ledger.sqlite"
 HOOK_RC=0
-HANDFEST_LEDGER="$HYPHEN_LEDGER" HANDFEST_CHAIN="$HYPHEN_SIGNED" \
-  "$HOOK" <<<'{"hook_event_name":"PreToolUse","tool_name":"merge_pull_request","tool_input":{"owner":"feedback-loop-ai","repo":"-repo","pull_number":1}}' \
+HANDFEST_ALLOW_CREATE_LEDGER=1 HANDFEST_LEDGER="$HYPHEN_LEDGER" HANDFEST_CHAIN="$HYPHEN_SIGNED" \
+  "$HOOK" <<<'{"hook_event_name":"PreToolUse","tool_name":"merge_pull_request","tool_input":{"owner":"feedback-loop-ai","repo":"-repo","pullNumber":1}}' \
   >"$TMP_DIR/stdout.txt" 2>"$TMP_DIR/stderr.txt" || HOOK_RC=$?
 assert_eq "hyphen resource_id rc" "$HOOK_RC" "0"
 assert_json "hyphen resource_id stdout" "$(cat "$TMP_DIR/stdout.txt")" "d['verdict'] == 'permit' and d['receipt_hash'].startswith('sha256:')"
@@ -709,7 +794,7 @@ pass "stderr OSError/ENOSPC (2>/dev/full) failed closed with exit 2 in both Pyth
 # Place raw 0xff inside an otherwise valid permitted payload/policy so errors="replace" would pass instead of denying
 HOOK_RC=0
 UTF8_LEDGER="$TMP_DIR/utf8-ledger.sqlite"
-printf '{"tool_name":"merge_pull_request","tool_input":{"owner":"feedback-loop-ai","repo":"handfest","pull_number":10,"note":"bad\xff"}}' \
+printf '{"tool_name":"merge_pull_request","tool_input":{"owner":"feedback-loop-ai","repo":"handfest","pullNumber":10,"note":"bad\xff"}}' \
   | HANDFEST_LEDGER="$UTF8_LEDGER" "$HOOK" >"$TMP_DIR/stdout.txt" 2>"$TMP_DIR/stderr.txt" || HOOK_RC=$?
 assert_eq "invalid utf8 stdin rc" "$HOOK_RC" "2"
 assert_json "invalid utf8 stdin stderr" "$(cat "$TMP_DIR/stderr.txt")" "d['verdict'] == 'deny' and d['code'] == 'invalid_input'"
@@ -722,39 +807,39 @@ assert_eq "invalid utf8 policy map rc" "$HOOK_RC" "2"
 assert_json "invalid utf8 policy map stderr" "$(cat "$TMP_DIR/stderr.txt")" "d['verdict'] == 'deny' and d['code'] == 'invalid_policy_map'"
 
 # Lone UTF-16 surrogate in tool_name
-run_hook '{"tool_name":"merge_\ud800","tool_input":{"owner":"feedback-loop-ai","repo":"handfest","pull_number":10}}'
+run_hook '{"tool_name":"merge_\ud800","tool_input":{"owner":"feedback-loop-ai","repo":"handfest","pullNumber":10}}'
 assert_eq "surrogate tool_name rc" "$HOOK_RC" "2"
 assert_json "surrogate tool_name stderr" "$HOOK_ERR" "d['verdict'] == 'deny' and d['code'] == 'invalid_input'"
 
 # Lone UTF-16 surrogate in tool_input (both mapped and unmapped nested string)
-run_hook '{"tool_name":"merge_pull_request","tool_input":{"owner":"feedback-loop-ai","repo":"handfest\ud800","pull_number":10}}'
+run_hook '{"tool_name":"merge_pull_request","tool_input":{"owner":"feedback-loop-ai","repo":"handfest\ud800","pullNumber":10}}'
 assert_eq "surrogate tool_input mapped rc" "$HOOK_RC" "2"
 assert_json "surrogate tool_input mapped stderr" "$HOOK_ERR" "d['verdict'] == 'deny' and d['code'] == 'invalid_input'"
 
-run_hook '{"tool_name":"merge_pull_request","tool_input":{"owner":"feedback-loop-ai","repo":"handfest","pull_number":10,"extra":["ok","bad\ud800"]}}'
+run_hook '{"tool_name":"merge_pull_request","tool_input":{"owner":"feedback-loop-ai","repo":"handfest","pullNumber":10,"extra":["ok","bad\ud800"]}}'
 assert_eq "surrogate tool_input nested rc" "$HOOK_RC" "2"
 assert_json "surrogate tool_input nested stderr" "$HOOK_ERR" "d['verdict'] == 'deny' and d['code'] == 'invalid_input'"
 
 # Nested case-colliding keys and nested non-ASCII key inside array
-run_hook '{"tool_name":"merge_pull_request","tool_input":{"owner":"feedback-loop-ai","repo":"handfest","pull_number":10,"extra":{"force":false,"Force":true}}}'
+run_hook '{"tool_name":"merge_pull_request","tool_input":{"owner":"feedback-loop-ai","repo":"handfest","pullNumber":10,"extra":{"force":false,"Force":true}}}'
 assert_eq "nested case collision rc" "$HOOK_RC" "2"
 assert_json "nested case collision stderr" "$HOOK_ERR" "d['verdict'] == 'deny' and d['code'] == 'invalid_input'"
 
-run_hook '{"tool_name":"merge_pull_request","tool_input":{"owner":"feedback-loop-ai","repo":"handfest","pull_number":10,"items":[{"caf\u00e9":1}]}}'
+run_hook '{"tool_name":"merge_pull_request","tool_input":{"owner":"feedback-loop-ai","repo":"handfest","pullNumber":10,"items":[{"caf\u00e9":1}]}}'
 assert_eq "nested non-ascii key rc" "$HOOK_RC" "2"
 assert_json "nested non-ascii key stderr" "$HOOK_ERR" "d['verdict'] == 'deny' and d['code'] == 'invalid_input'"
 pass "Strict UTF-8, lone UTF-16 surrogates, and recursive nested key checks all failed closed (exit 2)"
 
 # Test 26: Binding boundary tests (i64 overflow, NUL control char, NaN JSON constant)
-run_hook '{"tool_name":"merge_pull_request","tool_input":{"owner":"feedback-loop-ai","repo":"handfest","pull_number":9223372036854775808}}'
+run_hook '{"tool_name":"merge_pull_request","tool_input":{"owner":"feedback-loop-ai","repo":"handfest","pullNumber":9223372036854775808}}'
 assert_eq "i64 overflow rc" "$HOOK_RC" "2"
 assert_json "i64 overflow stderr" "$HOOK_ERR" "d['verdict'] == 'deny' and d['code'] == 'invalid_argument'"
 
-run_hook '{"tool_name":"merge_pull_request","tool_input":{"owner":"feedback-loop-ai","repo":"handfest\u0000","pull_number":10}}'
+run_hook '{"tool_name":"merge_pull_request","tool_input":{"owner":"feedback-loop-ai","repo":"handfest\u0000","pullNumber":10}}'
 assert_eq "nul control char rc" "$HOOK_RC" "2"
 assert_json "nul control char stderr" "$HOOK_ERR" "d['verdict'] == 'deny' and d['code'] == 'invalid_argument'"
 
-run_hook '{"tool_name":"merge_pull_request","tool_input":{"owner":"feedback-loop-ai","repo":"handfest","pull_number":NaN}}'
+run_hook '{"tool_name":"merge_pull_request","tool_input":{"owner":"feedback-loop-ai","repo":"handfest","pullNumber":NaN}}'
 assert_eq "NaN json constant rc" "$HOOK_RC" "2"
 assert_json "NaN json constant stderr" "$HOOK_ERR" "d['verdict'] == 'deny' and d['code'] == 'invalid_input'"
 pass "i64 overflow, NUL control char, and NaN JSON constant all failed closed (exit 2)"
@@ -785,11 +870,134 @@ PY_SKILL
     --valid-from 2026-11-24T17:00:00Z --valid-until 2026-11-25T01:00:00Z --out "$SKILL_SIGNED" >/dev/null
   SKILL_LEDGER="$SKILL_HF.ledger.sqlite"
   HOOK_RC=0
-  HANDFEST_LEDGER="$SKILL_LEDGER" HANDFEST_CHAIN="$SKILL_SIGNED" \
+  HANDFEST_ALLOW_CREATE_LEDGER=1 HANDFEST_LEDGER="$SKILL_LEDGER" HANDFEST_CHAIN="$SKILL_SIGNED" \
     "$HOOK" <<<"$VALID_PAYLOAD" >"$TMP_DIR/stdout.txt" 2>"$TMP_DIR/stderr.txt" || HOOK_RC=$?
   assert_eq "skill example $skill_rel permit rc" "$HOOK_RC" "0"
   assert_json "skill example $skill_rel permit stdout" "$(cat "$TMP_DIR/stdout.txt")" "d['verdict'] == 'permit' and d['receipt_hash'].startswith('sha256:')"
 done
 pass "Example mandates in claude-code/SKILL.md and agy/SKILL.md aligned with policy-map.example.json and permitted the example call"
+
+# Test 28: Missing/deleted HANDFEST_LEDGER fails closed (missing_ledger) and prevents quota reset
+DEL_LEDGER="$TMP_DIR/deleted-ledger.sqlite"
+HOOK_RC=0
+HANDFEST_LEDGER="$DEL_LEDGER" "$HOOK" <<<"$VALID_PAYLOAD" >"$TMP_DIR/stdout.txt" 2>"$TMP_DIR/stderr.txt" || HOOK_RC=$?
+assert_eq "absent ledger rc" "$HOOK_RC" "2"
+assert_strict_rfc8259_json_line "absent ledger stderr" "$TMP_DIR/stderr.txt" "d['verdict'] == 'deny' and d['code'] == 'missing_ledger'"
+if [[ -e "$DEL_LEDGER" ]]; then
+  echo "FAIL [absent ledger created]: $DEL_LEDGER should not have been created" >&2
+  exit 1
+fi
+
+HOOK_RC=0
+HANDFEST_LEDGER="$DEL_LEDGER" HANDFEST_ALLOW_CREATE_LEDGER="yes" "$HOOK" <<<"$VALID_PAYLOAD" >"$TMP_DIR/stdout.txt" 2>"$TMP_DIR/stderr.txt" || HOOK_RC=$?
+assert_eq "invalid allow_create_ledger rc" "$HOOK_RC" "2"
+assert_strict_rfc8259_json_line "invalid allow_create_ledger stderr" "$TMP_DIR/stderr.txt" "d['verdict'] == 'deny' and d['code'] == 'missing_config'"
+
+# Exhaust LIMIT 2 calls mandate, delete ledger, re-run -> MUST exit 2 (missing_ledger), NOT reset quota to Permit
+HOOK_RC=0
+HANDFEST_LEDGER="$DEL_LEDGER" HANDFEST_ALLOW_CREATE_LEDGER=1 "$HOOK" <<<"$VALID_PAYLOAD" >"$TMP_DIR/stdout.txt" 2>"$TMP_DIR/stderr.txt" || HOOK_RC=$?
+assert_eq "quota-reset call 1 rc" "$HOOK_RC" "0"
+assert_strict_rfc8259_json_line "quota-reset call 1 stdout" "$TMP_DIR/stdout.txt" "d['verdict'] == 'permit'"
+
+HOOK_RC=0
+HANDFEST_LEDGER="$DEL_LEDGER" "$HOOK" <<<"$VALID_PAYLOAD" >"$TMP_DIR/stdout.txt" 2>"$TMP_DIR/stderr.txt" || HOOK_RC=$?
+assert_eq "quota-reset call 2 rc" "$HOOK_RC" "0"
+assert_strict_rfc8259_json_line "quota-reset call 2 stdout" "$TMP_DIR/stdout.txt" "d['verdict'] == 'permit'"
+
+HOOK_RC=0
+HANDFEST_LEDGER="$DEL_LEDGER" "$HOOK" <<<"$VALID_PAYLOAD" >"$TMP_DIR/stdout.txt" 2>"$TMP_DIR/stderr.txt" || HOOK_RC=$?
+assert_eq "quota-reset call 3 exhausted rc" "$HOOK_RC" "2"
+assert_strict_rfc8259_json_line "quota-reset call 3 exhausted stderr" "$TMP_DIR/stderr.txt" "d['verdict'] == 'deny' and d['code'] == 'mandate_denied' and 'quota' in d['reason'].lower()"
+
+rm -f "$DEL_LEDGER"
+HOOK_RC=0
+HANDFEST_LEDGER="$DEL_LEDGER" "$HOOK" <<<"$VALID_PAYLOAD" >"$TMP_DIR/stdout.txt" 2>"$TMP_DIR/stderr.txt" || HOOK_RC=$?
+assert_eq "deleted ledger re-run rc" "$HOOK_RC" "2"
+assert_strict_rfc8259_json_line "deleted ledger re-run stderr" "$TMP_DIR/stderr.txt" "d['verdict'] == 'deny' and d['code'] == 'missing_ledger'"
+if [[ -e "$DEL_LEDGER" ]]; then
+  echo "FAIL [deleted ledger recreated]: $DEL_LEDGER must not be recreated after deletion" >&2
+  exit 1
+fi
+pass "Missing/deleted HANDFEST_LEDGER failed closed with missing_ledger (exit 2) and blocked quota reset"
+
+# Test 29: Closed stderr pipe (EPIPE), closed fd 2>&-, stdout >/dev/full, and python3-only PATH (no cat)
+python3 -I - "$HOOK" "$EMPTY_BIN" "$(command -v bash)" <<'PY_EPIPE'
+import os, subprocess, sys
+hook, empty_bin, bash_bin = sys.argv[1:]
+payload = b'{"hook_event_name":"PreToolUse","tool_name":"Bash","tool_input":{"command":"id"}}'
+
+def run_with_epipe(cmd, env=None):
+    r, w = os.pipe()
+    os.close(r)
+    try:
+        proc = subprocess.run(cmd, input=payload, stdout=subprocess.PIPE, stderr=w, env=env)
+    finally:
+        os.close(w)
+    return proc
+
+p1 = run_with_epipe([hook])
+assert p1.returncode == 2, f"Python deny EPIPE expected rc 2, got {p1.returncode}"
+assert p1.stdout == b"", f"Python deny EPIPE expected empty stdout, got {p1.stdout!r}"
+
+env_no_py = dict(os.environ)
+env_no_py["PATH"] = empty_bin
+p2 = run_with_epipe([bash_bin, hook], env=env_no_py)
+assert p2.returncode == 2, f"Bash fallback EPIPE expected rc 2, got {p2.returncode}"
+assert p2.stdout == b"", f"Bash fallback EPIPE expected empty stdout, got {p2.stdout!r}"
+PY_EPIPE
+
+HOOK_RC=0
+printf '%s' '{"hook_event_name":"PreToolUse","tool_name":"Bash","tool_input":{"command":"id"}}' \
+  | "$HOOK" >"$TMP_DIR/stdout.txt" 2>&- || HOOK_RC=$?
+assert_eq "closed fd 2>&- python deny rc" "$HOOK_RC" "2"
+assert_eq "closed fd 2>&- python deny stdout" "$(cat "$TMP_DIR/stdout.txt")" ""
+
+HOOK_RC=0
+printf '%s' '{"hook_event_name":"PreToolUse","tool_name":"Bash","tool_input":{"command":"id"}}' \
+  | env PATH="$EMPTY_BIN" "$(command -v bash)" "$HOOK" >"$TMP_DIR/stdout.txt" 2>&- || HOOK_RC=$?
+assert_eq "closed fd 2>&- bash fallback rc" "$HOOK_RC" "2"
+assert_eq "closed fd 2>&- bash fallback stdout" "$(cat "$TMP_DIR/stdout.txt")" ""
+
+FULL_LEDGER="$TMP_DIR/stdout-full-ledger.sqlite"
+HOOK_RC=0
+HANDFEST_LEDGER="$FULL_LEDGER" HANDFEST_ALLOW_CREATE_LEDGER=1 "$HOOK" <<<"$VALID_PAYLOAD" >/dev/full 2>"$TMP_DIR/stderr.txt" || HOOK_RC=$?
+assert_eq "stdout /dev/full permit rc" "$HOOK_RC" "2"
+assert_strict_rfc8259_json_line "stdout /dev/full permit stderr" "$TMP_DIR/stderr.txt" "d['verdict'] == 'deny' and d['code'] == 'internal_error'"
+
+PY_ONLY_BIN="$TMP_DIR/py-only-bin"
+mkdir -p "$PY_ONLY_BIN"
+ln -s "$(command -v python3)" "$PY_ONLY_BIN/python3"
+
+HOOK_RC=0
+printf '%s' '{"hook_event_name":"PreToolUse","tool_name":"Bash","tool_input":{"command":"id"}}' \
+  | env PATH="$PY_ONLY_BIN" "$(command -v bash)" "$HOOK" >"$TMP_DIR/stdout.txt" 2>"$TMP_DIR/stderr.txt" || HOOK_RC=$?
+assert_eq "py-only PATH deny rc" "$HOOK_RC" "2"
+assert_strict_rfc8259_json_line "py-only PATH deny stderr" "$TMP_DIR/stderr.txt" "d['verdict'] == 'deny' and d['code'] == 'unmapped_tool'"
+
+PY_ONLY_LEDGER="$TMP_DIR/py-only-ledger.sqlite"
+HOOK_RC=0
+printf '%s' "$VALID_PAYLOAD" \
+  | env PATH="$PY_ONLY_BIN" HANDFEST_LEDGER="$PY_ONLY_LEDGER" HANDFEST_ALLOW_CREATE_LEDGER=1 "$(command -v bash)" "$HOOK" >"$TMP_DIR/stdout.txt" 2>"$TMP_DIR/stderr.txt" || HOOK_RC=$?
+assert_eq "py-only PATH permit rc" "$HOOK_RC" "0"
+assert_strict_rfc8259_json_line "py-only PATH permit stdout" "$TMP_DIR/stdout.txt" "d['verdict'] == 'permit' and d['receipt_hash'].startswith('sha256:')"
+pass "Closed stderr pipe (EPIPE), closed fd 2>&-, stdout >/dev/full, and python3-only PATH all behaved deterministically with single-line JSON"
+
+# Test 30: Strict os.environb UTF-8 validation & lone UTF-16 surrogate inside top-level JSON key
+HOOK_RC=0
+HANDFEST_NOW=$'2026-11-24T18:30:00Z\xff' "$HOOK" <<<"$VALID_PAYLOAD" >"$TMP_DIR/stdout.txt" 2>"$TMP_DIR/stderr.txt" || HOOK_RC=$?
+assert_eq "non-utf8 HANDFEST_NOW rc" "$HOOK_RC" "2"
+assert_strict_rfc8259_json_line "non-utf8 HANDFEST_NOW stderr" "$TMP_DIR/stderr.txt" "d['verdict'] == 'deny' and d['code'] == 'missing_config' and 'UTF-8' in d['reason'] and '\ufffd' not in d['reason']"
+
+for env_var in HANDFEST_POLICY_MAP HANDFEST_LEDGER HANDFEST_CHAIN HANDFEST_ACTOR_KEY HANDFEST_BIN HANDFEST_ALLOW_CREATE_LEDGER; do
+  HOOK_RC=0
+  env "${env_var}="$'bad\xffval' "$HOOK" <<<"$VALID_PAYLOAD" >"$TMP_DIR/stdout.txt" 2>"$TMP_DIR/stderr.txt" || HOOK_RC=$?
+  assert_eq "non-utf8 $env_var rc" "$HOOK_RC" "2"
+  assert_strict_rfc8259_json_line "non-utf8 $env_var stderr" "$TMP_DIR/stderr.txt" "d['verdict'] == 'deny' and d['code'] == 'missing_config' and 'UTF-8' in d['reason'] and '\ufffd' not in d['reason']"
+done
+
+run_hook '{"tool_name":"merge_pull_request","tool_input":{"owner":"feedback-loop-ai","repo":"handfest","pullNumber":10},"bad\ud800key":1}'
+assert_eq "surrogate top-level key rc" "$HOOK_RC" "2"
+assert_strict_rfc8259_json_line "surrogate top-level key stderr" "$TMP_DIR/stderr.txt" "d['verdict'] == 'deny' and d['code'] == 'invalid_input' and 'key' in d['reason'].lower()"
+pass "Non-UTF-8 HANDFEST_* env vars (zero lone surrogates in RFC 8259 JSON) and lone surrogate in top-level JSON key all failed closed (exit 2)"
 
 echo "ALL $PASS_COUNT HOOK & PLUGIN TESTS PASSED."

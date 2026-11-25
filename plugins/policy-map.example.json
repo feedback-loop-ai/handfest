@@ -9,7 +9,7 @@
           "field": "resource.owner",
           "type": "str"
         },
-        "pull_number": {
+        "pullNumber": {
           "field": "resource.pr",
           "type": "int"
         }

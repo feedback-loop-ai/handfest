@@ -8,13 +8,17 @@
 #   HANDFEST_ACTOR_KEY   Concrete requesting actor KeyId (e.g. ed25519:<64-hex>)
 #
 # Optional env:
-#   HANDFEST_BIN         Path or command name for `handfest` CLI (default: handfest)
-#   HANDFEST_NOW         Fixed RFC 3339 UTC timestamp (defaults to host UTC clock)
+#   HANDFEST_BIN                  Path or command name for `handfest` CLI (default: handfest)
+#   HANDFEST_NOW                  Fixed RFC 3339 UTC timestamp (defaults to host UTC clock)
+#   HANDFEST_ALLOW_CREATE_LEDGER  Set to "1" only during initial setup to allow creating a missing ledger file
+#
+# Requirements: bash, python3 (3.10+, standard library only)
 #
 # Exit codes:
 #   0  ONLY when `handfest check` returns Permit with a valid sha256 receipt_hash
 #   2  All denials, unmapped tools, malformed inputs, and config/runtime errors (fail closed)
 
+trap '' PIPE
 set -euo pipefail
 
 if ! command -v python3 >/dev/null 2>&1; then
@@ -22,8 +26,8 @@ if ! command -v python3 >/dev/null 2>&1; then
   exit 2
 fi
 
-PY_CODE="$(cat <<'PY'
-import datetime, json, os, re, shutil, subprocess, sys, unicodedata
+IFS= read -r -d '' PY_CODE <<'PY' || true
+import datetime, json, os, re, shutil, subprocess, unicodedata
 
 IDENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_-]*\Z", re.ASCII)
 RFC3339_RE = re.compile(r"^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})Z\Z", re.ASCII)
@@ -53,25 +57,43 @@ class HookError(Exception):
         self.code, self.reason, self.receipt_hash = code, reason, receipt_hash
 
 
+def sanitize_surrogates(s: str) -> str:
+    if has_surrogate(s):
+        return s.encode("utf-8", errors="replace").decode("utf-8")
+    return s
+
+
+def write_all(fd: int, data: bytes) -> None:
+    view = memoryview(data)
+    written = 0
+    while written < len(view):
+        n = os.write(fd, view[written:])
+        if n <= 0:
+            raise OSError(f"short write on fd {fd}")
+        written += n
+
+
 def emit_deny(code: str, reason: str, receipt_hash: str | None = None) -> None:
+    safe_code = sanitize_surrogates(code)
+    safe_reason = sanitize_surrogates(reason)
     out = {
         "hookSpecificOutput": {
             "hookEventName": "PreToolUse",
             "permissionDecision": "deny",
-            "permissionDecisionReason": f"handfest {code}: {reason}",
+            "permissionDecisionReason": f"handfest {safe_code}: {safe_reason}",
         },
         "verdict": "deny",
-        "code": code,
-        "reason": reason,
+        "code": safe_code,
+        "reason": safe_reason,
     }
     if receipt_hash is not None:
-        out["receipt_hash"] = receipt_hash
+        out["receipt_hash"] = sanitize_surrogates(receipt_hash)
+    payload = (json.dumps(out, separators=(",", ":"), allow_nan=False) + "\n").encode("utf-8", errors="strict")
     try:
-        sys.stderr.write(json.dumps(out, separators=(",", ":")) + "\n")
-        sys.stderr.flush()
+        write_all(2, payload)
     except OSError:
         pass
-    sys.exit(2)
+    os._exit(2)
 
 
 def emit_permit(receipt_hash: str) -> None:
@@ -80,9 +102,12 @@ def emit_permit(receipt_hash: str) -> None:
         "verdict": "permit",
         "receipt_hash": receipt_hash,
     }
-    sys.stdout.write(json.dumps(out, separators=(",", ":")) + "\n")
-    sys.stdout.flush()
-    sys.exit(0)
+    payload = (json.dumps(out, separators=(",", ":"), allow_nan=False) + "\n").encode("utf-8", errors="strict")
+    try:
+        write_all(1, payload)
+    except OSError as exc:
+        emit_deny("internal_error", f"failed to write permit output to stdout: {exc}")
+    os._exit(0)
 
 
 def is_ident(s: str) -> bool:
@@ -369,15 +394,25 @@ def parse_arg_scalar(tool: str, arg: str, expected: str, val) -> dict:
     )
 
 
+def get_env_strict(name: str) -> str | None:
+    raw = os.environb.get(name.encode("ascii"))
+    if raw is None:
+        return None
+    try:
+        return raw.decode("utf-8", errors="strict")
+    except UnicodeDecodeError as exc:
+        raise HookError("missing_config", f"environment variable {name} is not valid UTF-8: {exc}")
+
+
 def require_env(name: str) -> str:
-    val = os.environ.get(name, "")
+    val = get_env_strict(name)
     if not val:
         raise HookError("missing_config", f"required environment variable {name} is not set")
     return val
 
 
 def resolve_bin() -> str:
-    raw = os.environ.get("HANDFEST_BIN", "").strip() or "handfest"
+    raw = (get_env_strict("HANDFEST_BIN") or "").strip() or "handfest"
     if "/" in raw:
         if os.path.isfile(raw) and os.access(raw, os.X_OK):
             return raw
@@ -399,12 +434,21 @@ def resolve_chain(raw_chain: str) -> list[str]:
 
 
 def resolve_now() -> str:
-    override = os.environ.get("HANDFEST_NOW", "")
+    override = get_env_strict("HANDFEST_NOW")
     if override:
         if not is_rfc3339_utc(override):
             raise HookError("missing_config", f"invalid HANDFEST_NOW '{override}': expected RFC 3339 UTC")
         return override
     return datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def resolve_allow_create_ledger() -> bool:
+    raw = get_env_strict("HANDFEST_ALLOW_CREATE_LEDGER")
+    if raw is None or raw in ("", "0"):
+        return False
+    if raw == "1":
+        return True
+    raise HookError("missing_config", f"invalid HANDFEST_ALLOW_CREATE_LEDGER '{raw}': expected '0' or '1'")
 
 
 def validate_tool_input_keys(tool: str, root: dict) -> None:
@@ -425,9 +469,18 @@ def validate_tool_input_keys(tool: str, root: dict) -> None:
             stack.extend(cur)
 
 
+def read_stdin_bytes() -> bytes:
+    chunks = []
+    while True:
+        chunk = os.read(0, 65536)
+        if not chunk:
+            return b"".join(chunks)
+        chunks.append(chunk)
+
+
 def parse_stdin() -> tuple[str, dict]:
     try:
-        raw_bytes = sys.stdin.buffer.read()
+        raw_bytes = read_stdin_bytes()
     except OSError as exc:
         raise HookError("invalid_input", f"failed to read hook stdin: {exc}")
     try:
@@ -529,6 +582,7 @@ def main() -> None:
     handfest_bin = resolve_bin()
     chain_paths = resolve_chain(chain_raw)
     now_utc = resolve_now()
+    allow_create_ledger = resolve_allow_create_ledger()
     policy_map = load_policy_map(policy_path)
     tool_name, tool_input = parse_stdin()
 
@@ -537,6 +591,12 @@ def main() -> None:
         raise HookError("unmapped_tool", f"tool '{tool_name}' is not admitted in HANDFEST_POLICY_MAP")
 
     resource_id, facts = extract_resource_and_facts(tool_name, tool_input, pol)
+
+    if not allow_create_ledger and not os.path.isfile(ledger_path):
+        raise HookError(
+            "missing_ledger",
+            f"ledger file does not exist: '{ledger_path}' (set HANDFEST_ALLOW_CREATE_LEDGER=1 only during initial setup)",
+        )
 
     cmd = [
         handfest_bin, "check",
@@ -561,10 +621,9 @@ try:
     main()
 except HookError as err:
     emit_deny(err.code, err.reason, receipt_hash=err.receipt_hash)
-except Exception as exc:
+except BaseException as exc:
     emit_deny("internal_error", f"unexpected hook error: {exc}")
 PY
-)"
 
 rc=0
 python3 -I -c "$PY_CODE" || rc=$?

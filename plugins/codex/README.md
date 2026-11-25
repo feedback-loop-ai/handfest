@@ -13,7 +13,7 @@ This plugin configures OpenAI Codex to route MCP tool calls through `handfest-mc
 
 ## Setup
 
-1. Ensure `handfest` (`crates/handfest-cli` on `main`) and `handfest-mcp` (`crates/handfest-mcp`) are on your `PATH`.
+1. Ensure `handfest` (`crates/handfest-cli` on `main`) and `handfest-mcp` (planned `crates/handfest-mcp`, not yet shipped in this workspace) are on your `PATH`.
 2. Out-of-band (human terminal), generate keys and sign a mandate:
    ```bash
    handfest keygen --out ~/.handfest/human.key.json
