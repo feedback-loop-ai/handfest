@@ -6,20 +6,19 @@ use std::io::{BufRead, Write};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use handfest_anchors::{verify_chain, AnchorError, SignedMandate};
-use handfest_core::ast::KeyId;
+use handfest_core::ast::{is_valid_quoted_str, KeyId};
 use handfest_core::gate::{ActionRequest, VerifiedFacts, VerifiedMandate};
 use handfest_core::lattice::subsumes;
 use handfest_core::Verdict;
 use handfest_ledger::{LedgerError, SqliteLedger};
-use serde_json::{json, Value};
 
 use crate::exact_json::{parse_exact_json, ExactJson};
 use crate::framing::{
-    extract_request_id, forward_and_read_response, read_bounded_line, write_denied_response,
-    write_jsonrpc_error, write_raw_line, JsonRpcId, LineReadError, ProxyIo, JSONRPC_INTERNAL_ERROR,
-    JSONRPC_INVALID_REQUEST, JSONRPC_PARSE_ERROR,
+    extract_request_id, fail_upstream_protocol, forward_and_read_response, read_bounded_line,
+    write_denied_response, write_jsonrpc_error, write_raw_line, JsonRpcId, LineReadError, ProxyIo,
+    JSONRPC_INTERNAL_ERROR, JSONRPC_INVALID_REQUEST, JSONRPC_PARSE_ERROR,
 };
-use crate::mapping::{MappingError, ToolPolicyMap};
+use crate::mapping::{MappingError, ToolPolicy, ToolPolicyMap};
 
 /// Default maximum JSON-RPC line length in bytes (1 MiB).
 pub const DEFAULT_MAX_LINE_BYTES: usize = 1024 * 1024;
@@ -299,6 +298,16 @@ impl<C: Clock> McpProxy<C> {
                         max_bytes: self.max_line_bytes,
                     });
                 }
+                Err(LineReadError::BareCr) => {
+                    write_jsonrpc_error(
+                        io.client_out,
+                        None,
+                        JSONRPC_PARSE_ERROR,
+                        "bare carriage return (0x0D) is not permitted in JSON-RPC stdio frame",
+                        None,
+                    )?;
+                    continue;
+                }
                 Err(LineReadError::InvalidUtf8) => {
                     write_jsonrpc_error(
                         io.client_out,
@@ -367,34 +376,29 @@ impl<C: Clock> McpProxy<C> {
         };
 
         if obj.get("jsonrpc").and_then(ExactJson::as_str) != Some("2.0") {
-            if let Some(req_id) = id.as_ref() {
-                write_jsonrpc_error(
-                    io.client_out,
-                    Some(req_id),
-                    JSONRPC_INVALID_REQUEST,
-                    "jsonrpc version must be \"2.0\"",
-                    None,
-                )?;
-            }
-            return Ok(());
+            return write_jsonrpc_error(
+                io.client_out,
+                id.as_ref(),
+                JSONRPC_INVALID_REQUEST,
+                "jsonrpc version must be \"2.0\"",
+                None,
+            );
         }
 
         let Some(method) = obj.get("method").and_then(ExactJson::as_str) else {
-            if let Some(req_id) = id.as_ref() {
-                write_jsonrpc_error(
-                    io.client_out,
-                    Some(req_id),
-                    JSONRPC_INVALID_REQUEST,
-                    "missing or non-string JSON-RPC method",
-                    None,
-                )?;
-            }
-            return Ok(());
+            return write_jsonrpc_error(
+                io.client_out,
+                id.as_ref(),
+                JSONRPC_INVALID_REQUEST,
+                "missing or non-string JSON-RPC method",
+                None,
+            );
         };
 
+        let normalized_frame = parsed.to_json_string();
         match id {
-            None => handle_notification(method, raw_frame, io.upstream_in),
-            Some(req_id) => self.handle_request(&req_id, method, obj, raw_frame, io),
+            None => handle_notification(method, &normalized_frame, io.upstream_in),
+            Some(req_id) => self.handle_request(&req_id, method, obj, &normalized_frame, io),
         }
     }
 
@@ -403,7 +407,7 @@ impl<C: Clock> McpProxy<C> {
         req_id: &JsonRpcId,
         method: &str,
         obj: &BTreeMap<String, ExactJson>,
-        raw_frame: &str,
+        normalized_frame: &str,
         io: &mut ProxyIo<'_, CW, UR, UW>,
     ) -> Result<(), ProxyError>
     where
@@ -414,25 +418,32 @@ impl<C: Clock> McpProxy<C> {
         match method {
             "initialize" | "ping" => {
                 let response =
-                    forward_and_read_response(req_id, raw_frame, self.max_line_bytes, io)?;
-                write_raw_line(io.client_out, &response)
+                    forward_and_read_response(req_id, normalized_frame, self.max_line_bytes, io)?;
+                write_raw_line(io.client_out, &ExactJson::Object(response).to_json_string())
             }
-            "tools/list" => self.handle_tools_list(req_id, raw_frame, io),
-            "tools/call" => self.handle_tools_call(req_id, obj, raw_frame, io),
-            other => write_jsonrpc_error(
-                io.client_out,
-                Some(req_id),
-                HANDFEST_DENIED_ERROR_CODE,
-                &format!("handfest denied: method '{other}' is not permitted"),
-                Some(json!({ "reason": format!("method '{other}' is not in proxy allowlist") })),
-            ),
+            "tools/list" => self.handle_tools_list(req_id, normalized_frame, io),
+            "tools/call" => self.handle_tools_call(req_id, obj, normalized_frame, io),
+            other => {
+                let mut data = BTreeMap::new();
+                data.insert(
+                    "reason".to_string(),
+                    ExactJson::Str(format!("method '{other}' is not in proxy allowlist")),
+                );
+                write_jsonrpc_error(
+                    io.client_out,
+                    Some(req_id),
+                    HANDFEST_DENIED_ERROR_CODE,
+                    &format!("handfest denied: method '{other}' is not permitted"),
+                    Some(&ExactJson::Object(data)),
+                )
+            }
         }
     }
 
     fn handle_tools_list<CW, UR, UW>(
         &self,
         req_id: &JsonRpcId,
-        raw_frame: &str,
+        normalized_frame: &str,
         io: &mut ProxyIo<'_, CW, UR, UW>,
     ) -> Result<(), ProxyError>
     where
@@ -440,36 +451,24 @@ impl<C: Clock> McpProxy<C> {
         UR: BufRead,
         UW: Write,
     {
-        let response_line = forward_and_read_response(req_id, raw_frame, self.max_line_bytes, io)?;
-        let mut resp: Value = match serde_json::from_str(&response_line) {
-            Ok(val) => val,
-            Err(err) => {
-                return write_jsonrpc_error(
-                    io.client_out,
-                    Some(req_id),
-                    JSONRPC_INTERNAL_ERROR,
-                    &format!("invalid JSON in upstream tools/list response: {err}"),
-                    None,
-                );
-            }
-        };
+        let mut resp_obj =
+            forward_and_read_response(req_id, normalized_frame, self.max_line_bytes, io)?;
 
-        if resp.get("error").is_some() {
-            return write_raw_line(io.client_out, &response_line);
+        // `forward_and_read_response` already proved `result` XOR valid `error` object.
+        if resp_obj.contains_key("error") {
+            return write_raw_line(io.client_out, &ExactJson::Object(resp_obj).to_json_string());
         }
 
-        let Some(tools) = resp
+        let Some(tools) = resp_obj
             .get_mut("result")
-            .and_then(Value::as_object_mut)
+            .and_then(ExactJson::as_object_mut)
             .and_then(|res| res.get_mut("tools"))
-            .and_then(Value::as_array_mut)
+            .and_then(ExactJson::as_array_mut)
         else {
-            return write_jsonrpc_error(
+            return fail_upstream_protocol(
                 io.client_out,
-                Some(req_id),
-                JSONRPC_INTERNAL_ERROR,
-                "malformed upstream tools/list response: missing result.tools array",
-                None,
+                req_id,
+                "malformed upstream tools/list response: missing result.tools array".to_string(),
             );
         };
 
@@ -477,20 +476,18 @@ impl<C: Clock> McpProxy<C> {
             entry
                 .as_object()
                 .and_then(|obj| obj.get("name"))
-                .and_then(Value::as_str)
+                .and_then(ExactJson::as_str)
                 .is_some_and(|name| self.is_tool_permitted(name))
         });
 
-        let filtered = serde_json::to_string(&resp)
-            .map_err(|err| ProxyError::UpstreamProtocol(err.to_string()))?;
-        write_raw_line(io.client_out, &filtered)
+        write_raw_line(io.client_out, &ExactJson::Object(resp_obj).to_json_string())
     }
 
     fn handle_tools_call<CW, UR, UW>(
         &mut self,
         req_id: &JsonRpcId,
         obj: &BTreeMap<String, ExactJson>,
-        raw_frame: &str,
+        normalized_frame: &str,
         io: &mut ProxyIo<'_, CW, UR, UW>,
     ) -> Result<(), ProxyError>
     where
@@ -502,13 +499,13 @@ impl<C: Clock> McpProxy<C> {
         let (tool_name, arguments) = match extract_tool_call_params(obj) {
             Ok(parts) => parts,
             Err(reason) => {
-                return self.deny_with_synthetic_receipt(
-                    req_id,
-                    "invalid_params",
-                    &reason,
-                    now,
-                    io.client_out,
-                );
+                let denial_req = ActionRequest {
+                    actor_key: self.actor_key.clone(),
+                    action: "mcp.invalid_params".to_string(),
+                    resource_kind: format!("mcp_tool:{reason}"),
+                    resource_id: "invalid_params".to_string(),
+                };
+                return self.record_denial_and_respond(req_id, &denial_req, now, io.client_out);
             }
         };
 
@@ -519,13 +516,14 @@ impl<C: Clock> McpProxy<C> {
             {
                 Ok(mapped) => mapped,
                 Err(err) => {
-                    return self.deny_with_synthetic_receipt(
-                        req_id,
+                    let denial_req = build_mapping_denial_request(
+                        &self.actor_key,
+                        &self.policy_map,
                         tool_name,
-                        &err.to_string(),
-                        now,
-                        io.client_out,
+                        arguments,
+                        &err,
                     );
+                    return self.record_denial_and_respond(req_id, &denial_req, now, io.client_out);
                 }
             };
 
@@ -550,8 +548,8 @@ impl<C: Clock> McpProxy<C> {
         match verdict {
             Verdict::Permit => {
                 let response =
-                    forward_and_read_response(req_id, raw_frame, self.max_line_bytes, io)?;
-                write_raw_line(io.client_out, &response)
+                    forward_and_read_response(req_id, normalized_frame, self.max_line_bytes, io)?;
+                write_raw_line(io.client_out, &ExactJson::Object(response).to_json_string())
             }
             Verdict::Deny { reason } => write_denied_response(
                 io.client_out,
@@ -562,38 +560,30 @@ impl<C: Clock> McpProxy<C> {
         }
     }
 
-    fn deny_with_synthetic_receipt<CW: Write>(
+    fn record_denial_and_respond<CW: Write>(
         &mut self,
         req_id: &JsonRpcId,
-        tool_name: &str,
-        reason: &str,
+        denial_request: &ActionRequest,
         now: i64,
         client_out: &mut CW,
     ) -> Result<(), ProxyError> {
-        // Colon is forbidden in concrete HANDFEST actions, so `gate::authorize` is
-        // guaranteed to return `Verdict::Deny` while still recording a hash-chained receipt.
-        let synthetic_request = ActionRequest {
-            actor_key: self.actor_key.clone(),
-            action: format!("mcp.unmapped:{tool_name}"),
-            resource_kind: "mcp_tool".to_string(),
-            resource_id: tool_name.to_string(),
-        };
         let (verdict, receipt) = self.ledger.evaluate_and_record(
             &self.verified_chain,
-            &synthetic_request,
+            denial_request,
             &VerifiedFacts::new(),
             now,
         )?;
-        debug_assert!(
-            matches!(verdict, Verdict::Deny { .. }),
-            "synthetic unmapped action must always evaluate to Deny"
-        );
-        write_denied_response(
-            client_out,
-            req_id,
-            reason,
-            &receipt.receipt_hash.to_string(),
-        )
+        match verdict {
+            Verdict::Deny { reason } => write_denied_response(
+                client_out,
+                req_id,
+                &reason,
+                &receipt.receipt_hash.to_string(),
+            ),
+            Verdict::Permit => Err(ProxyError::UpstreamProtocol(
+                "internal invariant violation: denial request evaluated to Permit".to_string(),
+            )),
+        }
     }
 
     fn is_tool_permitted(&self, tool_name: &str) -> bool {
@@ -610,6 +600,55 @@ impl<C: Clock> McpProxy<C> {
             .iter()
             .all(|vm| vm.ast.allow().iter().any(|pat| pat.matches(&policy.action)))
     }
+}
+
+/// Builds a guaranteed-denial [`ActionRequest`] that preserves the actual mapped action when the
+/// tool is configured in `policy_map` and records the exact mapping failure in `resource_kind`.
+fn build_mapping_denial_request(
+    actor_key: &KeyId,
+    policy_map: &ToolPolicyMap,
+    tool_name: &str,
+    arguments: Option<&ExactJson>,
+    err: &MappingError,
+) -> ActionRequest {
+    match policy_map.get(tool_name) {
+        Some(policy) => ActionRequest {
+            actor_key: actor_key.clone(),
+            action: policy.action.clone(),
+            // Colon is forbidden in `is_valid_ident`, guaranteeing `Verdict::Deny` even under
+            // wildcard mandates while preserving the real mapped action and exact error detail.
+            resource_kind: format!("{}:{err}", policy.resource_kind),
+            resource_id: best_effort_resource_id(tool_name, policy, arguments),
+        },
+        None => ActionRequest {
+            actor_key: actor_key.clone(),
+            action: format!("mcp.unmapped:{tool_name}"),
+            resource_kind: "mcp_tool".to_string(),
+            resource_id: tool_name.to_string(),
+        },
+    }
+}
+
+fn best_effort_resource_id(
+    tool_name: &str,
+    policy: &ToolPolicy,
+    arguments: Option<&ExactJson>,
+) -> String {
+    if let Some(static_id) = &policy.static_resource_id {
+        return static_id.clone();
+    }
+    if let Some(arg_key) = &policy.resource_id_arg {
+        if let Some(val) = arguments
+            .and_then(ExactJson::as_object)
+            .and_then(|map| map.get(arg_key))
+            .and_then(ExactJson::as_str)
+        {
+            if is_valid_quoted_str(val) {
+                return val.to_string();
+            }
+        }
+    }
+    tool_name.to_string()
 }
 
 fn extract_tool_call_params(
@@ -629,11 +668,11 @@ fn extract_tool_call_params(
 
 fn handle_notification<UW: Write>(
     method: &str,
-    raw_frame: &str,
+    normalized_frame: &str,
     upstream_in: &mut UW,
 ) -> Result<(), ProxyError> {
     if ALLOWED_NOTIFICATION_METHODS.contains(&method) {
-        write_raw_line(upstream_in, raw_frame)?;
+        write_raw_line(upstream_in, normalized_frame)?;
     }
     // Disallowed notifications (including notification `tools/call`) are dropped without forwarding.
     Ok(())

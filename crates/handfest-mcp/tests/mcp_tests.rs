@@ -7,11 +7,13 @@ use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
+use std::time::{Duration, Instant};
 
 use handfest_anchors::{Ed25519Keypair, SignedMandate};
 use handfest_core::ast::parse_rfc3339_utc;
 use handfest_core::cnl::{parse_mandate, try_render_canonical};
-use handfest_core::gate::VerifiedMandate;
+use handfest_core::gate::{DecisionReceipt, VerifiedMandate};
+use handfest_core::Verdict;
 use handfest_ledger::SqliteLedger;
 use handfest_mcp::{
     verify_mandate_chain, FactSpec, FactType, FixedClock, McpProxy, ProxyError, ToolPolicy,
@@ -939,4 +941,403 @@ fn subprocess_startup_fail_fast_rejects_widened_chain_before_spawning_upstream()
         "upstream must NEVER be spawned when startup chain verification fails"
     );
     assert!(String::from_utf8_lossy(&fail_output.stderr).contains("attenuation"));
+}
+
+// ---------------------------------------------------------------------------
+// 7. Round 2 remediation tests (Findings 1–5)
+// ---------------------------------------------------------------------------
+
+fn build_pr_proxy(
+    now_rfc3339: &str,
+) -> (McpProxy<FixedClock>, Vec<VerifiedMandate>, Ed25519Keypair) {
+    let root_kp = Ed25519Keypair::generate();
+    let mid_kp = Ed25519Keypair::generate();
+    let agent_kp = Ed25519Keypair::generate();
+    let valid_from = parse_rfc3339_utc("2026-01-01T00:00:00Z").unwrap();
+    let valid_until = parse_rfc3339_utc("2027-01-01T00:00:00Z").unwrap();
+    let now = parse_rfc3339_utc(now_rfc3339).unwrap();
+
+    let (_, verified) = build_pr_chain(&root_kp, &mid_kp, &agent_kp, valid_from, valid_until);
+    let proxy = McpProxy::new(
+        verified.clone(),
+        agent_kp.key_id(),
+        pr_policy_map(),
+        SqliteLedger::open_in_memory().unwrap(),
+        FixedClock::new(now),
+    )
+    .unwrap();
+    (proxy, verified, agent_kp)
+}
+
+fn run_raw_proxy_io(
+    proxy: &mut McpProxy<FixedClock>,
+    client_bytes: &[u8],
+    upstream_bytes: &[u8],
+) -> (Result<(), ProxyError>, Vec<u8>, Vec<u8>) {
+    let mut client_in = BufReader::new(client_bytes);
+    let mut client_out = Vec::new();
+    let mut upstream_in = Vec::new();
+    let mut upstream_out = BufReader::new(upstream_bytes);
+    let res = proxy.run(
+        &mut client_in,
+        &mut client_out,
+        &mut upstream_in,
+        &mut upstream_out,
+    );
+    (res, client_out, upstream_in)
+}
+
+#[test]
+fn bare_cr_smuggling_rejected_on_client_and_upstream_and_crlf_normalized() {
+    let (mut proxy, _, _) = build_pr_proxy("2026-06-01T00:00:00Z");
+
+    let smuggling_input = concat!(
+        "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\",\"params\":\r",
+        "{\"method\":\"tools/call\",\"params\":{\"name\":\"delete_repo\",\"arguments\":{\"repo\":\"org/app\"}}}\r}\n",
+        "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}\r",
+        "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"delete_repo\",\"arguments\":{\"repo\":\"org/app\"}}}\r\n",
+        "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"ping\"}\r\r\n",
+        "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}\r"
+    );
+
+    let (res, client_out, upstream_in) =
+        run_raw_proxy_io(&mut proxy, smuggling_input.as_bytes(), b"");
+    res.expect("client bare CR frames are rejected cleanly without fatal error");
+    assert!(
+        upstream_in.is_empty(),
+        "upstream MUST receive 0 bytes from bare CR smuggling payloads, got: {:?}",
+        String::from_utf8_lossy(&upstream_in)
+    );
+
+    let errors: Vec<Value> = String::from_utf8(client_out)
+        .unwrap()
+        .lines()
+        .map(|l| serde_json::from_str::<Value>(l).unwrap())
+        .collect();
+    assert_eq!(errors.len(), 4);
+    for err in &errors {
+        assert_eq!(err["id"], Value::Null);
+        assert_eq!(err["error"]["code"], json!(-32700));
+    }
+
+    let valid_crlf = concat!(
+        "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}\r\n",
+        "{\"jsonrpc\":\"2.0\",\"id\":9,\"method\":\"ping\"}\r\n"
+    );
+    let upstream_reply = b"{\"jsonrpc\":\"2.0\",\"id\":9,\"result\":{}}\r\n";
+    let (crlf_res, crlf_out, crlf_up) =
+        run_raw_proxy_io(&mut proxy, valid_crlf.as_bytes(), upstream_reply);
+    crlf_res.expect("valid CRLF frames succeed");
+    assert!(
+        !crlf_up.contains(&b'\r'),
+        "forwarded bytes must contain zero CR"
+    );
+    assert!(
+        !crlf_out.contains(&b'\r'),
+        "relayed bytes must contain zero CR"
+    );
+    assert_eq!(crlf_up.iter().filter(|&&b| b == b'\n').count(), 2);
+
+    let (up_err, up_client_out, _) = run_raw_proxy_io(
+        &mut proxy,
+        b"{\"jsonrpc\":\"2.0\",\"id\":10,\"method\":\"ping\"}\n",
+        b"{\"jsonrpc\":\"2.0\",\"id\":10,\"result\":{}\r}\n",
+    );
+    assert!(matches!(up_err, Err(ProxyError::UpstreamProtocol(_))));
+    let parsed: Value = serde_json::from_str(std::str::from_utf8(&up_client_out).unwrap()).unwrap();
+    assert_eq!(parsed["id"], json!(10));
+    assert_eq!(parsed["error"]["code"], json!(-32603));
+}
+
+#[test]
+fn tools_list_rejects_error_null_and_dual_result_error_and_relays_valid_error() {
+    let req = b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/list\",\"params\":{}}\n";
+    let malicious_responses = [
+        "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"tools\":[{\"name\":\"delete_repo\"},{\"name\":\"merge_pr\"}]},\"error\":null}\n",
+        "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"tools\":[{\"name\":\"delete_repo\"}]},\"error\":{\"code\":-1,\"message\":\"x\"}}\n",
+        "{\"jsonrpc\":\"2.0\",\"id\":1,\"error\":null}\n",
+        "{\"jsonrpc\":\"2.0\",\"id\":1,\"error\":{\"code\":1.5,\"message\":\"bad\"}}\n",
+        "{\"jsonrpc\":\"2.0\",\"id\":1}\n",
+    ];
+
+    for raw_resp in malicious_responses {
+        let (mut proxy, _, _) = build_pr_proxy("2026-06-01T00:00:00Z");
+        let (res, client_out, _) = run_raw_proxy_io(&mut proxy, req, raw_resp.as_bytes());
+        assert!(
+            matches!(res, Err(ProxyError::UpstreamProtocol(_))),
+            "expected UpstreamProtocol for {raw_resp}, got {res:?}"
+        );
+        let out_str = String::from_utf8(client_out).unwrap();
+        assert!(
+            !out_str.contains("delete_repo") && !out_str.contains("merge_pr"),
+            "malformed tools/list response leaked tools: {out_str}"
+        );
+        let parsed: Value = serde_json::from_str(out_str.trim()).unwrap();
+        assert_eq!(parsed["id"], json!(1));
+        assert_eq!(parsed["error"]["code"], json!(-32603));
+    }
+
+    let (mut proxy, _, _) = build_pr_proxy("2026-06-01T00:00:00Z");
+    let valid_err =
+        b"{\"jsonrpc\":\"2.0\",\"id\":1,\"error\":{\"code\":-32601,\"message\":\"tools disabled\"}}\n";
+    let (ok_res, ok_out, _) = run_raw_proxy_io(&mut proxy, req, valid_err);
+    ok_res.expect("valid error-only tools/list response relays cleanly");
+    let parsed: Value = serde_json::from_str(std::str::from_utf8(&ok_out).unwrap().trim()).unwrap();
+    assert_eq!(parsed["id"], json!(1));
+    assert_eq!(parsed["error"]["code"], json!(-32601));
+    assert_eq!(parsed["error"]["message"], json!("tools disabled"));
+}
+
+#[test]
+fn upstream_server_requests_and_numeric_id_equivalence_correlate_strictly() {
+    let (mut proxy, _, _) = build_pr_proxy("2026-06-01T00:00:00Z");
+
+    let client_req = concat!(
+        "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",",
+        "\"params\":{\"name\":\"merge_pr\",\"arguments\":{\"repo\":\"org/app\"}}}\n"
+    );
+    let upstream_stream = concat!(
+        "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"roots/list\",\"params\":{}}\n",
+        "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"ping\"}\n",
+        "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/progress\",\"params\":{\"step\":1}}\n",
+        "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"content\":[{\"type\":\"text\",\"text\":\"executed:merge_pr\"}]}}\n"
+    );
+
+    let (res, client_out, upstream_in) = run_raw_proxy_io(
+        &mut proxy,
+        client_req.as_bytes(),
+        upstream_stream.as_bytes(),
+    );
+    res.expect("interleaved upstream server requests must not confuse response correlation");
+
+    let client_frames: Vec<Value> = String::from_utf8(client_out)
+        .unwrap()
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    assert_eq!(client_frames.len(), 2);
+    assert_eq!(client_frames[0]["method"], json!("notifications/progress"));
+    assert_eq!(client_frames[1]["id"], json!(1));
+    assert_eq!(
+        client_frames[1]["result"]["content"][0]["text"],
+        json!("executed:merge_pr")
+    );
+
+    let upstream_frames: Vec<Value> = String::from_utf8(upstream_in)
+        .unwrap()
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    assert_eq!(upstream_frames.len(), 3);
+    assert_eq!(upstream_frames[0]["method"], json!("tools/call"));
+    assert_eq!(upstream_frames[1]["id"], json!(1));
+    assert_eq!(upstream_frames[1]["error"]["code"], json!(-32601));
+    assert_eq!(upstream_frames[2]["id"], json!(1));
+    assert_eq!(upstream_frames[2]["error"]["code"], json!(-32601));
+
+    let equiv_req = concat!(
+        "{\"jsonrpc\":\"2.0\",\"id\":1.5,\"method\":\"ping\"}\n",
+        "{\"jsonrpc\":\"2.0\",\"id\":18446744073709551617,\"method\":\"ping\"}\n"
+    );
+    let equiv_resp = concat!(
+        "{\"jsonrpc\":\"2.0\",\"id\":1.50,\"result\":{}}\n",
+        "{\"jsonrpc\":\"2.0\",\"id\":18446744073709551617.0,\"result\":{}}\n"
+    );
+    let (eq_res, eq_out, _) =
+        run_raw_proxy_io(&mut proxy, equiv_req.as_bytes(), equiv_resp.as_bytes());
+    eq_res.expect("numerically equivalent JSON-RPC ids must match");
+    assert_eq!(String::from_utf8(eq_out).unwrap().lines().count(), 2);
+
+    let (mismatch_res, mismatch_out, _) = run_raw_proxy_io(
+        &mut proxy,
+        b"{\"jsonrpc\":\"2.0\",\"id\":18446744073709551617,\"method\":\"ping\"}\n",
+        b"{\"jsonrpc\":\"2.0\",\"id\":18446744073709551616,\"result\":{}}\n",
+    );
+    assert!(matches!(mismatch_res, Err(ProxyError::UpstreamProtocol(_))));
+    let mismatch_str = String::from_utf8(mismatch_out).unwrap();
+    assert!(mismatch_str.contains("\"id\":18446744073709551617"));
+    assert!(mismatch_str.contains("-32603"));
+}
+
+#[test]
+fn tools_list_lossless_serialization_and_deep_nesting() {
+    let (mut proxy, _, _) = build_pr_proxy("2026-06-01T00:00:00Z");
+
+    let mut nested_schema =
+        String::from("{\"const\":100.000000000000001,\"bigId\":18446744073709551617}");
+    for _ in 0..48 {
+        nested_schema = format!("{{\"nested\":{nested_schema}}}");
+    }
+
+    let req = "{\"jsonrpc\":\"2.0\",\"id\":18446744073709551617,\"method\":\"tools/list\",\"params\":{}}\n";
+    let upstream_resp = format!(
+        "{{\"jsonrpc\":\"2.0\",\"id\":18446744073709551617,\"result\":{{\"tools\":[{{\"name\":\"merge_pr\",\"inputSchema\":{nested_schema}}},{{\"name\":\"delete_repo\",\"inputSchema\":{{}}}}]}}}}\n"
+    );
+
+    let (res, client_out, _) =
+        run_raw_proxy_io(&mut proxy, req.as_bytes(), upstream_resp.as_bytes());
+    res.expect("deeply nested lossless tools/list must succeed");
+
+    let raw_out = String::from_utf8(client_out).unwrap();
+    assert!(
+        raw_out.contains("100.000000000000001"),
+        "decimal constant must not round through f64: {raw_out}"
+    );
+    assert!(
+        raw_out.contains("\"id\":18446744073709551617"),
+        "large integer id must not round through f64: {raw_out}"
+    );
+    assert!(
+        raw_out.contains("\"bigId\":18446744073709551617"),
+        "large integer schema constant must not round through f64: {raw_out}"
+    );
+    assert!(
+        raw_out.contains("\"merge_pr\"") && !raw_out.contains("delete_repo"),
+        "unauthorized tool must be filtered out: {raw_out}"
+    );
+}
+
+#[test]
+fn mapping_failure_receipt_records_mapped_action_and_invalid_empty_object_returns_32600() {
+    let root_kp = Ed25519Keypair::generate();
+    let agent_kp = Ed25519Keypair::generate();
+    let valid_from = parse_rfc3339_utc("2026-01-01T00:00:00Z").unwrap();
+    let valid_until = parse_rfc3339_utc("2027-01-01T00:00:00Z").unwrap();
+    let now = parse_rfc3339_utc("2026-06-01T00:00:00Z").unwrap();
+
+    let wildcard_mandate = format!(
+        "HANDFEST v1\n\
+         FROM human \"Admin\" (key: {root})\n\
+         TO agent \"Worker\" (key: {agent})\n\
+         DELEGATION max 0 hops\n\
+         ALLOW git.*\n\
+         ON repo \"*\"\n",
+        root = root_kp.key_id(),
+        agent = agent_kp.key_id(),
+    );
+    let (signed, _) = sign_text(&root_kp, &wildcard_mandate, valid_from, valid_until);
+    let verified = verify_mandate_chain(&[signed]).unwrap();
+    let chain_ids = vec![verified[0].ast.try_mandate_id().unwrap()];
+
+    let mut proxy = McpProxy::new(
+        verified,
+        agent_kp.key_id(),
+        pr_policy_map(),
+        SqliteLedger::open_in_memory().unwrap(),
+        FixedClock::new(now),
+    )
+    .unwrap();
+
+    let frames = concat!(
+        "{}\n",
+        "{\"jsonrpc\":\"2.0\"}\n",
+        "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"merge_pr\",\"arguments\":{}}}\n"
+    );
+    let (res, client_out, upstream_in) = run_raw_proxy_io(&mut proxy, frames.as_bytes(), b"");
+    res.expect("invalid request objects and mapping denials handled cleanly");
+    assert!(upstream_in.is_empty(), "no frame may reach upstream");
+
+    let responses: Vec<Value> = String::from_utf8(client_out)
+        .unwrap()
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    assert_eq!(responses.len(), 3);
+
+    for idx in [0usize, 1] {
+        assert_eq!(responses[idx]["id"], Value::Null);
+        assert_eq!(responses[idx]["error"]["code"], json!(-32600));
+    }
+
+    let deny = &responses[2];
+    assert_eq!(deny["id"], json!(1));
+    assert_eq!(deny["error"]["code"], json!(HANDFEST_DENIED_ERROR_CODE));
+    let reason = deny["error"]["data"]["reason"].as_str().unwrap();
+    assert!(
+        reason.contains("tool 'merge_pr': missing required resource_id argument 'repo'"),
+        "unexpected denial reason: {reason}"
+    );
+    assert!(
+        !reason.contains("mcp.unmapped") && !reason.contains("invalid concrete action"),
+        "misleading unmapped/action error in reason: {reason}"
+    );
+
+    let expected_receipt = DecisionReceipt {
+        chain_ids,
+        actor_key: agent_kp.key_id(),
+        action: "git.pr.merge".to_string(),
+        resource: "repo:tool 'merge_pr': missing required resource_id argument 'repo' \"merge_pr\""
+            .to_string(),
+        timestamp: now,
+        verdict: Verdict::Deny {
+            reason: reason.to_string(),
+        },
+        receipt_hash: handfest_core::ast::MandateId([0u8; 32]),
+        prev_receipt_hash: None,
+    };
+    assert_eq!(
+        deny["error"]["data"]["receipt_hash"].as_str().unwrap(),
+        expected_receipt.compute_hash().to_string(),
+        "recorded SQLite receipt must commit to mapped action 'git.pr.merge' and exact reason"
+    );
+    assert_eq!(proxy.ledger().verify_integrity().unwrap(), 1);
+}
+
+#[cfg(unix)]
+#[test]
+fn subprocess_kills_blocked_upstream_without_hanging_on_client_eof_and_error() {
+    let dir = tempdir().unwrap();
+    let (root_path, child_path, policy_path, ledger_path, _mid_kp, agent_kp, _chain) =
+        write_pr_chain_fixtures(dir.path());
+
+    for send_oversized_error in [false, true] {
+        let started = Instant::now();
+        let mut child = Command::new(env!("CARGO_BIN_EXE_handfest-mcp"))
+            .args([
+                "--chain",
+                root_path.to_str().unwrap(),
+                child_path.to_str().unwrap(),
+                "--ledger",
+                ledger_path.to_str().unwrap(),
+                "--actor-key",
+                &agent_kp.key_id().to_string(),
+                "--policy-map",
+                policy_path.to_str().unwrap(),
+                "--now",
+                "2026-06-01T00:00:00Z",
+                "--",
+                "sh",
+                "-c",
+                "exec sleep 30",
+            ])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn handfest-mcp with blocked upstream");
+
+        {
+            let mut stdin = child.stdin.take().unwrap();
+            if send_oversized_error {
+                let huge = "a".repeat(1024 * 1024 + 32);
+                let _ = writeln!(stdin, "{huge}");
+            }
+        }
+        let output = child.wait_with_output().expect("wait handfest-mcp");
+        let elapsed = started.elapsed();
+
+        if send_oversized_error {
+            assert!(!output.status.success());
+        } else {
+            assert!(
+                output.status.success(),
+                "handfest-mcp should exit cleanly on EOF: stderr={}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "handfest-mcp hung waiting on blocked upstream (error={send_oversized_error}): {elapsed:?}"
+        );
+    }
 }

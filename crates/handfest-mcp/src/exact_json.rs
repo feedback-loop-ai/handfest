@@ -1,13 +1,14 @@
-//! Lossless JSON parser and exact base-10 decimal parser.
+//! Lossless JSON parser, serializer, and exact base-10 decimal helpers.
 //!
 //! Numeric tokens are preserved verbatim without routing through IEEE-754 `f64`, and duplicate
 //! object keys are rejected to prevent parser-differential smuggling between proxy and upstream.
 
 use std::collections::BTreeMap;
+use std::fmt::Write as _;
 
 use handfest_core::ast::{Decimal, MAX_DECIMAL_SCALE};
 
-const MAX_JSON_DEPTH: usize = 32;
+const MAX_JSON_DEPTH: usize = 128;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ExactJson {
@@ -27,10 +28,144 @@ impl ExactJson {
         }
     }
 
+    pub(crate) fn as_object_mut(&mut self) -> Option<&mut BTreeMap<String, ExactJson>> {
+        match self {
+            Self::Object(map) => Some(map),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn as_array_mut(&mut self) -> Option<&mut Vec<ExactJson>> {
+        match self {
+            Self::Array(items) => Some(items),
+            _ => None,
+        }
+    }
+
     pub(crate) fn as_str(&self) -> Option<&str> {
         match self {
             Self::Str(s) => Some(s.as_str()),
             _ => None,
+        }
+    }
+
+    /// Serializes this AST into compact single-line JSON without routing numbers through `f64`.
+    pub(crate) fn to_json_string(&self) -> String {
+        let mut out = String::new();
+        write_exact_json(self, &mut out);
+        out
+    }
+}
+
+/// Exact canonical base-10 value of an RFC 8259 JSON numeric literal (`(-1)^neg * sig * 10^exp`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum CanonicalJsonNumber {
+    Zero,
+    NonZero {
+        neg: bool,
+        sig_digits: String,
+        exp: i128,
+    },
+}
+
+/// Normalizes a valid RFC 8259 JSON number token for exact numeric equivalence (no `f64`).
+pub(crate) fn canonicalize_json_number(raw: &str) -> Result<CanonicalJsonNumber, String> {
+    let (mant_part, exp_str) = split_exponent(raw)?;
+    let (neg, unsigned_mant) = match mant_part.strip_prefix('-') {
+        Some(rest) => (true, rest),
+        None => (false, mant_part),
+    };
+    let (int_digits, frac_digits) = match unsigned_mant.split_once('.') {
+        Some((i, f)) => (i, f),
+        None => (unsigned_mant, ""),
+    };
+
+    let mut digits = String::with_capacity(int_digits.len() + frac_digits.len());
+    digits.push_str(int_digits);
+    digits.push_str(frac_digits);
+
+    let trimmed_leading = digits.trim_start_matches('0');
+    if trimmed_leading.is_empty() {
+        return Ok(CanonicalJsonNumber::Zero);
+    }
+
+    let exp: i128 = match exp_str {
+        Some(s) => s
+            .parse()
+            .map_err(|_| format!("JSON number exponent '{s}' out of range"))?,
+        None => 0,
+    };
+    let frac_len =
+        i128::try_from(frac_digits.len()).map_err(|_| "fractional length overflow".to_string())?;
+    let sig_digits = trimmed_leading.trim_end_matches('0');
+    let trailing_zeros = i128::try_from(trimmed_leading.len() - sig_digits.len())
+        .map_err(|_| "trailing zero count overflow".to_string())?;
+    let net_exp = exp
+        .checked_sub(frac_len)
+        .and_then(|v| v.checked_add(trailing_zeros))
+        .ok_or_else(|| "JSON number exponent overflow".to_string())?;
+
+    Ok(CanonicalJsonNumber::NonZero {
+        neg,
+        sig_digits: sig_digits.to_string(),
+        exp: net_exp,
+    })
+}
+
+/// Returns `true` when `raw` is a JSON integer literal representable as a signed 64-bit integer.
+pub(crate) fn is_valid_json_int(raw: &str) -> bool {
+    !raw.contains(['.', 'e', 'E']) && raw.parse::<i64>().is_ok()
+}
+
+/// Appends `s` as a valid RFC 8259 single-line JSON string literal (escaping all control chars).
+pub(crate) fn write_json_string(s: &str, out: &mut String) {
+    out.push('"');
+    for ch in s.chars() {
+        match ch {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\u{08}' => out.push_str("\\b"),
+            '\u{0C}' => out.push_str("\\f"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => {
+                let _ = write!(out, "\\u{:04x}", c as u32);
+            }
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+}
+
+fn write_exact_json(val: &ExactJson, out: &mut String) {
+    match val {
+        ExactJson::Null => out.push_str("null"),
+        ExactJson::Bool(true) => out.push_str("true"),
+        ExactJson::Bool(false) => out.push_str("false"),
+        ExactJson::Number(raw) => out.push_str(raw),
+        ExactJson::Str(s) => write_json_string(s, out),
+        ExactJson::Array(items) => {
+            out.push('[');
+            for (idx, item) in items.iter().enumerate() {
+                if idx > 0 {
+                    out.push(',');
+                }
+                write_exact_json(item, out);
+            }
+            out.push(']');
+        }
+        ExactJson::Object(map) => {
+            out.push('{');
+            for (idx, (key, item)) in map.iter().enumerate() {
+                if idx > 0 {
+                    out.push(',');
+                }
+                write_json_string(key, out);
+                out.push(':');
+                write_exact_json(item, out);
+            }
+            out.push('}');
         }
     }
 }
@@ -347,5 +482,58 @@ impl<'a> JsonParser<'a> {
             self.pos += 1;
         }
         self.pos > start
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn canonical_json_number_compares_losslessly() {
+        assert_eq!(
+            canonicalize_json_number("1.50").unwrap(),
+            canonicalize_json_number("1.5").unwrap()
+        );
+        assert_eq!(
+            canonicalize_json_number("1.50").unwrap(),
+            canonicalize_json_number("15e-1").unwrap()
+        );
+        assert_eq!(
+            canonicalize_json_number("0").unwrap(),
+            canonicalize_json_number("-0.0e99").unwrap()
+        );
+        assert_eq!(
+            canonicalize_json_number("18446744073709551617").unwrap(),
+            canonicalize_json_number("1.8446744073709551617e19").unwrap()
+        );
+        assert_ne!(
+            canonicalize_json_number("18446744073709551616").unwrap(),
+            canonicalize_json_number("18446744073709551617").unwrap()
+        );
+        assert_ne!(
+            canonicalize_json_number("9007199254740992").unwrap(),
+            canonicalize_json_number("9007199254740993").unwrap()
+        );
+        assert!(canonicalize_json_number("1e9999999999999999999999999999999999999999").is_err());
+    }
+
+    #[test]
+    fn serializer_preserves_numbers_escapes_control_chars_and_supports_deep_nesting() {
+        let raw = r#"{"a":100.000000000000001,"b":18446744073709551617,"c":"line\r\n\t\b\f\u0001\"\\","d":[true,false,null]}"#;
+        let parsed = parse_exact_json(raw).unwrap();
+        let encoded = parsed.to_json_string();
+        assert_eq!(encoded, raw);
+        assert!(!encoded.contains('\r'));
+        assert!(!encoded.contains('\n'));
+
+        let depth_64 = format!("{}1{}", "[".repeat(64), "]".repeat(64));
+        assert!(parse_exact_json(&depth_64).is_ok());
+
+        let depth_129 = format!("{}1{}", "[".repeat(129), "]".repeat(129));
+        assert_eq!(
+            parse_exact_json(&depth_129).unwrap_err(),
+            "JSON nesting depth exceeded"
+        );
     }
 }

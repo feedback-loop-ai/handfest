@@ -64,33 +64,42 @@ impl Clock for RuntimeClock {
 
 struct ChildGuard {
     child: Child,
+    reaped: bool,
 }
 
 impl ChildGuard {
     fn new(child: Child) -> Self {
-        Self { child }
+        Self {
+            child,
+            reaped: false,
+        }
     }
 
-    fn shutdown(&mut self) {
-        for _ in 0..CHILD_EXIT_GRACE_POLLS {
-            match self.child.try_wait() {
-                Ok(Some(_)) => return,
-                Ok(None) => thread::sleep(CHILD_EXIT_POLL_INTERVAL),
-                Err(_) => break,
+    fn shutdown(&mut self, graceful: bool) {
+        if self.reaped {
+            return;
+        }
+        if graceful {
+            for _ in 0..CHILD_EXIT_GRACE_POLLS {
+                match self.child.try_wait() {
+                    Ok(Some(_)) => {
+                        self.reaped = true;
+                        return;
+                    }
+                    Ok(None) => thread::sleep(CHILD_EXIT_POLL_INTERVAL),
+                    Err(_) => break,
+                }
             }
         }
         let _ = self.child.kill();
         let _ = self.child.wait();
+        self.reaped = true;
     }
 }
 
 impl Drop for ChildGuard {
     fn drop(&mut self) {
-        if matches!(self.child.try_wait(), Ok(Some(_))) {
-            return;
-        }
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        self.shutdown(false);
     }
 }
 
@@ -147,7 +156,7 @@ fn run(cli: Cli) -> Result<(), String> {
         .spawn()
         .map_err(|err| format!("failed to spawn upstream '{upstream_cmd}': {err}"))?;
 
-    let child_stdin = child
+    let mut upstream_in = child
         .stdin
         .take()
         .ok_or_else(|| "failed to capture upstream stdin pipe".to_string())?;
@@ -161,7 +170,6 @@ fn run(cli: Cli) -> Result<(), String> {
     let stdout = io::stdout();
     let mut client_in = BufReader::new(stdin.lock());
     let mut client_out = BufWriter::new(stdout.lock());
-    let mut upstream_in = BufWriter::new(child_stdin);
     let mut upstream_out = BufReader::new(child_stdout);
 
     let run_result = proxy.run(
@@ -171,10 +179,10 @@ fn run(cli: Cli) -> Result<(), String> {
         &mut upstream_out,
     );
 
-    // Close upstream stdin so the child observes EOF before shutdown waits/kills it.
+    // Close unbuffered upstream stdin immediately (cannot block on flush) before reaping child.
     drop(upstream_in);
     drop(upstream_out);
-    guard.shutdown();
+    guard.shutdown(run_result.is_ok());
 
     run_result.map_err(|err| err.to_string())
 }
