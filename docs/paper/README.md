@@ -4,12 +4,12 @@ This directory contains the arXiv-ready LaTeX manuscript (`cs.CR` / `cs.AI`) for
 
 > *Executable Ricardian Mandates: Deterministic, Multi-Anchor Authority Vesting for Autonomous AI Agents*
 
-All architectural claims, `HANDFEST v1` grammar rules, lattice attenuation laws, workspace metrics, and adversarial threat-model defenses in this manuscript are grounded directly in the `handfest` repository at commit `60f105e`.
+All architectural claims, `HANDFEST v1` grammar rules, lattice attenuation laws, workspace metrics, and implemented adversarial defenses in this manuscript are grounded directly in the `handfest` repository at commit `60f105e` (with unimplemented Slice 2 MCP proxy defenses explicitly marked as proposed specifications).
 
 ## Files
 
 - `handfest-ricardian-mandates.tex` — Complete two-column LaTeX manuscript using only standard TeX Live packages (`geometry`, `inputenc`, `fontenc`, `lmodern`, `microtype`, `amsmath`, `amssymb`, `amsthm`, `booktabs`, `array`, `enumitem`, `listings`, `xcolor`, `url`, `hyperref`).
-- `references.bib` — Complete BibTeX bibliography matching every `\cite{...}` key in the manuscript.
+- `references.bib` — Complete BibTeX bibliography matching every `\cite{...}` key in the manuscript, with rendered stable identifiers and URLs compatible with `\bibliographystyle{plain}`.
 - `README.md` — Build and arXiv packaging instructions (this file).
 
 ## Prerequisites
@@ -45,12 +45,12 @@ pdflatex -interaction=nonstopmode handfest-ricardian-mandates.tex
 
 arXiv compiles uploaded LaTeX sources using `pdflatex` and expects the pre-generated `.bbl` file (produced by `bibtex`) alongside the `.tex` file rather than running `bibtex` itself.
 
-1. Build the PDF once locally so `handfest-ricardian-mandates.bbl` is generated and verified with zero undefined references or warnings:
+1. Finalize any metadata edits—such as updating the `\author{...}` block in `handfest-ricardian-mandates.tex` with individual author names and affiliations—**before** the final build.
+2. Build the final PDF locally so `handfest-ricardian-mandates.bbl` matches the exact source being submitted, and inspect both the rendered PDF and `handfest-ricardian-mandates.log` for zero undefined references, zero missing citations, and zero overfull-box warnings:
    ```bash
    cd docs/paper
    latexmk -pdf -interaction=nonstopmode handfest-ricardian-mandates.tex
    ```
-2. Update the `\author{...}` block in `handfest-ricardian-mandates.tex` with the final author list and affiliations if submitting under individual author names.
 3. Package the clean source tarball (excluding `.aux`, `.log`, `.out`, `.fls`, `.fdb_latexmk`, and `.pdf`):
    ```bash
    tar -czf handfest-arxiv-source.tar.gz \
@@ -60,12 +60,14 @@ arXiv compiles uploaded LaTeX sources using `pdflatex` and expects the pre-gener
    ```
 4. Upload `handfest-arxiv-source.tar.gz` to arXiv under primary category **`cs.CR` (Cryptography and Security)** and secondary category **`cs.AI` (Artificial Intelligence)**.
 
-## Reproducing Codebase Verification
+## Reproducing Codebase Verification Offline
 
-From the repository root, the exact Rust workspace verified against this manuscript can be checked offline via:
+Offline verification assumes a locally cached Rust `1.98.0` toolchain (`rust-toolchain.toml`, with `clippy` and `rustfmt` components) and a pre-populated Cargo dependency cache matching `Cargo.lock`. From the repository root, run:
 
 ```bash
 cargo fmt --all -- --check
-cargo clippy --workspace --all-targets --locked -- -D warnings
-cargo test --workspace --locked
+cargo clippy --workspace --all-targets --locked --offline -- -D warnings
+cargo test --workspace --locked --offline
 ```
+
+License and one-way crate-graph policies declared in `deny.toml` are checked separately when `cargo-deny` is installed (`cargo deny check`); they are not enforced automatically by `cargo fmt`, `cargo clippy`, or `cargo test`.
