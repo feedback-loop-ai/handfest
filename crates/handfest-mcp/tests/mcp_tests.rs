@@ -1215,7 +1215,7 @@ fn upstream_server_requests_and_numeric_id_equivalence_correlate_strictly() {
     assert_eq!(upstream_frames[2]["error"]["code"], json!(-32601));
 
     let equiv_req = concat!(
-        "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"ping\"}\n",
+        "{\"jsonrpc\":\"2.0\",\"id\":0,\"method\":\"ping\"}\n",
         "{\"jsonrpc\":\"2.0\",\"id\":9007199254740991,\"method\":\"ping\"}\n",
         "{\"jsonrpc\":\"2.0\",\"id\":-9007199254740991,\"method\":\"ping\"}\n"
     );
@@ -1223,13 +1223,26 @@ fn upstream_server_requests_and_numeric_id_equivalence_correlate_strictly() {
         &mut proxy,
         equiv_req.as_bytes(),
         vec![
-            b"{\"jsonrpc\":\"2.0\",\"id\":1.0,\"result\":{}}\n".to_vec(),
-            b"{\"jsonrpc\":\"2.0\",\"id\":9007199254740991.0,\"result\":{}}\n".to_vec(),
-            b"{\"jsonrpc\":\"2.0\",\"id\":-9.007199254740991e15,\"result\":{}}\n".to_vec(),
+            b"{\"jsonrpc\":\"2.0\",\"id\":-0,\"result\":{}}\n".to_vec(),
+            b"{\"jsonrpc\":\"2.0\",\"id\":9007199254740991,\"result\":{}}\n".to_vec(),
+            b"{\"jsonrpc\":\"2.0\",\"id\":-9007199254740991,\"result\":{}}\n".to_vec(),
         ],
     );
-    eq_res.expect("numerically equivalent safe-integer JSON-RPC ids must match");
+    eq_res.expect("plain safe-integer JSON-RPC ids must match");
     assert_eq!(String::from_utf8(eq_out).unwrap().lines().count(), 3);
+
+    for bad_upstream_id in ["1.0", "90071992547409910e-1"] {
+        let up_resp = format!("{{\"jsonrpc\":\"2.0\",\"id\":{bad_upstream_id},\"result\":{{}}}}\n");
+        let (bad_res, _, _) = run_raw_proxy_io(
+            &mut proxy,
+            b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"ping\"}\n",
+            up_resp.as_bytes(),
+        );
+        assert!(
+            matches!(bad_res, Err(ProxyError::UpstreamProtocol(_))),
+            "non-plain upstream id {bad_upstream_id} must fail protocol check: {bad_res:?}"
+        );
+    }
 
     let (mismatch_res, mismatch_out, _) = run_raw_proxy_io(
         &mut proxy,

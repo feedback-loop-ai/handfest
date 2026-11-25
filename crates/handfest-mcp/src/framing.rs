@@ -3,9 +3,7 @@
 use std::collections::BTreeMap;
 use std::io::{BufRead, Write};
 
-use crate::exact_json::{
-    canonicalize_json_number, is_valid_json_int, write_json_string, CanonicalJsonNumber, ExactJson,
-};
+use crate::exact_json::{is_valid_json_int, write_json_string, ExactJson};
 use crate::proxy::{ProxyError, HANDFEST_DENIED_ERROR_CODE};
 
 pub(crate) const JSONRPC_PARSE_ERROR: i32 = -32700;
@@ -87,47 +85,25 @@ pub(crate) fn extract_id_value(val: &ExactJson) -> Result<JsonRpcId, String> {
 }
 
 fn parse_safe_jsonrpc_id_int(raw: &str) -> Result<i64, String> {
-    match canonicalize_json_number(raw).map_err(|err| err.to_string())? {
-        CanonicalJsonNumber::Zero => Ok(0),
-        CanonicalJsonNumber::NonZero {
-            neg,
-            sig_digits,
-            exp,
-        } => {
-            if exp < 0 {
-                return Err(
-                    "JSON-RPC numeric id must be an exact integer without fractional part"
-                        .to_string(),
-                );
-            }
-            // MAX_SAFE_JSONRPC_ID = 9_007_199_254_740_991 has 16 decimal digits.
-            // Because `sig_digits` is non-empty, `exp >= 16` or `sig_digits.len() + exp > 16`
-            // is strictly >= 10^16 > MAX_SAFE_JSONRPC_ID.
-            const MAX_SAFE_DIGITS: usize = 16;
-            let exp_usize = match usize::try_from(exp) {
-                Ok(e) if e < MAX_SAFE_DIGITS => e,
-                _ => {
-                    return Err(
-                        "JSON-RPC numeric id outside IEEE-754 safe integer range".to_string()
-                    );
-                }
-            };
-            if sig_digits.len() > MAX_SAFE_DIGITS - exp_usize {
-                return Err("JSON-RPC numeric id outside IEEE-754 safe integer range".to_string());
-            }
-            let mut value: i64 = 0;
-            for b in sig_digits.bytes() {
-                value = value * 10 + i64::from(b - b'0');
-            }
-            for _ in 0..exp_usize {
-                value *= 10;
-            }
-            if value > MAX_SAFE_JSONRPC_ID {
-                return Err("JSON-RPC numeric id outside IEEE-754 safe integer range".to_string());
-            }
-            Ok(if neg { -value } else { value })
-        }
+    let digits = raw.strip_prefix('-').unwrap_or(raw);
+    let is_plain_canonical_int = match digits.as_bytes() {
+        [b'0'] => true,
+        [first, rest @ ..] => matches!(first, b'1'..=b'9') && rest.iter().all(u8::is_ascii_digit),
+        [] => false,
+    };
+    if !is_plain_canonical_int {
+        return Err(
+            "JSON-RPC numeric id must be a plain integer without decimal point or exponent"
+                .to_string(),
+        );
     }
+    let value = raw
+        .parse::<i64>()
+        .map_err(|_| "JSON-RPC numeric id outside IEEE-754 safe integer range".to_string())?;
+    if !(-MAX_SAFE_JSONRPC_ID..=MAX_SAFE_JSONRPC_ID).contains(&value) {
+        return Err("JSON-RPC numeric id outside IEEE-754 safe integer range".to_string());
+    }
+    Ok(value)
 }
 
 pub(crate) fn reject_unknown_keys(
@@ -569,47 +545,55 @@ mod tests {
     }
 
     #[test]
-    fn jsonrpc_id_restricts_numbers_to_exact_ieee754_safe_integers() {
+    fn jsonrpc_id_restricts_numbers_to_plain_ieee754_safe_integers() {
         let id_1 = extract_id_value(&ExactJson::Number("1".to_string())).unwrap();
-        let id_1_0 = extract_id_value(&ExactJson::Number("1.0".to_string())).unwrap();
-        let id_1e0 = extract_id_value(&ExactJson::Number("1e0".to_string())).unwrap();
         let id_str = JsonRpcId::Str("1".to_string());
-        assert_eq!(id_1, id_1_0);
-        assert_eq!(id_1, id_1e0);
         assert_ne!(id_1, id_str);
 
         let zero_a = extract_id_value(&ExactJson::Number("0".to_string())).unwrap();
-        let zero_b = extract_id_value(&ExactJson::Number("-0.0".to_string())).unwrap();
+        let zero_b = extract_id_value(&ExactJson::Number("-0".to_string())).unwrap();
         assert_eq!(zero_a, zero_b);
 
         let max_safe =
             extract_id_value(&ExactJson::Number("9007199254740991".to_string())).unwrap();
-        let max_safe_sci =
-            extract_id_value(&ExactJson::Number("9.007199254740991e15".to_string())).unwrap();
         let max_safe_minus_one =
             extract_id_value(&ExactJson::Number("9007199254740990".to_string())).unwrap();
-        assert_eq!(max_safe, max_safe_sci);
         assert_ne!(max_safe, max_safe_minus_one);
 
         let min_safe =
             extract_id_value(&ExactJson::Number("-9007199254740991".to_string())).unwrap();
         assert_ne!(min_safe, max_safe);
 
-        let hundred = extract_id_value(&ExactJson::Number("1e2".to_string())).unwrap();
         let hundred_plain = extract_id_value(&ExactJson::Number("100".to_string())).unwrap();
-        assert_eq!(hundred, hundred_plain);
+        assert_ne!(hundred_plain, id_1);
 
-        for fractional in [
+        for non_plain in [
+            "1.0",
+            "1e0",
+            "1E0",
+            "-0.0",
+            "1e2",
+            "9.007199254740991e15",
+            "90071992547409910e-1",
+            "9007199254740990e0",
             "1.5",
             "1.0000000000000001",
             "1e-400",
             "-0.1",
             "9007199254740991.5",
+            "1e16",
+            "1e100000000000000000000",
+            "00",
+            "-01",
+            "+1",
+            "",
+            "-",
         ] {
-            let err = extract_id_value(&ExactJson::Number(fractional.to_string())).unwrap_err();
+            let err = extract_id_value(&ExactJson::Number(non_plain.to_string())).unwrap_err();
             assert_eq!(
-                err, "JSON-RPC numeric id must be an exact integer without fractional part",
-                "fractional id {fractional} must fail"
+                err,
+                "JSON-RPC numeric id must be a plain integer without decimal point or exponent",
+                "non-plain id {non_plain} must fail"
             );
         }
 
@@ -619,9 +603,8 @@ mod tests {
             "-9007199254740992",
             "10000000000000000",
             "10000000000000001",
-            "1e16",
             "18446744073709551617",
-            "1e100000000000000000000",
+            "-18446744073709551617",
         ] {
             let err = extract_id_value(&ExactJson::Number(out_of_range.to_string())).unwrap_err();
             assert_eq!(

@@ -191,8 +191,19 @@ impl<C: Clock, L: ReceiptLedger> McpProxy<C, L> {
                 RecvOutcome::Event(IoEvent::ClientLine(res)) => {
                     self.on_client_read(res, &mut state, &mut transport, client_out)?;
                 }
-                RecvOutcome::Event(IoEvent::UpstreamLine(res)) => {
-                    self.on_upstream_read(res, &mut state, &mut transport, client_out)?;
+                RecvOutcome::Event(IoEvent::UpstreamLine(line)) => {
+                    self.on_upstream_read(line, &mut state, &mut transport, client_out)?;
+                }
+                RecvOutcome::Event(IoEvent::UpstreamReadFailed) => {
+                    if let Some(err) = transport.take_upstream_read_error() {
+                        return fail_upstream_line_read(
+                            err,
+                            self.max_line_bytes,
+                            state.active_id(),
+                            client_out,
+                        );
+                    }
+                    return emit_upstream_eof(client_out, state.active_id());
                 }
                 RecvOutcome::Event(IoEvent::UpstreamWriteReady) => {}
                 RecvOutcome::Event(IoEvent::UpstreamWriteFailed) => {
@@ -436,28 +447,17 @@ impl<C: Clock, L: ReceiptLedger> McpProxy<C, L> {
 
     fn on_upstream_read<CW: Write>(
         &mut self,
-        res: Result<Option<String>, LineReadError>,
+        line: Option<String>,
         state: &mut SessionState,
         transport: &mut DuplexTransport,
         client_out: &mut CW,
     ) -> Result<(), ProxyError> {
-        let raw_line = match res {
-            Ok(Some(raw)) => raw,
-            Ok(None) => {
-                state.upstream_eof = true;
-                if state.active_request.is_some() {
-                    return emit_upstream_eof(client_out, state.active_id());
-                }
-                return Ok(());
+        let Some(raw_line) = line else {
+            state.upstream_eof = true;
+            if state.active_request.is_some() {
+                return emit_upstream_eof(client_out, state.active_id());
             }
-            Err(err) => {
-                return fail_upstream_line_read(
-                    err,
-                    self.max_line_bytes,
-                    state.active_id(),
-                    client_out,
-                );
-            }
+            return Ok(());
         };
 
         let parsed = match parse_exact_json(&raw_line) {
@@ -549,9 +549,6 @@ impl<C: Clock, L: ReceiptLedger> McpProxy<C, L> {
         req_id: &JsonRpcId,
         ctx: &mut DispatchCtx<'_, CW>,
     ) -> Result<(), ProxyError> {
-        if let Some(err) = ctx.transport.poll_writer_error() {
-            return Err(err);
-        }
         let terminal = ctx.state.upstream_eof || ctx.transport.poll_upstream_eof();
         if let Some(err) = ctx.transport.poll_writer_error() {
             return Err(err);

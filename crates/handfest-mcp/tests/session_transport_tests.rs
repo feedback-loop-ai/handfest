@@ -593,13 +593,14 @@ fn full_writer_queue_does_not_block_upstream_response_or_shutdown_timeout() {
         drained_tx: Some(drained_tx),
         close_rx,
     });
-    let (mut client_out_w, mut client_out_r) = mem_pipe();
+    let (mut client_out_w, mut client_out_r) = mem_pipe_timeout();
     let (_gate_tx, gate_rx) = mpsc::sync_channel(1);
     let (entered_tx, entered_rx) = mpsc::sync_channel(1);
     let (mut up_out_w, up_out_r) = mem_pipe();
+    let (done_tx, done_rx) = mpsc::sync_channel(1);
 
     let proxy_thread = thread::spawn(move || {
-        proxy.run(
+        let res = proxy.run(
             client_in_r,
             &mut client_out_w,
             GateWriter {
@@ -607,7 +608,8 @@ fn full_writer_queue_does_not_block_upstream_response_or_shutdown_timeout() {
                 entered_tx: Some(entered_tx),
             },
             up_out_r,
-        )
+        );
+        let _ = done_tx.send(res);
     });
 
     entered_rx
@@ -624,8 +626,10 @@ fn full_writer_queue_does_not_block_upstream_response_or_shutdown_timeout() {
         r#"{{"jsonrpc":"2.0","id":1,"result":{{"pong":true}}}}"#
     )
     .unwrap();
-    let mut resp_line = String::new();
-    client_out_r.read_line(&mut resp_line).unwrap();
+    let resp_line = client_out_r.read_line_timeout(
+        Duration::from_secs(2),
+        "upstream pong response under full writer queue",
+    );
     let resp: Value = serde_json::from_str(resp_line.trim_end()).unwrap();
     assert_eq!(resp["id"], json!(1));
     assert_eq!(resp["result"]["pong"], json!(true));
@@ -634,7 +638,10 @@ fn full_writer_queue_does_not_block_upstream_response_or_shutdown_timeout() {
     // rather than deadlocking forever.
     let started = Instant::now();
     drop(close_tx);
-    let res = proxy_thread.join().unwrap();
+    let res = done_rx
+        .recv_timeout(Duration::from_secs(2))
+        .expect("session hung instead of honoring shutdown_timeout under full writer queue");
+    proxy_thread.join().unwrap();
     res.expect("shutdown timeout must terminate stalled-writer session cleanly");
     assert!(
         started.elapsed() < Duration::from_secs(2),
@@ -664,12 +671,13 @@ fn full_writer_queue_does_not_block_upstream_eof() {
         drained_tx: Some(drained_tx),
         close_rx,
     });
-    let (mut cout_w2, mut cout_r2) = mem_pipe();
+    let (mut cout_w2, mut cout_r2) = mem_pipe_timeout();
     let (_gate_tx2, gate_rx2) = mpsc::sync_channel(1);
     let (entered_tx2, entered_rx2) = mpsc::sync_channel(1);
     let (up_out_w2, up_out_r2) = mem_pipe();
+    let (done_tx2, done_rx2) = mpsc::sync_channel(1);
     let eof_thread = thread::spawn(move || {
-        eof_proxy.run(
+        let res = eof_proxy.run(
             cin_r2,
             &mut cout_w2,
             GateWriter {
@@ -677,7 +685,8 @@ fn full_writer_queue_does_not_block_upstream_eof() {
                 entered_tx: Some(entered_tx2),
             },
             up_out_r2,
-        )
+        );
+        let _ = done_tx2.send(res);
     });
 
     entered_rx2
@@ -688,15 +697,18 @@ fn full_writer_queue_does_not_block_upstream_eof() {
         .expect("writer queue guaranteed full before upstream EOF");
     drop(up_out_w2);
 
-    let mut eof_line = String::new();
-    cout_r2.read_line(&mut eof_line).unwrap();
+    let eof_line = cout_r2.read_line_timeout(
+        Duration::from_secs(2),
+        "upstream EOF error under full writer queue",
+    );
     let eof_json: Value = serde_json::from_str(eof_line.trim_end()).unwrap();
     assert_eq!(eof_json["id"], json!(1));
     assert_eq!(eof_json["error"]["code"], json!(-32603));
-    assert!(matches!(
-        eof_thread.join().unwrap(),
-        Err(ProxyError::UpstreamEof)
-    ));
+    let res = done_rx2
+        .recv_timeout(Duration::from_secs(2))
+        .expect("proxy hung on upstream EOF under full writer queue");
+    eof_thread.join().unwrap();
+    assert!(matches!(res, Err(ProxyError::UpstreamEof)));
 }
 
 #[test]
