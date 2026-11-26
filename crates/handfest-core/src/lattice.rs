@@ -114,7 +114,18 @@ impl core::error::Error for NarrowError {}
 pub fn subsumes(parent: &HandfestAst, child: &HandfestAst) -> Result<(), NarrowError> {
     parent.validate().map_err(NarrowError::InvalidAst)?;
     child.validate().map_err(NarrowError::InvalidAst)?;
-    check_handoff(parent, child)?;
+    let expected_id = parent.try_mandate_id().map_err(NarrowError::InvalidAst)?;
+    subsumes_with_parent_id(parent, expected_id, child)
+}
+
+/// Proves monotonic attenuation for already-validated `parent` and `child` using a precomputed
+/// `parent_id`, avoiding redundant validation and SHA-256 rehashing across chain checks.
+pub(crate) fn subsumes_with_parent_id(
+    parent: &HandfestAst,
+    parent_id: MandateId,
+    child: &HandfestAst,
+) -> Result<(), NarrowError> {
+    check_handoff(parent, parent_id, child)?;
     check_hops(parent, child)?;
     check_actions(parent, child)?;
     check_resources(parent, child)?;
@@ -123,8 +134,11 @@ pub fn subsumes(parent: &HandfestAst, child: &HandfestAst) -> Result<(), NarrowE
     Ok(())
 }
 
-fn check_handoff(parent: &HandfestAst, child: &HandfestAst) -> Result<(), NarrowError> {
-    let expected_id = parent.try_mandate_id().map_err(NarrowError::InvalidAst)?;
+fn check_handoff(
+    parent: &HandfestAst,
+    expected_id: MandateId,
+    child: &HandfestAst,
+) -> Result<(), NarrowError> {
     let Some(actual_id) = child.parent() else {
         return Err(NarrowError::MissingParent);
     };

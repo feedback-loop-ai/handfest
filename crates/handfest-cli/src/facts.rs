@@ -8,7 +8,9 @@ use std::fs;
 
 use handfest_core::ast::{is_valid_field_path, is_valid_quoted_str, parse_rfc3339_utc, Scalar};
 use handfest_core::gate::VerifiedFacts;
-use handfest_core::json_num::{parse_canonical_json_int, parse_decimal_str, parse_json_decimal};
+use handfest_core::json_num::{
+    parse_canonical_json_int, parse_decimal_str, parse_json_decimal, scan_json_number_token,
+};
 
 const MAX_JSON_DEPTH: usize = 16;
 
@@ -274,49 +276,9 @@ impl<'a> JsonParser<'a> {
 
     fn parse_number(&mut self) -> Result<String, String> {
         let start = self.pos;
-        if self.peek() == Some(b'-') {
-            self.pos += 1;
-        }
-        match self.peek() {
-            Some(b'0') => {
-                self.pos += 1;
-                if matches!(self.peek(), Some(b'0'..=b'9')) {
-                    return Err(format!("leading zero in JSON number at offset {start}"));
-                }
-            }
-            Some(b'1'..=b'9') => {
-                self.pos += 1;
-                self.consume_digits();
-            }
-            _ => return Err(format!("invalid JSON number at offset {start}")),
-        }
-
-        if self.peek() == Some(b'.') {
-            self.pos += 1;
-            if !self.consume_digits() {
-                return Err(format!("expected fractional digit at offset {}", self.pos));
-            }
-        }
-
-        if matches!(self.peek(), Some(b'e' | b'E')) {
-            self.pos += 1;
-            if matches!(self.peek(), Some(b'+' | b'-')) {
-                self.pos += 1;
-            }
-            if !self.consume_digits() {
-                return Err(format!("expected exponent digit at offset {}", self.pos));
-            }
-        }
-
-        Ok(self.src[start..self.pos].to_string())
-    }
-
-    fn consume_digits(&mut self) -> bool {
-        let start = self.pos;
-        while matches!(self.peek(), Some(b'0'..=b'9')) {
-            self.pos += 1;
-        }
-        self.pos > start
+        let end = scan_json_number_token(self.bytes, start).map_err(|err| err.to_string())?;
+        self.pos = end;
+        Ok(self.src[start..end].to_string())
     }
 }
 

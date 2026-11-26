@@ -317,6 +317,11 @@ fn round10_tools_list_filters_static_resource_id_mismatch_and_expired_chain_once
                     "action": "ops.deploy",
                     "resource_kind": "target",
                     "static_resource_id": "prod"
+                },
+                "deploy_wrong_kind": {
+                    "action": "ops.deploy",
+                    "resource_kind": "cluster",
+                    "static_resource_id": "staging"
                 }
             }
         }"#,
@@ -340,7 +345,7 @@ fn round10_tools_list_filters_static_resource_id_mismatch_and_expired_chain_once
             up_in_r.read_line(&mut req).unwrap();
             writeln!(
                 up_out_w,
-                r#"{{"jsonrpc":"2.0","id":1,"result":{{"tools":[{{"name":"deploy_staging","inputSchema":{{"type":"object"}}}},{{"name":"deploy_prod","inputSchema":{{"type":"object"}}}}]}}}}"#
+                r#"{{"jsonrpc":"2.0","id":1,"result":{{"tools":[{{"name":"deploy_staging","inputSchema":{{"type":"object"}}}},{{"name":"deploy_prod","inputSchema":{{"type":"object"}}}},{{"name":"deploy_wrong_kind","inputSchema":{{"type":"object"}}}}]}}}}"#
             )
             .unwrap();
         });

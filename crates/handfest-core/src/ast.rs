@@ -750,6 +750,11 @@ impl Decimal {
         Ok(dec)
     }
 
+    pub(crate) const fn from_valid_parts(mantissa: i128, scale: u8) -> Self {
+        debug_assert!(scale <= MAX_DECIMAL_SCALE);
+        Self { mantissa, scale }
+    }
+
     /// Validates that `scale <= MAX_DECIMAL_SCALE`.
     pub fn validate(&self) -> Result<(), AstError> {
         if self.scale > MAX_DECIMAL_SCALE {

@@ -16,7 +16,7 @@ use crate::exact_json::{
     is_canonical_json_int_syntax, parse_canonical_json_int, parse_decimal_str, parse_exact_json,
     parse_json_decimal, ExactJson,
 };
-use crate::framing::{find_case_colliding_keys, find_non_ascii_key};
+use crate::framing::{validate_json_keys_recursive, JsonKeyError};
 
 /// Expected scalar type for an argument-derived fact.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -220,6 +220,19 @@ impl ToolPolicy {
             )));
         }
         Ok(())
+    }
+
+    /// Builds [`VerifiedFacts`] from this policy's static facts (excluding `context.time`, which
+    /// is exclusively sourced from the runtime `Clock`).
+    pub(crate) fn static_verified_facts(&self) -> Result<VerifiedFacts, MappingError> {
+        let mut facts = VerifiedFacts::new();
+        for (field, typed) in &self.static_facts {
+            let scalar = typed.to_scalar()?;
+            if field != "context.time" {
+                facts.insert(field.clone(), scalar);
+            }
+        }
+        Ok(facts)
     }
 }
 
@@ -502,11 +515,8 @@ fn build_verified_facts(
 
     // Operator/broker-supplied static facts ALWAYS override argument-derived facts.
     // `context.time` is exclusively sourced from `Clock`, never from static or argument facts.
-    for (field, typed) in &policy.static_facts {
-        let scalar = typed.to_scalar()?;
-        if field != "context.time" {
-            facts.insert(field.clone(), scalar);
-        }
+    for (field, scalar) in policy.static_verified_facts()?.0 {
+        facts.insert(field, scalar);
     }
 
     Ok(facts)
@@ -592,7 +602,20 @@ fn check_argument_case_collisions(
     args_val: &ExactJson,
     args_map: &BTreeMap<String, ExactJson>,
 ) -> Result<(), MappingError> {
-    check_json_case_collisions(tool_name, args_val)?;
+    validate_json_keys_recursive(args_val).map_err(|err| match err {
+        JsonKeyError::NonAscii(key) => MappingError::NonAsciiArgumentKey {
+            tool: tool_name.to_string(),
+            key: key.to_string(),
+        },
+        JsonKeyError::CaseCollision {
+            existing,
+            colliding,
+        } => MappingError::CaseCollidingArgumentKey {
+            tool: tool_name.to_string(),
+            key: colliding.to_string(),
+            collides_with: existing.to_string(),
+        },
+    })?;
     if let Some(configured) = policy.resource_id_arg.as_deref() {
         reject_configured_case_collision(tool_name, args_map, configured)?;
     }
@@ -618,37 +641,6 @@ fn reject_configured_case_collision(
         });
     }
     Ok(())
-}
-
-fn check_json_case_collisions(tool_name: &str, val: &ExactJson) -> Result<(), MappingError> {
-    match val {
-        ExactJson::Object(map) => {
-            if let Some(key) = find_non_ascii_key(map) {
-                return Err(MappingError::NonAsciiArgumentKey {
-                    tool: tool_name.to_string(),
-                    key: key.to_string(),
-                });
-            }
-            if let Some((a, b)) = find_case_colliding_keys(map) {
-                return Err(MappingError::CaseCollidingArgumentKey {
-                    tool: tool_name.to_string(),
-                    key: b.to_string(),
-                    collides_with: a.to_string(),
-                });
-            }
-            for child in map.values() {
-                check_json_case_collisions(tool_name, child)?;
-            }
-            Ok(())
-        }
-        ExactJson::Array(items) => {
-            for item in items {
-                check_json_case_collisions(tool_name, item)?;
-            }
-            Ok(())
-        }
-        ExactJson::Null | ExactJson::Bool(_) | ExactJson::Number(_) | ExactJson::Str(_) => Ok(()),
-    }
 }
 
 fn is_valid_concrete_action(action: &str) -> bool {

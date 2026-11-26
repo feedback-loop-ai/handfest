@@ -2,6 +2,12 @@ use std::io::{self, BufReader, Read, Write};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
+use handfest_anchors::Ed25519Keypair;
+use handfest_core::ast::parse_rfc3339_utc;
+use handfest_ledger::SqliteLedger;
+
+use crate::mapping::ToolPolicyMap;
+use crate::proxy::{verify_mandate_chain, FixedClock, McpProxy};
 use crate::transport::{DuplexTransport, RecvOutcome};
 
 use super::*;
@@ -42,12 +48,45 @@ impl Drop for BrokenPipeSignalingWriter {
     }
 }
 
+fn build_test_proxy() -> McpProxy<FixedClock, SqliteLedger> {
+    let root_kp = Ed25519Keypair::generate();
+    let agent_kp = Ed25519Keypair::generate();
+    let valid_from = parse_rfc3339_utc("2026-01-01T00:00:00Z").unwrap();
+    let valid_until = parse_rfc3339_utc("2027-01-01T00:00:00Z").unwrap();
+    let now = parse_rfc3339_utc("2026-06-01T00:00:00Z").unwrap();
+    let text = format!(
+        "HANDFEST v1\n\
+         FROM human \"Root\" (key: {})\n\
+         TO agent \"Agent\" (key: {})\n\
+         DELEGATION max 0 hops\n\
+         ALLOW ops.run\n\
+         ON target \"staging\"\n",
+        root_kp.key_id(),
+        agent_kp.key_id(),
+    );
+    let signed = root_kp
+        .sign_mandate(&text, "session-test", valid_from, valid_until)
+        .unwrap();
+    let verified = verify_mandate_chain(&[signed]).unwrap();
+    McpProxy::new(
+        verified,
+        agent_kp.key_id(),
+        ToolPolicyMap::from_json_str(r#"{"tools":{}}"#).unwrap(),
+        SqliteLedger::open_in_memory().unwrap(),
+        FixedClock::new(now),
+    )
+    .unwrap()
+}
+
 #[test]
-fn post_eof_drain_timeout_surfaces_broken_pipe_from_poll_writer_error() {
+fn post_eof_drain_timeout_dispatch_surfaces_broken_pipe_without_prior_polling() {
     let (_client_hold_tx, client_hold_rx) = mpsc::sync_channel(1);
     let (_up_hold_tx, up_hold_rx) = mpsc::sync_channel(1);
     let (dropped_tx, dropped_rx) = mpsc::sync_channel(1);
 
+    let mut proxy = build_test_proxy();
+    let mut state = SessionState::default();
+    let mut client_out = Vec::new();
     let mut transport = DuplexTransport::start(
         BufReader::new(BlockingReader(client_hold_rx)),
         BrokenPipeSignalingWriter {
@@ -64,26 +103,33 @@ fn post_eof_drain_timeout_surfaces_broken_pipe_from_poll_writer_error() {
         .recv_timeout(Duration::from_secs(2))
         .expect("writer thread failed with BrokenPipe and populated writer_done_rx");
 
-    // Simulate post-EOF drain deadline expiring (`RecvOutcome::Timeout`) before `UpstreamWriteFailed`
-    // is dequeued from `event_rx`: `handle_post_eof_timeout` MUST surface `BrokenPipe`.
-    let expired_deadline = Some(Instant::now());
-    let outcome = transport.recv_event(expired_deadline);
+    // Deterministically produce `RecvOutcome::Timeout` and drive `McpProxy::run`'s exact outcome
+    // dispatcher (`handle_recv_outcome`), proving the timeout arm itself surfaces `BrokenPipe`
+    // rather than relying on an earlier non-timeout `poll_writer_error` or `UpstreamWriteFailed`.
+    let outcome = transport.recv_event(Some(Instant::now()));
     assert!(
         matches!(outcome, RecvOutcome::Timeout),
         "expected RecvOutcome::Timeout, got {outcome:?}"
     );
-    let err = handle_post_eof_timeout(&transport).unwrap_err();
+    let step = proxy.handle_recv_outcome(outcome, &mut state, &mut transport, &mut client_out);
     assert!(
-        matches!(err, ProxyError::Io(ref io_err) if io_err.kind() == io::ErrorKind::BrokenPipe),
-        "expected ProxyError::Io(BrokenPipe) on post-EOF drain timeout, got {err:?}"
+        matches!(
+            step,
+            LoopStep::Finish(Err(ProxyError::Io(ref io_err)))
+                if io_err.kind() == io::ErrorKind::BrokenPipe
+        ),
+        "expected LoopStep::Finish(Err(BrokenPipe)) on RecvOutcome::Timeout dispatch"
     );
 }
 
 #[test]
-fn post_eof_drain_timeout_returns_ok_when_writer_has_no_error() {
+fn post_eof_drain_timeout_dispatch_returns_ok_when_writer_has_no_error() {
     let (_client_hold_tx, client_hold_rx) = mpsc::sync_channel(1);
     let (_up_hold_tx, up_hold_rx) = mpsc::sync_channel(1);
 
+    let mut proxy = build_test_proxy();
+    let mut state = SessionState::default();
+    let mut client_out = Vec::new();
     let mut transport = DuplexTransport::start(
         BufReader::new(BlockingReader(client_hold_rx)),
         io::sink(),
@@ -93,5 +139,6 @@ fn post_eof_drain_timeout_returns_ok_when_writer_has_no_error() {
 
     let outcome = transport.recv_event(Some(Instant::now()));
     assert!(matches!(outcome, RecvOutcome::Timeout));
-    assert!(handle_post_eof_timeout(&transport).is_ok());
+    let step = proxy.handle_recv_outcome(outcome, &mut state, &mut transport, &mut client_out);
+    assert!(matches!(step, LoopStep::Finish(Ok(()))));
 }

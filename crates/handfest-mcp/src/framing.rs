@@ -201,11 +201,63 @@ pub(crate) fn reject_unknown_keys(
     Ok(())
 }
 
-pub(crate) fn find_non_ascii_key(obj: &BTreeMap<String, ExactJson>) -> Option<&str> {
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum JsonKeyError<'a> {
+    NonAscii(&'a str),
+    CaseCollision {
+        existing: &'a str,
+        colliding: &'a str,
+    },
+}
+
+impl JsonKeyError<'_> {
+    pub(crate) fn format_with_context(&self, context: &str) -> String {
+        match self {
+            Self::NonAscii(key) => format!("{context}: non-ASCII key '{key}'"),
+            Self::CaseCollision {
+                existing,
+                colliding,
+            } => format!(
+                "{context}: key '{colliding}' collides case-insensitively with '{existing}'"
+            ),
+        }
+    }
+}
+
+/// Recursively validates that every JSON object in `val` has strictly ASCII keys with no
+/// ASCII case-insensitive collisions.
+pub(crate) fn validate_json_keys_recursive(val: &ExactJson) -> Result<(), JsonKeyError<'_>> {
+    match val {
+        ExactJson::Object(map) => {
+            if let Some(key) = find_non_ascii_key(map) {
+                return Err(JsonKeyError::NonAscii(key));
+            }
+            if let Some((existing, colliding)) = find_case_colliding_keys(map) {
+                return Err(JsonKeyError::CaseCollision {
+                    existing,
+                    colliding,
+                });
+            }
+            for child in map.values() {
+                validate_json_keys_recursive(child)?;
+            }
+            Ok(())
+        }
+        ExactJson::Array(items) => {
+            for item in items {
+                validate_json_keys_recursive(item)?;
+            }
+            Ok(())
+        }
+        ExactJson::Null | ExactJson::Bool(_) | ExactJson::Number(_) | ExactJson::Str(_) => Ok(()),
+    }
+}
+
+fn find_non_ascii_key(obj: &BTreeMap<String, ExactJson>) -> Option<&str> {
     obj.keys().find(|k| !k.is_ascii()).map(String::as_str)
 }
 
-pub(crate) fn find_case_colliding_keys(obj: &BTreeMap<String, ExactJson>) -> Option<(&str, &str)> {
+fn find_case_colliding_keys(obj: &BTreeMap<String, ExactJson>) -> Option<(&str, &str)> {
     let mut seen: BTreeMap<String, &str> = BTreeMap::new();
     for key in obj.keys() {
         let folded = key.to_ascii_lowercase();
@@ -536,6 +588,40 @@ pub(crate) fn read_bounded_line<R: BufRead>(
         }
         buf.extend_from_slice(chunk);
         reader.consume(chunk_len);
+    }
+}
+
+pub(crate) fn fail_upstream_line_read<CW: Write>(
+    err: LineReadError,
+    max_line_bytes: usize,
+    req_id: Option<&JsonRpcId>,
+    client_out: &mut CW,
+) -> Result<(), ProxyError> {
+    match err {
+        LineReadError::TooLong => {
+            let _ = write_jsonrpc_error(
+                client_out,
+                req_id,
+                JSONRPC_INTERNAL_ERROR,
+                &format!("upstream response exceeded {max_line_bytes} bytes"),
+                None,
+            );
+            Err(ProxyError::UpstreamFrameTooLarge {
+                max_bytes: max_line_bytes,
+            })
+        }
+        LineReadError::BareCr => fail_upstream_error(
+            client_out,
+            req_id,
+            JSONRPC_PARSE_ERROR,
+            "upstream emitted bare carriage return (0x0D) in JSON-RPC frame".to_string(),
+        ),
+        LineReadError::InvalidUtf8 => fail_upstream_protocol(
+            client_out,
+            req_id,
+            "upstream emitted non-UTF-8 JSON-RPC frame".to_string(),
+        ),
+        LineReadError::Io(io_err) => Err(ProxyError::Io(io_err)),
     }
 }
 

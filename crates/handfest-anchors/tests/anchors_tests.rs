@@ -686,20 +686,29 @@ mod registry_tests {
             })
         );
 
-        // 2. Empty, control-char, and mismatched anchor_id
-        for bad_anchor in ["", "bad\nid", "other-anchor"] {
+        // 2a. Empty and control-char anchor_id isolated from mismatch (signed.anchor_id matches!)
+        for bad_anchor in ["", "bad\nid"] {
+            let mut bad_signed = base_signed.clone();
+            bad_signed.anchor_id = bad_anchor.to_string();
             let mut reg = AnchorRegistry::new();
-            let mut v = MutatingStubVerifier::clean();
-            v.override_anchor_id = Some(bad_anchor.to_string());
-            reg.register("passkey", v);
+            reg.register("passkey", MutatingStubVerifier::clean());
             assert!(
                 matches!(
-                    reg.verify(&base_signed),
-                    Err(AnchorError::InvalidAnchorId(_))
+                    reg.verify(&bad_signed),
+                    Err(AnchorError::InvalidAnchorId(ref msg)) if !msg.contains("does not match")
                 ),
-                "anchor_id {bad_anchor:?} must be rejected"
+                "isolated invalid anchor_id {bad_anchor:?} must fail anchor_id validation"
             );
         }
+        // 2b. Valid but mismatched anchor_id isolated from invalid syntax
+        let mut reg = AnchorRegistry::new();
+        let mut v = MutatingStubVerifier::clean();
+        v.override_anchor_id = Some("other-anchor".to_string());
+        reg.register("passkey", v);
+        assert!(matches!(
+            reg.verify(&base_signed),
+            Err(AnchorError::InvalidAnchorId(ref msg)) if msg.contains("does not match")
+        ));
 
         // 3. Mismatched signer_key (proof != envelope) and (proof != ast.from)
         let mut reg = AnchorRegistry::new();
@@ -739,29 +748,47 @@ mod registry_tests {
             Err(AnchorError::ActorKindMismatch { .. })
         ));
 
-        // 5. Out-of-range valid_from / valid_until, empty window, and mismatched window
+        // 5a. Out-of-range valid_from / valid_until isolated (envelope window matches proof)
         for (wf, wu) in [
             (MIN_RFC3339_TIMESTAMP - 1, until),
             (from, MAX_RFC3339_TIMESTAMP + 1),
         ] {
+            let mut bad_signed = base_signed.clone();
+            bad_signed.valid_from = wf;
+            bad_signed.valid_until = wu;
             let mut reg = AnchorRegistry::new();
-            let mut v = MutatingStubVerifier::clean();
-            v.override_window = Some((wf, wu));
-            reg.register("passkey", v);
+            reg.register("passkey", MutatingStubVerifier::clean());
             assert!(matches!(
-                reg.verify(&base_signed),
+                reg.verify(&bad_signed),
                 Err(AnchorError::InvalidTimestamp(_))
             ));
         }
-        for (wf, wu) in [(from, from), (from + 1, until), (from, until + 1)] {
+        // 5b. Inverted window (valid_from > valid_until) isolated (envelope matches proof)
+        let mut inverted_signed = base_signed.clone();
+        inverted_signed.valid_from = until;
+        inverted_signed.valid_until = from;
+        let mut reg = AnchorRegistry::new();
+        reg.register("passkey", MutatingStubVerifier::clean());
+        assert_eq!(
+            reg.verify(&inverted_signed),
+            Err(AnchorError::InvalidValidityWindow {
+                valid_from: until,
+                valid_until: from,
+            })
+        );
+        // 5c. Mismatched window isolated (proof window itself is valid_from <= valid_until)
+        for (wf, wu) in [(from + 1, until), (from, until + 1)] {
             let mut reg = AnchorRegistry::new();
             let mut v = MutatingStubVerifier::clean();
             v.override_window = Some((wf, wu));
             reg.register("passkey", v);
-            assert!(matches!(
+            assert_eq!(
                 reg.verify(&base_signed),
-                Err(AnchorError::InvalidValidityWindow { .. })
-            ));
+                Err(AnchorError::InvalidValidityWindow {
+                    valid_from: wf,
+                    valid_until: wu,
+                })
+            );
         }
 
         // 6. AST does not match signed.canonical_words
@@ -783,6 +810,66 @@ mod registry_tests {
             Err(AnchorError::NonCanonicalMandate(
                 ParseError::NonCanonical { .. }
             ))
+        ));
+    }
+
+    #[test]
+    fn ed25519_verifier_and_default_registry_agree_on_equal_validity_bounds() {
+        use handfest_anchors::{verify_verifier_postconditions, Ed25519Keypair, Ed25519Verifier};
+        use handfest_core::gate::{authorize, ActionRequest, QuotaSnapshot, VerifiedFacts};
+        use handfest_core::Verdict;
+
+        let kp = Ed25519Keypair::generate();
+        let leaf_kp = Ed25519Keypair::generate();
+        let text = format!(
+            "HANDFEST v1\n\
+             FROM human \"Root\" (key: {})\n\
+             TO agent \"Leaf\" (key: {})\n\
+             DELEGATION max 0 hops\n\
+             ALLOW git.pr.merge\n\
+             ON repo \"org/*\"\n",
+            kp.key_id(),
+            leaf_kp.key_id(),
+        );
+        let t = parse_rfc3339_utc("2026-06-01T00:00:00Z").unwrap();
+        let signed = kp
+            .sign_mandate(&text, "eq-bounds", t, t)
+            .expect("equal valid_from == valid_until signs cleanly");
+
+        let direct = Ed25519Verifier
+            .verify(&signed)
+            .expect("Ed25519Verifier accepts equal bounds");
+        let via_registry = AnchorRegistry::default_registry()
+            .verify(&signed)
+            .expect("AnchorRegistry::default_registry agrees with Ed25519Verifier");
+        assert_eq!(direct, via_registry);
+        assert_eq!(verify_verifier_postconditions(&signed, &direct), Ok(()));
+
+        // Invalid signer_key in envelope is rejected directly by verify_verifier_postconditions.
+        let mut bad_key_signed = signed.clone();
+        bad_key_signed.signer_key = "not-a-key-id".to_string();
+        assert!(matches!(
+            verify_verifier_postconditions(&bad_key_signed, &direct),
+            Err(AnchorError::InvalidPublicKey(_))
+        ));
+
+        // Gate evaluation still denies the empty [t, t) validity window at `now = t`.
+        let (verdict, _) = authorize(
+            &[via_registry],
+            &ActionRequest {
+                actor_key: leaf_kp.key_id(),
+                action: "git.pr.merge".into(),
+                resource_kind: "repo".into(),
+                resource_id: "org/app".into(),
+            },
+            &VerifiedFacts::new(),
+            &QuotaSnapshot::new(),
+            t,
+            None,
+        );
+        assert!(matches!(
+            verdict,
+            Verdict::Deny { ref reason } if reason.contains("invalid anchor proof validity window")
         ));
     }
 }

@@ -3,7 +3,9 @@
 use std::fmt;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use handfest_anchors::{AnchorError, AnchorRegistry, AnchorVerifier, SignedMandate};
+use handfest_anchors::{
+    verify_verifier_postconditions, AnchorError, AnchorRegistry, AnchorVerifier, SignedMandate,
+};
 use handfest_core::ast::MandateId;
 use handfest_core::gate::{verify_chain_structure, ChainStructureError, VerifiedMandate};
 use handfest_ledger::LedgerError;
@@ -165,12 +167,18 @@ pub fn verify_mandate_chain_with<V: AnchorVerifier + ?Sized>(
     }
     let mut verified = Vec::with_capacity(signed.len());
     for (hop, item) in signed.iter().enumerate() {
-        let vm = verifier.verify(item).map_err(|source| {
-            ProxyError::Anchor(AnchorError::ChainHop {
-                hop,
-                source: Box::new(source),
+        let vm = verifier
+            .verify(item)
+            .and_then(|vm| {
+                verify_verifier_postconditions(item, &vm)?;
+                Ok(vm)
             })
-        })?;
+            .map_err(|source| {
+                ProxyError::Anchor(AnchorError::ChainHop {
+                    hop,
+                    source: Box::new(source),
+                })
+            })?;
         verified.push(vm);
     }
     let _ = validate_verified_chain(&verified)?;

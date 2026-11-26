@@ -327,10 +327,24 @@ impl AnchorVerifier for AnchorRegistry {
             .get(key_id.scheme())
             .ok_or_else(|| AnchorError::UnsupportedKeyScheme(key_id.scheme().to_string()))?;
         let vm = verifier.verify(signed)?;
-        enforce_proof_identity_postconditions(signed, &key_id, &vm)?;
-        enforce_proof_window_and_ast_postconditions(signed, &vm)?;
+        verify_verifier_postconditions(signed, &vm)?;
         Ok(vm)
     }
+}
+
+/// Enforces the Liskov substitution postconditions required of every [`AnchorVerifier`] output:
+/// proof identity, actor kind, assurance level, valid `anchor_id`, RFC 3339 validity window
+/// (`valid_from <= valid_until`) matching the signed envelope, and canonical AST equality.
+pub fn verify_verifier_postconditions(
+    signed: &SignedMandate,
+    vm: &VerifiedMandate,
+) -> Result<(), AnchorError> {
+    let expected_key = KeyId::parse(&signed.signer_key).map_err(|err| {
+        AnchorError::InvalidPublicKey(format!("invalid KeyId '{}': {err}", signed.signer_key))
+    })?;
+    enforce_proof_identity_postconditions(signed, &expected_key, vm)?;
+    enforce_proof_window_and_ast_postconditions(signed, vm)?;
+    Ok(())
 }
 
 fn enforce_proof_identity_postconditions(
@@ -384,16 +398,8 @@ fn enforce_proof_window_and_ast_postconditions(
     signed: &SignedMandate,
     vm: &VerifiedMandate,
 ) -> Result<(), AnchorError> {
-    if !is_valid_timestamp(vm.proof.valid_from) {
-        return Err(AnchorError::InvalidTimestamp(vm.proof.valid_from));
-    }
-    if !is_valid_timestamp(vm.proof.valid_until) {
-        return Err(AnchorError::InvalidTimestamp(vm.proof.valid_until));
-    }
-    if vm.proof.valid_from >= vm.proof.valid_until
-        || vm.proof.valid_from != signed.valid_from
-        || vm.proof.valid_until != signed.valid_until
-    {
+    validate_validity_window(vm.proof.valid_from, vm.proof.valid_until)?;
+    if vm.proof.valid_from != signed.valid_from || vm.proof.valid_until != signed.valid_until {
         return Err(AnchorError::InvalidValidityWindow {
             valid_from: vm.proof.valid_from,
             valid_until: vm.proof.valid_until,

@@ -6,7 +6,9 @@ use std::io::Write;
 use std::time::Duration;
 
 use handfest_core::ast::{KeyId, MandateId};
-use handfest_core::gate::{verify_chain_runtime, ActionRequest, VerifiedMandate};
+use handfest_core::gate::{
+    evaluate_predicate_if_known, verify_chain_runtime, ActionRequest, VerifiedMandate,
+};
 use handfest_core::Verdict;
 pub use handfest_ledger::ReceiptLedger;
 use handfest_ledger::SqliteLedger;
@@ -17,7 +19,7 @@ pub use crate::adapters::{
 };
 use crate::exact_json::ExactJson;
 use crate::framing::{
-    fail_upstream_protocol, find_case_colliding_keys, find_non_ascii_key, reject_unknown_keys,
+    fail_upstream_protocol, reject_unknown_keys, validate_json_keys_recursive,
     write_denied_response, write_jsonrpc_error, write_raw_line, JsonRpcId, JSONRPC_INTERNAL_ERROR,
 };
 use crate::mapping::{denial_resource_id, ToolPolicyMap};
@@ -228,11 +230,7 @@ impl<C: Clock, L: ReceiptLedger> McpProxy<C, L> {
             );
         };
 
-        if let Err(detail) = reject_unknown_keys(
-            result_obj,
-            &["tools", "nextCursor", "_meta"],
-            "upstream tools/list result",
-        ) {
+        if let Err(detail) = validate_tools_list_result_fields(result_obj) {
             return fail_upstream_protocol(client_out, Some(req_id), detail);
         }
 
@@ -259,7 +257,7 @@ impl<C: Clock, L: ReceiptLedger> McpProxy<C, L> {
                     .as_object()
                     .and_then(|obj| obj.get("name"))
                     .and_then(ExactJson::as_str)
-                    .is_some_and(|name| self.is_tool_permitted(name))
+                    .is_some_and(|name| self.is_tool_permitted(name, evaluated_at))
             });
         }
 
@@ -276,7 +274,7 @@ impl<C: Clock, L: ReceiptLedger> McpProxy<C, L> {
     ) -> Result<(), ProxyError> {
         let reason = match verify_chain_runtime(&self.verified_chain, &self.actor_key, now) {
             Ok(()) => mapping_reason,
-            Err(chain_reason) => chain_reason,
+            Err(chain_err) => chain_err.to_string(),
         };
         let receipt = match self.ledger.record_denial(
             self.chain_ids.clone(),
@@ -304,8 +302,11 @@ impl<C: Clock, L: ReceiptLedger> McpProxy<C, L> {
         )
     }
 
-    fn is_tool_permitted(&self, tool_name: &str) -> bool {
+    fn is_tool_permitted(&self, tool_name: &str, evaluated_at: i64) -> bool {
         let Some(policy) = self.policy_map.get(tool_name) else {
+            return false;
+        };
+        let Ok(static_facts) = policy.static_verified_facts() else {
             return false;
         };
         self.verified_chain.iter().all(|vm| {
@@ -316,9 +317,16 @@ impl<C: Clock, L: ReceiptLedger> McpProxy<C, L> {
                     .on()
                     .iter()
                     .any(|sel| sel.kind() == policy.resource_kind && sel.matches(static_id)),
-                None => true,
+                None => vm
+                    .ast
+                    .on()
+                    .iter()
+                    .any(|sel| sel.kind() == policy.resource_kind),
             };
-            action_allowed && resource_allowed
+            let predicates_allowed = vm.ast.where_clauses().iter().all(|pred| {
+                evaluate_predicate_if_known(pred, &static_facts, evaluated_at).unwrap_or(true)
+            });
+            action_allowed && resource_allowed && predicates_allowed
         })
     }
 }
@@ -347,6 +355,35 @@ fn build_mapping_denial_request(
     }
 }
 
+fn validate_tools_list_result_fields(
+    result_obj: &BTreeMap<String, ExactJson>,
+) -> Result<(), String> {
+    reject_unknown_keys(
+        result_obj,
+        &["tools", "nextCursor", "_meta"],
+        "upstream tools/list result",
+    )?;
+    if let Some(cursor) = result_obj.get("nextCursor") {
+        if cursor.as_str().is_none() {
+            return Err(
+                "malformed upstream tools/list response: result.nextCursor must be a string"
+                    .to_string(),
+            );
+        }
+    }
+    if let Some(meta) = result_obj.get("_meta") {
+        if meta.as_object().is_none() {
+            return Err(
+                "malformed upstream tools/list response: result._meta must be a JSON object"
+                    .to_string(),
+            );
+        }
+        validate_json_keys_recursive(meta)
+            .map_err(|err| err.format_with_context("malformed upstream tools/list _meta"))?;
+    }
+    Ok(())
+}
+
 fn validate_tools_list_entries(tools: &[ExactJson]) -> Result<(), String> {
     for entry in tools {
         let Some(obj) = entry.as_object() else {
@@ -360,7 +397,8 @@ fn validate_tools_list_entries(tools: &[ExactJson]) -> Result<(), String> {
                 "malformed upstream tools/list entry: key '{key}' collides case-insensitively with 'name'"
             ));
         }
-        validate_tools_list_json_keys(entry)?;
+        validate_json_keys_recursive(entry)
+            .map_err(|err| err.format_with_context("malformed upstream tools/list entry"))?;
         let Some(name) = obj.get("name").and_then(ExactJson::as_str) else {
             return Err(
                 "malformed upstream tools/list entry: missing or non-string 'name'".to_string(),
@@ -373,34 +411,6 @@ fn validate_tools_list_entries(tools: &[ExactJson]) -> Result<(), String> {
         }
     }
     Ok(())
-}
-
-fn validate_tools_list_json_keys(val: &ExactJson) -> Result<(), String> {
-    match val {
-        ExactJson::Object(map) => {
-            if let Some(key) = find_non_ascii_key(map) {
-                return Err(format!(
-                    "malformed upstream tools/list entry: non-ASCII key '{key}'"
-                ));
-            }
-            if let Some((a, b)) = find_case_colliding_keys(map) {
-                return Err(format!(
-                    "malformed upstream tools/list entry: key '{b}' collides case-insensitively with '{a}'"
-                ));
-            }
-            for child in map.values() {
-                validate_tools_list_json_keys(child)?;
-            }
-            Ok(())
-        }
-        ExactJson::Array(items) => {
-            for item in items {
-                validate_tools_list_json_keys(item)?;
-            }
-            Ok(())
-        }
-        ExactJson::Null | ExactJson::Bool(_) | ExactJson::Number(_) | ExactJson::Str(_) => Ok(()),
-    }
 }
 
 fn extract_tool_call_params(

@@ -409,6 +409,38 @@ fn upstream_response_id_matches_exact_safe_integers_and_rejects_negative_zero_or
 }
 
 #[test]
+fn upstream_response_id_scales_positive_exponents_and_checks_safe_range() {
+    let client_ten = extract_id_value(&ExactJson::Number("10".to_string())).unwrap();
+    let client_hundred = extract_id_value(&ExactJson::Number("100".to_string())).unwrap();
+    let client_neg_hundred = extract_id_value(&ExactJson::Number("-100".to_string())).unwrap();
+    let client_scaled_max =
+        extract_id_value(&ExactJson::Number("9007199254740990".to_string())).unwrap();
+
+    for (raw, expected) in [
+        ("10.0", &client_ten),
+        ("1e1", &client_ten),
+        ("1e2", &client_hundred),
+        ("-1e2", &client_neg_hundred),
+        ("9.00719925474099e15", &client_scaled_max),
+    ] {
+        assert_eq!(
+            extract_upstream_response_id_value(&ExactJson::Number(raw.to_string())).unwrap(),
+            *expected,
+            "positive-exponent upstream response id {raw} must correlate"
+        );
+    }
+
+    for out_of_range in ["9.1e15", "-9.1e15"] {
+        assert_eq!(
+            extract_upstream_response_id_value(&ExactJson::Number(out_of_range.to_string()))
+                .unwrap_err(),
+            "JSON-RPC numeric id outside IEEE-754 safe integer range",
+            "positive-exponent overflow {out_of_range} must be rejected"
+        );
+    }
+}
+
+#[test]
 fn read_bounded_line_retries_eintr_mid_frame() {
     use std::collections::VecDeque;
     use std::io::{self, Read};

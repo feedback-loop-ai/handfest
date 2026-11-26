@@ -6,10 +6,11 @@ use std::time::{Duration, Instant};
 
 use crate::exact_json::{parse_exact_json, ExactJson};
 use crate::framing::{
-    classify_upstream_frame, extract_id_value, fail_upstream_error, fail_upstream_protocol,
-    format_jsonrpc_error_line, reject_unknown_keys, validate_client_envelope, write_jsonrpc_error,
-    write_raw_line, JsonRpcId, LineReadError, UpstreamFrame, JSONRPC_INTERNAL_ERROR,
-    JSONRPC_INVALID_REQUEST, JSONRPC_METHOD_NOT_FOUND, JSONRPC_PARSE_ERROR,
+    classify_upstream_frame, extract_id_value, fail_upstream_line_read, fail_upstream_protocol,
+    format_jsonrpc_error_line, reject_unknown_keys, validate_client_envelope,
+    validate_json_keys_recursive, write_jsonrpc_error, write_raw_line, JsonRpcId, LineReadError,
+    UpstreamFrame, JSONRPC_INTERNAL_ERROR, JSONRPC_INVALID_REQUEST, JSONRPC_METHOD_NOT_FOUND,
+    JSONRPC_PARSE_ERROR,
 };
 use crate::proxy::{Clock, McpProxy, ProxyError, ReceiptLedger, HANDFEST_DENIED_ERROR_CODE};
 use crate::transport::{DuplexTransport, IoEvent, RecvOutcome};
@@ -22,6 +23,12 @@ const ALLOWED_NOTIFICATION_METHODS: &[&str] = &[
     "notifications/initialized",
     "notifications/roots/list_changed",
 ];
+
+enum LoopStep {
+    Continue,
+    Finish(Result<(), ProxyError>),
+    FinishWriter,
+}
 
 pub(crate) enum PendingKind {
     Normal,
@@ -187,40 +194,55 @@ impl<C: Clock, L: ReceiptLedger> McpProxy<C, L> {
                 state.set_shutdown_timeout(self.shutdown_timeout);
             }
 
-            match transport.recv_event(state.shutdown_deadline) {
-                RecvOutcome::Event(IoEvent::ClientLine(res)) => {
-                    self.on_client_read(res, &mut state, &mut transport, client_out)?;
+            let outcome = transport.recv_event(state.shutdown_deadline);
+            match self.handle_recv_outcome(outcome, &mut state, &mut transport, client_out) {
+                LoopStep::Continue => {}
+                LoopStep::Finish(res) => return res,
+                LoopStep::FinishWriter => return transport.finish_writer(self.shutdown_timeout),
+            }
+        }
+    }
+
+    fn handle_recv_outcome<CW: Write>(
+        &mut self,
+        outcome: RecvOutcome,
+        state: &mut SessionState,
+        transport: &mut DuplexTransport,
+        client_out: &mut CW,
+    ) -> LoopStep {
+        match outcome {
+            RecvOutcome::Event(IoEvent::ClientLine(res)) => {
+                match self.on_client_read(res, state, transport, client_out) {
+                    Ok(()) => LoopStep::Continue,
+                    Err(err) => LoopStep::Finish(Err(err)),
                 }
-                RecvOutcome::Event(IoEvent::UpstreamLine(line)) => {
-                    self.on_upstream_read(line, &mut state, &mut transport, client_out)?;
+            }
+            RecvOutcome::Event(IoEvent::UpstreamLine(line)) => {
+                match self.on_upstream_read(line, state, transport, client_out) {
+                    Ok(()) => LoopStep::Continue,
+                    Err(err) => LoopStep::Finish(Err(err)),
                 }
-                RecvOutcome::Event(IoEvent::UpstreamReadFailed) => {
-                    if let Some(err) = transport.take_upstream_read_error() {
-                        return fail_upstream_line_read(
-                            err,
-                            self.max_line_bytes,
-                            state.active_id(),
-                            client_out,
-                        );
-                    }
-                    return emit_upstream_eof(client_out, state.active_id());
+            }
+            RecvOutcome::Event(IoEvent::UpstreamReadFailed) => {
+                LoopStep::Finish(if let Some(err) = transport.take_upstream_read_error() {
+                    fail_upstream_line_read(err, self.max_line_bytes, state.active_id(), client_out)
+                } else {
+                    emit_upstream_eof(client_out, state.active_id())
+                })
+            }
+            RecvOutcome::Event(IoEvent::UpstreamWriteReady) => LoopStep::Continue,
+            RecvOutcome::Event(IoEvent::UpstreamWriteFailed) => {
+                LoopStep::Finish(Err(transport.take_writer_error()))
+            }
+            RecvOutcome::Timeout => LoopStep::Finish(handle_post_eof_timeout(transport)),
+            RecvOutcome::Disconnected => {
+                if let Some(err) = transport.poll_writer_error() {
+                    return LoopStep::Finish(Err(err));
                 }
-                RecvOutcome::Event(IoEvent::UpstreamWriteReady) => {}
-                RecvOutcome::Event(IoEvent::UpstreamWriteFailed) => {
-                    return Err(transport.take_writer_error());
+                if state.active_request.is_some() {
+                    return LoopStep::Finish(emit_upstream_eof(client_out, state.active_id()));
                 }
-                RecvOutcome::Timeout => {
-                    return handle_post_eof_timeout(&transport);
-                }
-                RecvOutcome::Disconnected => {
-                    if let Some(err) = transport.poll_writer_error() {
-                        return Err(err);
-                    }
-                    if state.active_request.is_some() {
-                        return emit_upstream_eof(client_out, state.active_id());
-                    }
-                    return transport.finish_writer(self.shutdown_timeout);
-                }
+                LoopStep::FinishWriter
             }
         }
     }
@@ -595,40 +617,6 @@ impl<C: Clock, L: ReceiptLedger> McpProxy<C, L> {
     }
 }
 
-fn fail_upstream_line_read<CW: Write>(
-    err: LineReadError,
-    max_line_bytes: usize,
-    req_id: Option<&JsonRpcId>,
-    client_out: &mut CW,
-) -> Result<(), ProxyError> {
-    match err {
-        LineReadError::TooLong => {
-            let _ = write_jsonrpc_error(
-                client_out,
-                req_id,
-                JSONRPC_INTERNAL_ERROR,
-                &format!("upstream response exceeded {max_line_bytes} bytes"),
-                None,
-            );
-            Err(ProxyError::UpstreamFrameTooLarge {
-                max_bytes: max_line_bytes,
-            })
-        }
-        LineReadError::BareCr => fail_upstream_error(
-            client_out,
-            req_id,
-            JSONRPC_PARSE_ERROR,
-            "upstream emitted bare carriage return (0x0D) in JSON-RPC frame".to_string(),
-        ),
-        LineReadError::InvalidUtf8 => fail_upstream_protocol(
-            client_out,
-            req_id,
-            "upstream emitted non-UTF-8 JSON-RPC frame".to_string(),
-        ),
-        LineReadError::Io(io_err) => Err(ProxyError::Io(io_err)),
-    }
-}
-
 fn classify_client_line(raw_line: String) -> QueuedClientItem {
     let parsed = match parse_exact_json(&raw_line) {
         Ok(val) => val,
@@ -679,6 +667,14 @@ fn extract_cancel_request_id(obj: &BTreeMap<String, ExactJson>) -> Option<JsonRp
         "notifications/cancelled params",
     )
     .ok()?;
+    if params.get("reason").is_some_and(|v| v.as_str().is_none()) {
+        return None;
+    }
+    if let Some(meta) = params.get("_meta") {
+        if meta.as_object().is_none() || validate_json_keys_recursive(meta).is_err() {
+            return None;
+        }
+    }
     extract_id_value(params.get("requestId")?).ok()
 }
 

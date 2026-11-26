@@ -1124,9 +1124,13 @@ fn build_denial_receipt_enforces_rfc3339_timestamp_bounds() {
 
 #[test]
 fn verify_chain_runtime_and_structure_typed_errors_and_precedence() {
-    use handfest_core::gate::{verify_chain_runtime, verify_chain_structure, ChainStructureError};
+    use handfest_core::gate::{
+        evaluate_predicate_if_known, verify_chain_runtime, verify_chain_structure,
+        ChainStructureError, RuntimeChainError,
+    };
     use handfest_core::lattice::NarrowError;
     use handfest_core::ActorKind;
+    use sha2::{Digest, Sha256};
     use std::error::Error as _;
 
     let make_vm = |text: &str, signer: &str, kind: ActorKind, win: (i64, i64)| VerifiedMandate {
@@ -1153,33 +1157,94 @@ fn verify_chain_runtime_and_structure_typed_errors_and_precedence() {
     let sub = k("ed25519:cccc");
 
     assert_eq!(verify_chain_runtime(single, &leaf, 150), Ok(()));
+    let empty_rt = verify_chain_runtime(&[], &leaf, 150).unwrap_err();
     assert_eq!(
-        verify_chain_runtime(&[], &leaf, 150),
-        Err("empty mandate chain".into())
+        empty_rt,
+        RuntimeChainError::Structure(ChainStructureError::EmptyChain)
     );
+    assert!(empty_rt.source().is_some());
+    assert_eq!(empty_rt.to_string(), "empty mandate chain");
     for bad_ts in [MIN_RFC3339_TIMESTAMP - 1, MAX_RFC3339_TIMESTAMP + 1] {
         let err = verify_chain_runtime(single, &leaf, bad_ts).unwrap_err();
-        assert!(err.contains("outside 0000-01-01T00:00:00Z..=9999-12-31T23:59:59Z"));
+        assert_eq!(
+            err,
+            RuntimeChainError::InvalidTimestamp { timestamp: bad_ts }
+        );
+        assert!(err.source().is_none());
+        assert!(err
+            .to_string()
+            .contains("outside 0000-01-01T00:00:00Z..=9999-12-31T23:59:59Z"));
     }
-    assert!(verify_chain_runtime(single, &sub, 150)
-        .unwrap_err()
-        .contains("does not match leaf mandate TO key"));
-    assert!(verify_chain_runtime(single, &leaf, 200)
-        .unwrap_err()
-        .contains("outside anchor proof validity window"));
+    assert_eq!(
+        verify_chain_runtime(single, &sub, 150),
+        Err(RuntimeChainError::ActorKeyMismatch {
+            expected: leaf.clone(),
+            actual: sub.clone(),
+        })
+    );
+    assert_eq!(
+        verify_chain_runtime(single, &leaf, 200),
+        Err(RuntimeChainError::OutsideProofValidityWindow {
+            hop: 0,
+            now: 200,
+            valid_from: 100,
+            valid_until: 200,
+        })
+    );
+
+    // Empty or control-character proof anchor_id must be rejected on every hop.
+    for bad_anchor in ["", "bad\nid", "bad\0id"] {
+        let mut bad_vm = vm.clone();
+        bad_vm.proof.anchor_id = bad_anchor.to_string();
+        let err = verify_chain_runtime(std::slice::from_ref(&bad_vm), &leaf, 150).unwrap_err();
+        assert_eq!(err, RuntimeChainError::InvalidAnchorId { hop: 0 });
+        assert!(err.to_string().contains("invalid anchor proof anchor_id"));
+        let (verdict, _) = authorize(
+            &[bad_vm],
+            &ActionRequest {
+                actor_key: leaf.clone(),
+                action: "git.pr.merge".into(),
+                resource_kind: "repo".into(),
+                resource_id: "org/app".into(),
+            },
+            &VerifiedFacts::new(),
+            &QuotaSnapshot::new(),
+            150,
+            None,
+        );
+        assert!(matches!(
+            verdict,
+            Verdict::Deny { ref reason } if reason.contains("invalid anchor proof anchor_id")
+        ));
+    }
 
     let bad_signer = make_vm(root_text, "dddd", ActorKind::Human, (100, 200));
-    assert!(verify_chain_runtime(&[bad_signer], &leaf, 150)
-        .unwrap_err()
-        .contains("proof signer key"));
+    assert_eq!(
+        verify_chain_runtime(&[bad_signer], &leaf, 150),
+        Err(RuntimeChainError::ProofSignerMismatch {
+            hop: 0,
+            proof_key: k("ed25519:dddd"),
+            mandate_key: k("ed25519:aaaa"),
+        })
+    );
     let bad_kind = make_vm(root_text, "aaaa", ActorKind::Agent, (100, 200));
-    assert!(verify_chain_runtime(&[bad_kind], &leaf, 150)
-        .unwrap_err()
-        .contains("proof actor kind"));
+    assert_eq!(
+        verify_chain_runtime(&[bad_kind], &leaf, 150),
+        Err(RuntimeChainError::ProofActorKindMismatch {
+            hop: 0,
+            proof_kind: ActorKind::Agent,
+            mandate_kind: ActorKind::Human,
+        })
+    );
     let bad_window = make_vm(root_text, "aaaa", ActorKind::Human, (200, 200));
-    assert!(verify_chain_runtime(&[bad_window], &leaf, 200)
-        .unwrap_err()
-        .contains("invalid anchor proof validity window"));
+    assert_eq!(
+        verify_chain_runtime(&[bad_window], &leaf, 200),
+        Err(RuntimeChainError::InvalidProofValidityWindow {
+            hop: 0,
+            valid_from: 200,
+            valid_until: 200,
+        })
+    );
 
     // Out-of-range proof validity bounds must be rejected by gate::verify_proofs even when `now` is valid.
     for out_of_range_win in [
@@ -1189,8 +1254,17 @@ fn verify_chain_runtime_and_structure_typed_errors_and_precedence() {
     ] {
         let bad_bounds = make_vm(root_text, "aaaa", ActorKind::Human, out_of_range_win);
         let err = verify_chain_runtime(std::slice::from_ref(&bad_bounds), &leaf, 150).unwrap_err();
+        assert_eq!(
+            err,
+            RuntimeChainError::ProofTimestampOutOfRange {
+                hop: 0,
+                valid_from: out_of_range_win.0,
+                valid_until: out_of_range_win.1,
+            }
+        );
         assert!(
-            err.contains("outside 0000-01-01T00:00:00Z..=9999-12-31T23:59:59Z"),
+            err.to_string()
+                .contains("outside 0000-01-01T00:00:00Z..=9999-12-31T23:59:59Z"),
             "unexpected error: {err}"
         );
         let (verdict, _) = authorize(
@@ -1261,28 +1335,48 @@ fn verify_chain_runtime_and_structure_typed_errors_and_precedence() {
     assert!(hop_err.source().is_none());
     assert!(hop_err.to_string().contains("delegation hop overflow"));
 
+    // Hop-1 empty anchor_id rejected cleanly.
+    let mut bad_hop1_anchor = valid_child.clone();
+    bad_hop1_anchor.proof.anchor_id.clear();
+    assert_eq!(
+        verify_chain_runtime(&[vm.clone(), bad_hop1_anchor], &sub, 150),
+        Err(RuntimeChainError::InvalidAnchorId { hop: 1 })
+    );
+
     assert_eq!(
         verify_chain_runtime(&[vm.clone(), valid_child], &sub, 150),
         Ok(())
     );
-    assert!(
-        verify_chain_runtime(&[vm.clone(), widened_child.clone()], &sub, 150)
-            .unwrap_err()
-            .contains("attenuation check failed")
-    );
+    let wide_rt =
+        verify_chain_runtime(&[vm.clone(), widened_child.clone()], &sub, 150).unwrap_err();
+    assert!(matches!(
+        wide_rt,
+        RuntimeChainError::Structure(ChainStructureError::AttenuationFailed { hop: 0, .. })
+    ));
+    assert!(wide_rt.to_string().contains("attenuation check failed"));
 
     // Precedence regression: expired hop-0 proof [100, 200) at now = 200 AND widened hop-1 `ALLOW git.*`
     // MUST deny with the expired-proof reason (matching pre-round-9 60f105e/a2e28b9 precedence).
+    let expected_chain_ids = vec![pid, widened_child.ast.mandate_id()];
+    let expected_reason = "hop 0: timestamp 200 outside anchor proof validity window [100..200)";
     let chain = [vm, widened_child];
     let runtime_err = verify_chain_runtime(&chain, &sub, 200).unwrap_err();
     assert_eq!(
         runtime_err,
-        "hop 0: timestamp 200 outside anchor proof validity window [100..200)"
+        RuntimeChainError::OutsideProofValidityWindow {
+            hop: 0,
+            now: 200,
+            valid_from: 100,
+            valid_until: 200,
+        }
     );
+    assert_eq!(runtime_err.to_string(), expected_reason);
+
+    let prev_hash = MandateId([0xAB; 32]);
     let (verdict, receipt) = authorize(
         &chain,
         &ActionRequest {
-            actor_key: sub,
+            actor_key: sub.clone(),
             action: "git.pr.merge".into(),
             resource_kind: "repo".into(),
             resource_id: "org/app".into(),
@@ -1290,13 +1384,78 @@ fn verify_chain_runtime_and_structure_typed_errors_and_precedence() {
         &VerifiedFacts::new(),
         &QuotaSnapshot::new(),
         200,
-        None,
+        Some(prev_hash),
+    );
+    let expected_verdict = Verdict::Deny {
+        reason: expected_reason.into(),
+    };
+    assert_eq!(verdict, expected_verdict);
+    assert_eq!(receipt.chain_ids, expected_chain_ids);
+    assert_eq!(receipt.prev_receipt_hash, Some(prev_hash));
+    assert_eq!(receipt.verdict, expected_verdict);
+    assert_eq!(receipt.actor_key, sub);
+    assert_eq!(receipt.action, "git.pr.merge");
+    assert_eq!(receipt.resource, "repo \"org/app\"");
+    assert_eq!(receipt.timestamp, 200);
+
+    // Independently compute the canonical SHA-256 receipt hash from raw protocol inputs.
+    let mut hasher = Sha256::new();
+    hasher.update(b"HANDFEST-RECEIPT-v1\0");
+    hasher.update([1u8]);
+    hasher.update(prev_hash.as_bytes());
+    hasher.update((expected_chain_ids.len() as u64).to_be_bytes());
+    for id in &expected_chain_ids {
+        hasher.update(id.as_bytes());
+    }
+    for s in [
+        sub.scheme(),
+        sub.value(),
+        "git.pr.merge",
+        "repo \"org/app\"",
+    ] {
+        hasher.update((s.len() as u64).to_be_bytes());
+        hasher.update(s.as_bytes());
+    }
+    hasher.update(200i64.to_be_bytes());
+    hasher.update([1u8]);
+    hasher.update((expected_reason.len() as u64).to_be_bytes());
+    hasher.update(expected_reason.as_bytes());
+    let mut golden = [0u8; 32];
+    golden.copy_from_slice(&hasher.finalize());
+    assert_eq!(receipt.receipt_hash, MandateId(golden));
+    assert!(receipt.verify_hash());
+
+    // evaluate_predicate_if_known covers context.time, known static facts, and unknown facts.
+    let pred_ast = parse_mandate(
+        "HANDFEST v1\n\
+         FROM human \"Root\" (key: ed25519:aaaa)\n\
+         TO agent \"Leaf\" (key: ed25519:bbbb)\n\
+         DELEGATION max 0 hops\n\
+         ALLOW git.pr.merge\n\
+         ON repo \"org/*\"\n\
+         WHERE context.time < 2026-06-01T00:00:00Z\n\
+           AND env == \"prod\"\n\
+           AND pr.draft == false\n",
+    )
+    .unwrap();
+    let known = VerifiedFacts::new().with("env", Scalar::Str("staging".into()));
+    let before = handfest_core::ast::parse_rfc3339_utc("2026-05-01T00:00:00Z").unwrap();
+    let after = handfest_core::ast::parse_rfc3339_utc("2026-07-01T00:00:00Z").unwrap();
+    let clauses = pred_ast.where_clauses();
+    assert_eq!(
+        evaluate_predicate_if_known(&clauses[0], &known, before),
+        Some(true)
     );
     assert_eq!(
-        verdict,
-        Verdict::Deny {
-            reason: "hop 0: timestamp 200 outside anchor proof validity window [100..200)".into(),
-        }
+        evaluate_predicate_if_known(&clauses[0], &known, after),
+        Some(false)
     );
-    assert!(receipt.verify_hash());
+    assert_eq!(
+        evaluate_predicate_if_known(&clauses[1], &known, before),
+        Some(false)
+    );
+    assert_eq!(
+        evaluate_predicate_if_known(&clauses[2], &known, before),
+        None
+    );
 }

@@ -7,7 +7,7 @@ use alloc::format;
 use alloc::string::{String, ToString};
 use core::fmt;
 
-use crate::ast::{AstError, Decimal, MAX_DECIMAL_SCALE};
+use crate::ast::{Decimal, MAX_DECIMAL_SCALE};
 
 /// Structured error returned by canonical JSON numeric parsing and decimal conversion.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -19,7 +19,6 @@ pub enum NumberError {
     ExponentOverflow,
     ScaleOverflow { scale: u128, max: u8 },
     DecimalOverflow,
-    InvalidDecimal(AstError),
 }
 
 impl fmt::Display for NumberError {
@@ -34,18 +33,69 @@ impl fmt::Display for NumberError {
                 write!(f, "scale {scale} exceeds maximum {max}")
             }
             Self::DecimalOverflow => f.write_str("decimal overflow"),
-            Self::InvalidDecimal(err) => write!(f, "{err}"),
         }
     }
 }
 
-impl core::error::Error for NumberError {
-    fn source(&self) -> Option<&(dyn core::error::Error + 'static)> {
-        match self {
-            Self::InvalidDecimal(err) => Some(err),
-            _ => None,
+impl core::error::Error for NumberError {}
+
+/// Scans one RFC 8259 JSON number token starting at `start` within `bytes`, returning the end byte
+/// offset of the scanned token on success.
+///
+/// Enforces RFC 8259 leading-zero, fractional-digit, and exponent-digit syntax rules.
+pub fn scan_json_number_token(bytes: &[u8], start: usize) -> Result<usize, NumberError> {
+    let mut pos = start;
+    if bytes.get(pos) == Some(&b'-') {
+        pos += 1;
+    }
+    match bytes.get(pos) {
+        Some(&b'0') => {
+            pos += 1;
+            if matches!(bytes.get(pos), Some(b'0'..=b'9')) {
+                return Err(NumberError::LeadingZero);
+            }
+        }
+        Some(b'1'..=b'9') => {
+            pos += 1;
+            consume_ascii_digits(bytes, &mut pos);
+        }
+        _ => {
+            return Err(NumberError::InvalidSyntax(format!(
+                "invalid JSON number at offset {start}"
+            )));
         }
     }
+
+    if bytes.get(pos) == Some(&b'.') {
+        pos += 1;
+        if !consume_ascii_digits(bytes, &mut pos) {
+            return Err(NumberError::InvalidSyntax(format!(
+                "expected fractional digit at offset {pos}"
+            )));
+        }
+    }
+
+    if matches!(bytes.get(pos), Some(b'e' | b'E')) {
+        pos += 1;
+        if matches!(bytes.get(pos), Some(b'+' | b'-')) {
+            pos += 1;
+        }
+        if !consume_ascii_digits(bytes, &mut pos) {
+            return Err(NumberError::InvalidSyntax(format!(
+                "expected exponent digit at offset {pos}"
+            )));
+        }
+    }
+
+    Ok(pos)
+}
+
+fn consume_ascii_digits(bytes: &[u8], pos: &mut usize) -> bool {
+    let start = *pos;
+    while matches!(bytes.get(*pos), Some(b'0'..=b'9')) {
+        *pos += 1;
+    }
+    *pos > start
 }
 
 /// Exact canonical base-10 value of an RFC 8259 JSON numeric literal (`(-1)^neg * sig * 10^exp`).
@@ -225,16 +275,12 @@ fn build_decimal(neg: bool, trimmed_digits: &str, net_exp: i128) -> Result<Decim
                 max: MAX_DECIMAL_SCALE,
             });
         }
-        u8::try_from(abs_exp).map_err(|_| NumberError::ScaleOverflow {
-            scale: abs_exp,
-            max: MAX_DECIMAL_SCALE,
-        })?
+        // Guaranteed `abs_exp <= MAX_DECIMAL_SCALE (28) <= u8::MAX`.
+        abs_exp as u8
     };
 
     let mantissa = signed_from_u128(neg, acc).ok_or(NumberError::DecimalOverflow)?;
-    Decimal::new(mantissa, scale)
-        .map(|d| d.canonical())
-        .map_err(NumberError::InvalidDecimal)
+    Ok(Decimal::from_valid_parts(mantissa, scale).canonical())
 }
 
 fn signed_from_u128(neg: bool, abs: u128) -> Option<i128> {
@@ -306,6 +352,103 @@ mod tests {
         assert!(matches!(
             parse_decimal_str(""),
             Err(NumberError::InvalidSyntax(_))
+        ));
+    }
+
+    #[test]
+    fn decimal_min_max_and_overflow_boundaries_are_exact() {
+        let min_int = parse_decimal_str("-170141183460469231731687303715884105728").unwrap();
+        assert_eq!(min_int, Decimal::new(i128::MIN, 0).unwrap());
+        assert_eq!(min_int.mantissa(), i128::MIN);
+        assert_eq!(min_int.scale(), 0);
+
+        let min_scaled = parse_decimal_str("-1701411834604692317316873037158841057.28").unwrap();
+        assert_eq!(min_scaled, Decimal::new(i128::MIN, 2).unwrap());
+        assert_eq!(min_scaled.mantissa(), i128::MIN);
+        assert_eq!(min_scaled.scale(), 2);
+
+        let max_int = parse_decimal_str("170141183460469231731687303715884105727").unwrap();
+        assert_eq!(max_int, Decimal::new(i128::MAX, 0).unwrap());
+
+        for overflow in [
+            "170141183460469231731687303715884105728",
+            "-170141183460469231731687303715884105729",
+            "340282366920938463463374607431768211456",
+            "1e39",
+            "1e40",
+        ] {
+            assert_eq!(
+                parse_json_decimal(overflow),
+                Err(NumberError::DecimalOverflow),
+                "expected DecimalOverflow for {overflow}"
+            );
+        }
+
+        assert_eq!(
+            parse_json_decimal("1e-29"),
+            Err(NumberError::ScaleOverflow {
+                scale: 29,
+                max: MAX_DECIMAL_SCALE,
+            })
+        );
+    }
+
+    #[test]
+    fn malformed_integer_fraction_exponent_and_scanner_branches_fail_closed() {
+        for bad_exp in ["1e", "1E", "1e+", "1e-", "1e1a", "1E+1.2", "1e2e3"] {
+            assert!(
+                matches!(
+                    canonicalize_json_number(bad_exp),
+                    Err(NumberError::InvalidSyntax(ref msg)) if msg.contains("invalid exponent")
+                ),
+                "expected invalid exponent syntax error for {bad_exp}"
+            );
+        }
+
+        for bad_frac in ["1.", "0.", "1.a", "1.2.3", "-1."] {
+            assert!(
+                matches!(
+                    canonicalize_json_number(bad_frac),
+                    Err(NumberError::InvalidSyntax(ref msg))
+                        if msg.contains("invalid fractional digits")
+                ),
+                "expected invalid fractional digits error for {bad_frac}"
+            );
+        }
+
+        for bad_int in ["", "-", ".5", "-.5", "+1", "1a", " 1"] {
+            assert!(
+                matches!(
+                    canonicalize_json_number(bad_int),
+                    Err(NumberError::InvalidSyntax(ref msg))
+                        if msg.contains("invalid integer digits")
+                ),
+                "expected invalid integer digits error for {bad_int}"
+            );
+        }
+
+        // Shared scanner token boundaries
+        assert_eq!(scan_json_number_token(b"0,", 0), Ok(1));
+        assert_eq!(scan_json_number_token(b"-123.45e+6}", 0), Ok(10));
+        assert_eq!(
+            scan_json_number_token(b"01", 0),
+            Err(NumberError::LeadingZero)
+        );
+        assert_eq!(
+            scan_json_number_token(b"-01", 0),
+            Err(NumberError::LeadingZero)
+        );
+        assert!(matches!(
+            scan_json_number_token(b"-", 0),
+            Err(NumberError::InvalidSyntax(ref msg)) if msg.contains("invalid JSON number")
+        ));
+        assert!(matches!(
+            scan_json_number_token(b"1.", 0),
+            Err(NumberError::InvalidSyntax(ref msg)) if msg.contains("expected fractional digit")
+        ));
+        assert!(matches!(
+            scan_json_number_token(b"1e+", 0),
+            Err(NumberError::InvalidSyntax(ref msg)) if msg.contains("expected exponent digit")
         ));
     }
 }
