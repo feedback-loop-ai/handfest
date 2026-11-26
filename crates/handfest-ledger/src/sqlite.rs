@@ -15,10 +15,7 @@ use rusqlite::{
 };
 
 use crate::audit::{run_audit_tx, run_verified_track_record};
-use crate::preflight::{
-    open_existing_writable_guarded, open_read_only_guarded, open_writable_guarded,
-    ActiveHandleGuard,
-};
+use crate::preflight::{open_read_only_guarded, open_writable_guarded, ActiveHandleGuard};
 use crate::quotas::{apply_quota_updates, compute_quota_updates, load_quota_snapshot};
 use crate::schema::{initialize_or_verify_schema, verify_existing_schema};
 use crate::{LedgerError, ReceiptLedger, TrackRecord};
@@ -67,9 +64,8 @@ impl SqliteLedger {
     pub fn open_existing(path: impl AsRef<Path>) -> Result<Self, LedgerError> {
         let path = path.as_ref();
         validate_file_path(path, "SqliteLedger::open_existing")?;
-        let (conn, handle_guard) = open_existing_writable_guarded(path, |canonical| {
-            Connection::open_with_flags(canonical, EXISTING_LEDGER_OPEN_FLAGS)
-                .map_err(LedgerError::from)
+        let (conn, handle_guard) = open_writable_guarded(path, || {
+            Connection::open_with_flags(path, EXISTING_LEDGER_OPEN_FLAGS).map_err(LedgerError::from)
         })?;
         Self::init(conn, Some(handle_guard), "delete", false)
     }

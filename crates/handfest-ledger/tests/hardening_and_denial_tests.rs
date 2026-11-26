@@ -1052,7 +1052,7 @@ fn open_existing_rejects_missing_truncated_non_sqlite_and_empty_schema() {
     assert_eq!(fs::read(&non_sqlite).unwrap(), garbage);
     assert!(matches!(
         SqliteLedger::open_existing(dir.path()),
-        Err(LedgerError::Integrity(_))
+        Err(LedgerError::Storage(_))
     ));
 
     // 5. Empty-schema SQLite DB (valid header, 0 rows in sqlite_master) fails without DDL.
@@ -1111,4 +1111,146 @@ fn open_existing_accepts_valid_initialized_ledger_and_persists_receipts() {
     // Second open_existing while first handle is open exercises the refcount > 0 path cleanly.
     let existing2 = SqliteLedger::open_existing(&valid).unwrap();
     assert_eq!(existing2.verify_integrity().unwrap(), 2);
+}
+
+#[cfg(unix)]
+#[test]
+fn open_existing_lock_probe_helper() {
+    let Ok(db_path) = std::env::var("HANDFEST_OPEN_EXISTING_LOCK_DB") else {
+        return;
+    };
+    let mode = std::env::var("HANDFEST_OPEN_EXISTING_PROBE_MODE").unwrap_or_default();
+    let sql = match mode.as_str() {
+        "exclusive" => "BEGIN EXCLUSIVE; ROLLBACK;",
+        "immediate" => "BEGIN IMMEDIATE; ROLLBACK;",
+        other => panic!("unexpected probe mode: {other}"),
+    };
+    let conn = Connection::open(&db_path).expect("probe open");
+    conn.busy_timeout(std::time::Duration::ZERO).unwrap();
+    let res = conn.execute_batch(sql);
+    let expect_locked = std::env::var("HANDFEST_OPEN_EXISTING_EXPECT_LOCKED").as_deref() == Ok("1");
+    if expect_locked {
+        assert!(
+            res.is_err(),
+            "expected parent POSIX lock ({mode}) to remain held, but child acquired it"
+        );
+    } else {
+        res.expect("expected child lock probe to succeed after parent released transaction");
+    }
+}
+
+#[cfg(unix)]
+fn assert_cross_process_lock(db_path: &std::path::Path, mode: &str, expect_locked: bool) {
+    let exe = std::env::current_exe().expect("current test exe");
+    let status = std::process::Command::new(&exe)
+        .args(["--exact", "open_existing_lock_probe_helper", "--quiet"])
+        .env("HANDFEST_OPEN_EXISTING_LOCK_DB", db_path)
+        .env("HANDFEST_OPEN_EXISTING_PROBE_MODE", mode)
+        .env(
+            "HANDFEST_OPEN_EXISTING_EXPECT_LOCKED",
+            if expect_locked { "1" } else { "0" },
+        )
+        .status()
+        .expect("spawn cross-process lock probe");
+    assert!(
+        status.success(),
+        "cross-process lock probe failed (mode={mode}, expect_locked={expect_locked})"
+    );
+}
+
+#[test]
+fn open_existing_preserves_active_sqlite_transaction_locks() {
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    let dir = TempDir::new().unwrap();
+    let (vm, req, facts) = sum_and_calls_mandate();
+    let db_path = dir.path().join("locked_existing.sqlite");
+
+    {
+        let mut init = SqliteLedger::open(&db_path).unwrap();
+        let (v, _) = init
+            .evaluate_and_record(
+                std::slice::from_ref(&vm),
+                &req,
+                &facts,
+                ts("2026-11-24T18:00:00Z"),
+            )
+            .unwrap();
+        assert_eq!(v, Verdict::Permit);
+    }
+
+    // 1. Active SHARED read-snapshot lock: concurrent SqliteLedger::open_existing must wait for
+    //    the reader's lock without dropping it (zero raw File::open), then succeed once released.
+    {
+        let reader = Connection::open(&db_path).unwrap();
+        reader.execute_batch("BEGIN DEFERRED;").unwrap();
+        let count: i64 = reader
+            .query_row("SELECT count(*) FROM receipts", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 1);
+
+        let (started_tx, started_rx) = mpsc::channel();
+        let (done_tx, done_rx) = mpsc::channel();
+        let thread_path = db_path.clone();
+        let handle = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            let ledger = SqliteLedger::open_existing(&thread_path).unwrap();
+            let verified = ledger.verify_integrity().unwrap();
+            done_tx.send(verified).unwrap();
+        });
+        started_rx.recv().unwrap();
+
+        assert!(
+            done_rx.recv_timeout(Duration::from_millis(50)).is_err(),
+            "open_existing must wait while another handle holds a SHARED read snapshot"
+        );
+        #[cfg(unix)]
+        assert_cross_process_lock(&db_path, "exclusive", true);
+
+        reader.execute_batch("ROLLBACK;").unwrap();
+        drop(reader);
+
+        let verified = done_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("open_existing must succeed once SHARED snapshot releases");
+        assert_eq!(verified, 1);
+        handle.join().unwrap();
+    }
+    #[cfg(unix)]
+    assert_cross_process_lock(&db_path, "exclusive", false);
+
+    // 2. Active BEGIN IMMEDIATE (RESERVED) lock: concurrent SqliteLedger::open_existing waits on
+    //    the lock without dropping it, then completes cleanly once the first transaction ends.
+    let writer_tx = Connection::open(&db_path).unwrap();
+    writer_tx.execute_batch("BEGIN IMMEDIATE;").unwrap();
+
+    let (started_tx, started_rx) = mpsc::channel();
+    let (done_tx, done_rx) = mpsc::channel();
+    let thread_path = db_path.clone();
+    let handle = std::thread::spawn(move || {
+        started_tx.send(()).unwrap();
+        let ledger = SqliteLedger::open_existing(&thread_path).unwrap();
+        let verified = ledger.verify_integrity().unwrap();
+        done_tx.send(verified).unwrap();
+    });
+    started_rx.recv().unwrap();
+
+    assert!(
+        done_rx.recv_timeout(Duration::from_millis(50)).is_err(),
+        "open_existing must wait while another handle holds BEGIN IMMEDIATE"
+    );
+    #[cfg(unix)]
+    assert_cross_process_lock(&db_path, "immediate", true);
+
+    writer_tx.execute_batch("ROLLBACK;").unwrap();
+    drop(writer_tx);
+
+    let verified = done_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("open_existing must succeed once BEGIN IMMEDIATE releases");
+    assert_eq!(verified, 1);
+    handle.join().unwrap();
+    #[cfg(unix)]
+    assert_cross_process_lock(&db_path, "immediate", false);
 }

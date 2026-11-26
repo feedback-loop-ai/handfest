@@ -127,55 +127,6 @@ where
     Ok((conn, ActiveHandleGuard(id)))
 }
 
-/// Validates that an existing ledger path resolves to a regular SQLite rollback-journal file
-/// (`>= 100` bytes with valid header magic) and opens a writable connection while holding the
-/// process-local active-handle registry lock.
-///
-/// Never creates missing files; skips raw `File::open` header inspection when `refcount > 0` on
-/// the same inode so POSIX `fcntl` locks held by active handles in this process are preserved.
-pub(crate) fn open_existing_writable_guarded<T, F>(
-    path: &Path,
-    open_conn: F,
-) -> Result<(T, ActiveHandleGuard), LedgerError>
-where
-    F: FnOnce(&Path) -> Result<T, LedgerError>,
-{
-    let mut map = active_handles()
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner);
-    let canonical = fs::canonicalize(path).map_err(|err| {
-        LedgerError::Storage(format!(
-            "existing ledger '{}' not found or inaccessible: {err}",
-            path.display()
-        ))
-    })?;
-    let meta = stat_existing_regular_file(&canonical, "existing ledger")?;
-    let id = FileIdentity::from_metadata(&canonical, &meta);
-    if map.get(&id).copied().unwrap_or(0) == 0 {
-        inspect_sqlite_header(&canonical)?;
-    }
-    let conn = open_conn(&canonical)?;
-    let post_id = match FileIdentity::from_path(&canonical) {
-        Ok(post_id) => post_id,
-        Err(err) => {
-            drop(conn);
-            return Err(LedgerError::Integrity(format!(
-                "existing ledger '{}' disappeared or became inaccessible after open: {err}",
-                canonical.display()
-            )));
-        }
-    };
-    if post_id != id {
-        drop(conn);
-        return Err(LedgerError::Integrity(format!(
-            "existing ledger '{}' was replaced concurrently during open",
-            canonical.display()
-        )));
-    }
-    *map.entry(id.clone()).or_insert(0) += 1;
-    Ok((conn, ActiveHandleGuard(id)))
-}
-
 /// Validates read-only sidecars and opens a read-only ledger connection while holding the
 /// process-local active-handle registry lock across the `refcount == 0` check, header inspection,
 /// SQLite open, and refcount increment.
@@ -189,14 +140,14 @@ pub(crate) fn open_read_only_guarded<T, F>(
 where
     F: FnOnce(&Path) -> Result<T, LedgerError>,
 {
-    stat_existing_regular_file(canonical, "read-only ledger")?;
+    stat_read_only_regular_file(canonical)?;
     check_wal_sidecar(&append_suffix(canonical, "-wal"))?;
     check_rollback_journal_sidecar(&append_suffix(canonical, "-journal"))?;
 
     let mut map = active_handles()
         .lock()
         .unwrap_or_else(PoisonError::into_inner);
-    let meta = stat_existing_regular_file(canonical, "read-only ledger")?;
+    let meta = stat_read_only_regular_file(canonical)?;
     let id = FileIdentity::from_metadata(canonical, &meta);
     if map.get(&id).copied().unwrap_or(0) == 0 {
         inspect_sqlite_header(canonical)?;
@@ -206,22 +157,22 @@ where
     Ok((conn, ActiveHandleGuard(id)))
 }
 
-fn stat_existing_regular_file(canonical: &Path, label: &str) -> Result<fs::Metadata, LedgerError> {
+fn stat_read_only_regular_file(canonical: &Path) -> Result<fs::Metadata, LedgerError> {
     let meta = fs::metadata(canonical).map_err(|err| {
         LedgerError::Integrity(format!(
-            "failed to stat {label} '{}': {err}",
+            "failed to stat read-only ledger '{}': {err}",
             canonical.display()
         ))
     })?;
     if !meta.is_file() {
         return Err(LedgerError::Integrity(format!(
-            "{label} '{}' is not a regular file",
+            "read-only ledger '{}' is not a regular file",
             canonical.display()
         )));
     }
     if meta.len() < SQLITE_HEADER_LEN as u64 {
         return Err(LedgerError::Integrity(format!(
-            "{label} '{}' is truncated ({} bytes; minimum {SQLITE_HEADER_LEN})",
+            "read-only ledger '{}' is truncated ({} bytes; minimum {SQLITE_HEADER_LEN})",
             canonical.display(),
             meta.len()
         )));
@@ -515,87 +466,5 @@ mod tests {
             check_rollback_journal_sidecar_with_budget(&stuck, Duration::from_millis(15)),
             Err(LedgerError::Integrity(_))
         ));
-    }
-
-    #[test]
-    fn open_existing_writable_guarded_rejects_concurrent_replacement_and_unlink() {
-        use std::sync::atomic::{AtomicBool, Ordering};
-        use std::sync::Arc;
-
-        struct DropTracker(Arc<AtomicBool>);
-        impl Drop for DropTracker {
-            fn drop(&mut self) {
-                self.0.store(true, Ordering::SeqCst);
-            }
-        }
-
-        let write_fake_sqlite = |path: &Path| {
-            let mut fake = [0u8; SQLITE_HEADER_LEN];
-            fake[..SQLITE_HEADER_MAGIC.len()].copy_from_slice(SQLITE_HEADER_MAGIC);
-            fake[18] = 1;
-            fake[19] = 1;
-            fs::write(path, fake).unwrap();
-        };
-
-        let dir = TempDir::new().unwrap();
-
-        #[cfg(unix)]
-        {
-            let target = dir.path().join("replaced.sqlite");
-            let old_alias = dir.path().join("replaced_old_inode.sqlite");
-            let replacement = dir.path().join("replacement.sqlite");
-            write_fake_sqlite(&target);
-            fs::hard_link(&target, &old_alias).unwrap();
-            write_fake_sqlite(&replacement);
-
-            let dropped = Arc::new(AtomicBool::new(false));
-            let dropped_for_cb = Arc::clone(&dropped);
-            let res = open_existing_writable_guarded(&target, |canonical| {
-                fs::rename(&replacement, canonical).unwrap();
-                Ok(DropTracker(dropped_for_cb))
-            });
-            assert!(
-                matches!(res, Err(LedgerError::Integrity(_))),
-                "concurrent pathname replacement must fail closed with LedgerError::Integrity"
-            );
-            assert!(
-                dropped.load(Ordering::SeqCst),
-                "connection handle must be dropped immediately on inode mismatch"
-            );
-            assert_eq!(active_handle_count(&fs::canonicalize(&target).unwrap()), 0);
-            assert_eq!(
-                active_handle_count(&fs::canonicalize(&old_alias).unwrap()),
-                0
-            );
-        }
-
-        let vanished = dir.path().join("vanished.sqlite");
-        write_fake_sqlite(&vanished);
-        #[cfg(unix)]
-        let vanished_old_alias = {
-            let alias = dir.path().join("vanished_old_inode.sqlite");
-            fs::hard_link(&vanished, &alias).unwrap();
-            alias
-        };
-
-        let dropped = Arc::new(AtomicBool::new(false));
-        let dropped_for_cb = Arc::clone(&dropped);
-        let res = open_existing_writable_guarded(&vanished, |canonical| {
-            fs::remove_file(canonical).unwrap();
-            Ok(DropTracker(dropped_for_cb))
-        });
-        assert!(
-            matches!(res, Err(LedgerError::Integrity(_))),
-            "concurrent unlink during open must fail closed with LedgerError::Integrity"
-        );
-        assert!(
-            dropped.load(Ordering::SeqCst),
-            "connection handle must be dropped immediately when path disappears"
-        );
-        #[cfg(unix)]
-        assert_eq!(
-            active_handle_count(&fs::canonicalize(&vanished_old_alias).unwrap()),
-            0
-        );
     }
 }
