@@ -1,12 +1,13 @@
-//! Policy-map backed `handfest check` request resolution, reusing `handfest-mcp`'s single
-//! `ToolPolicyMap` and exact-JSON/decimal codec.
+//! Policy-map backed `handfest check` request resolution, reusing `handfest-core`'s single
+//! transport-independent `ToolPolicyMap` and exact-JSON/decimal codec.
 
+use std::fs;
 use std::io::{self, Read};
 use std::path::Path;
 
 use handfest_core::ast::KeyId;
 use handfest_core::gate::{ActionRequest, VerifiedFacts};
-use handfest_mcp::{MappingError, ToolPolicyMap};
+use handfest_core::policy::{MappingError, ToolPolicyMap};
 use serde_json::json;
 
 /// Structured policy-mapping error emitted on `stderr` so hooks and agents parse failure codes
@@ -65,7 +66,17 @@ pub(crate) fn resolve_policy_map_request(
     tool_name: &str,
     tool_input_arg: &str,
 ) -> Result<(ActionRequest, VerifiedFacts), PolicyCheckError> {
-    let policy_map = ToolPolicyMap::from_file(policy_map_path).map_err(|err| PolicyCheckError {
+    let raw_policy = fs::read_to_string(policy_map_path).map_err(|err| {
+        let map_err = MappingError::Io(format!(
+            "failed to read '{}': {err}",
+            policy_map_path.display()
+        ));
+        PolicyCheckError {
+            code: classify_policy_load_error(&map_err),
+            message: map_err.to_string(),
+        }
+    })?;
+    let policy_map = ToolPolicyMap::from_json_str(&raw_policy).map_err(|err| PolicyCheckError {
         code: classify_policy_load_error(&err),
         message: err.to_string(),
     })?;

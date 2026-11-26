@@ -409,15 +409,16 @@ fn assert_duplicate_inode_cap_and_journal_guard(
     );
     assert_eq!(reg.lock().unwrap().total_deferred_fds(), MAX_DEFERRED_FDS);
 
-    // Attempting to retain past MAX_DEFERRED_FDS must fail closed and never exceed the cap.
+    // Attempting to retain a protected inode past MAX_DEFERRED_FDS retains the fd first (never
+    // closing it and dropping POSIX fcntl locks) and still returns the cap Storage error.
     {
         let mut state = reg.lock().unwrap();
         assert!(matches!(
             state.maybe_defer_fd(key, File::open(dup_source).unwrap()),
             Err(LedgerError::Storage(ref m)) if m.contains("deferred raw-open fd cap (64)")
         ));
-        assert_eq!(state.deferred_fds[&key].len(), MAX_DEFERRED_FDS);
-        assert_eq!(state.total_deferred_fds(), MAX_DEFERRED_FDS);
+        assert_eq!(state.deferred_fds[&key].len(), MAX_DEFERRED_FDS + 1);
+        assert_eq!(state.total_deferred_fds(), MAX_DEFERRED_FDS + 1);
     }
     drop(writer_guard);
     assert!(reg.lock().unwrap().deferred_fds.is_empty());
@@ -1041,7 +1042,7 @@ fn inode_change_before_open_cannot_exceed_deferred_fd_cap() {
     assert_eq!(reg.lock().unwrap().total_deferred_fds(), MAX_DEFERRED_FDS);
 
     // Header probe race: pathname starts as untracked db_new, then changes to tracked db_a
-    // right before open. Pool MUST stay capped at MAX_DEFERRED_FDS and return Storage error.
+    // right before open. File MUST be retained (never dropped) while still returning Storage error.
     {
         let mut state = reg.lock().unwrap();
         let res = inspect_sqlite_header_with_opener(&mut state, &db_new, |path| {
@@ -1053,11 +1054,11 @@ fn inode_change_before_open_cannot_exceed_deferred_fd_cap() {
             res,
             Err(LedgerError::Storage(ref m)) if m.contains("deferred raw-open fd cap (64)")
         ));
-        assert_eq!(state.total_deferred_fds(), MAX_DEFERRED_FDS);
+        assert_eq!(state.total_deferred_fds(), MAX_DEFERRED_FDS + 1);
     }
 
     // Journal probe race: pathname starts as untracked journal_new, then changes to tracked db_a
-    // right before open. Pool MUST stay capped at MAX_DEFERRED_FDS and return Storage error.
+    // right before open. File MUST be retained (never dropped) while still returning Storage error.
     let res = probe_rollback_journal_open_with_opener(reg, &journal_new, false, |path| {
         fs::remove_file(path)?;
         fs::hard_link(&db_a, path)?;
@@ -1067,22 +1068,333 @@ fn inode_change_before_open_cannot_exceed_deferred_fd_cap() {
         res,
         Err(LedgerError::Storage(ref m)) if m.contains("deferred raw-open fd cap (64)")
     ));
-    assert_eq!(reg.lock().unwrap().total_deferred_fds(), MAX_DEFERRED_FDS);
+    assert_eq!(
+        reg.lock().unwrap().total_deferred_fds(),
+        MAX_DEFERRED_FDS + 2
+    );
 
-    // Unknown/missing pre-open inode key with active reader and saturated pool also fails closed
-    // before invoking open.
+    // Unknown/missing pre-open inode key with active_writers == 0 fails with Integrity (not
+    // Storage), while with active_writers > 0 it fails closed with Storage before invoking open.
+    let missing = dir.path().join("vanished.sqlite");
     {
         let mut state = reg.lock().unwrap();
-        let missing = dir.path().join("vanished.sqlite");
+        assert!(matches!(
+            inspect_sqlite_header_locked(&mut state, &missing),
+            Err(LedgerError::Integrity(_))
+        ));
+    }
+    let ((), w_b2) = open_writable_guarded_in(reg, &db_b, || Ok(())).unwrap();
+    {
+        let mut state = reg.lock().unwrap();
         let calls_before = raw_open_calls();
         assert!(matches!(
             inspect_sqlite_header_locked(&mut state, &missing),
             Err(LedgerError::Storage(ref m)) if m.contains("deferred raw-open fd cap (64)")
         ));
         assert_eq!(raw_open_calls(), calls_before);
-        assert_eq!(state.total_deferred_fds(), MAX_DEFERRED_FDS);
+    }
+    drop(w_b2);
+
+    drop(ro_a);
+    assert!(reg.lock().unwrap().deferred_fds.is_empty());
+}
+
+#[cfg(unix)]
+fn init_real_sqlite_db(path: &Path) -> PathBuf {
+    let conn = rusqlite::Connection::open(path).expect("create test sqlite db");
+    conn.execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY); INSERT INTO t VALUES (1);")
+        .expect("init test sqlite table");
+    drop(conn);
+    fs::canonicalize(path).expect("canonicalize test sqlite db")
+}
+
+#[cfg(unix)]
+fn saturate_registry_for_reader_only_state(
+    reg: &'static Mutex<ActiveHandleRegistry>,
+    dir: &Path,
+    db_a: &Path,
+    db_b: &Path,
+) -> ActiveHandleGuard {
+    let ((), ro_a) = open_read_only_guarded_in(reg, db_a, |_| Ok(())).unwrap();
+    let ((), w_b) = open_writable_guarded_in(reg, db_b, || Ok(())).unwrap();
+    for i in 0..MAX_DEFERRED_FDS {
+        let fill = write_valid_header_file(&dir.join(format!("sat_fill_{i}.sqlite")));
+        let ((), ro_fill) = open_read_only_guarded_in(reg, &fill, |_| Ok(())).unwrap();
+        drop(ro_fill);
+    }
+    assert_eq!(reg.lock().unwrap().total_deferred_fds(), MAX_DEFERRED_FDS);
+    drop(w_b);
+    assert_eq!(reg.lock().unwrap().active_writers, 0);
+    assert_eq!(reg.lock().unwrap().total_deferred_fds(), MAX_DEFERRED_FDS);
+    ro_a
+}
+
+#[cfg(unix)]
+#[test]
+fn preflight_exclusive_lock_probe_helper() {
+    let Ok(db_path) = std::env::var("HANDFEST_PREFLIGHT_LOCK_DB") else {
+        return;
+    };
+    let conn = rusqlite::Connection::open(&db_path).expect("probe open");
+    conn.busy_timeout(Duration::ZERO).unwrap();
+    let res = conn.execute_batch("BEGIN EXCLUSIVE; ROLLBACK;");
+    let expect_locked = std::env::var("HANDFEST_PREFLIGHT_EXPECT_LOCKED").as_deref() == Ok("1");
+    if expect_locked {
+        match res {
+            Err(rusqlite::Error::SqliteFailure(err, _))
+                if err.code == rusqlite::ErrorCode::DatabaseBusy => {}
+            other => panic!(
+                "expected parent POSIX lock to fail with DatabaseBusy (SQLITE_BUSY), got: {other:?}"
+            ),
+        }
+    } else {
+        res.expect("expected child EXCLUSIVE lock to succeed after parent lock ended");
+    }
+}
+
+#[cfg(unix)]
+fn assert_preflight_exclusive_lock(db_path: &Path, expect_locked: bool) {
+    use std::process::Command;
+
+    let exe = std::env::current_exe().expect("current test exe");
+    let output = Command::new(&exe)
+        .args([
+            "--exact",
+            "preflight::tests::preflight_exclusive_lock_probe_helper",
+            "--quiet",
+        ])
+        .env("HANDFEST_PREFLIGHT_LOCK_DB", db_path)
+        .env(
+            "HANDFEST_PREFLIGHT_EXPECT_LOCKED",
+            if expect_locked { "1" } else { "0" },
+        )
+        .output()
+        .expect("spawn preflight exclusive lock probe");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "cross-process BEGIN EXCLUSIVE probe failed (expect_locked={expect_locked})\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(
+        stdout.contains("1 passed"),
+        "cross-process BEGIN EXCLUSIVE probe did not execute helper test (expect_locked={expect_locked}); stdout:\n{stdout}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn inode_swap_at_deferred_fd_cap_retains_fd_and_preserves_posix_lock() {
+    static REG: OnceLock<Mutex<ActiveHandleRegistry>> = OnceLock::new();
+    let reg = REG.get_or_init(|| Mutex::new(ActiveHandleRegistry::default()));
+
+    let dir = TempDir::new().unwrap();
+    let db_a = init_real_sqlite_db(&dir.path().join("cap_lock_a.sqlite"));
+    let db_b = write_valid_header_file(&dir.path().join("cap_lock_b.sqlite"));
+    let db_new = write_valid_header_file(&dir.path().join("cap_lock_new.sqlite"));
+    let journal_new = dir.path().join("cap_lock_new.sqlite-journal");
+    fs::write(&journal_new, [0u8; ROLLBACK_JOURNAL_HDR_LEN]).unwrap();
+
+    let ro_a = saturate_registry_for_reader_only_state(reg, dir.path(), &db_a, &db_b);
+
+    let lock_conn = rusqlite::Connection::open(&db_a).unwrap();
+    lock_conn.execute_batch("BEGIN IMMEDIATE;").unwrap();
+    assert_preflight_exclusive_lock(&db_a, true);
+
+    {
+        let mut state = reg.lock().unwrap();
+        let res = inspect_sqlite_header_with_opener(&mut state, &db_new, |path| {
+            fs::remove_file(path)?;
+            fs::hard_link(&db_a, path)?;
+            open_no_follow_read_only(path)
+        });
+        assert!(matches!(
+            res,
+            Err(LedgerError::Storage(ref m)) if m.contains("deferred raw-open fd cap (64)")
+        ));
+    }
+    assert_preflight_exclusive_lock(&db_a, true);
+    assert_eq!(
+        reg.lock().unwrap().total_deferred_fds(),
+        MAX_DEFERRED_FDS + 1
+    );
+
+    let j_res = probe_rollback_journal_open_with_opener(reg, &journal_new, false, |path| {
+        fs::remove_file(path)?;
+        fs::hard_link(&db_a, path)?;
+        open_no_follow_read_only(path)
+    });
+    assert!(matches!(
+        j_res,
+        Err(LedgerError::Storage(ref m)) if m.contains("deferred raw-open fd cap (64)")
+    ));
+    assert_preflight_exclusive_lock(&db_a, true);
+    assert_eq!(
+        reg.lock().unwrap().total_deferred_fds(),
+        MAX_DEFERRED_FDS + 2
+    );
+
+    lock_conn.execute_batch("ROLLBACK;").unwrap();
+    drop(lock_conn);
+    drop(ro_a);
+    assert!(reg.lock().unwrap().deferred_fds.is_empty());
+    assert_preflight_exclusive_lock(&db_a, false);
+}
+
+#[cfg(unix)]
+#[test]
+fn inode_swap_to_deferred_fds_only_inode_retains_fd_and_preserves_posix_lock() {
+    use std::os::unix::fs::MetadataExt;
+
+    static REG: OnceLock<Mutex<ActiveHandleRegistry>> = OnceLock::new();
+    let reg = REG.get_or_init(|| Mutex::new(ActiveHandleRegistry::default()));
+
+    let dir = TempDir::new().unwrap();
+    let db_a = write_valid_header_file(&dir.path().join("def_only_a.sqlite"));
+    let db_b = write_valid_header_file(&dir.path().join("def_only_b.sqlite"));
+    let db_c = init_real_sqlite_db(&dir.path().join("def_only_c.sqlite"));
+    let db_new = write_valid_header_file(&dir.path().join("def_only_new.sqlite"));
+    let journal_new = dir.path().join("def_only_new.sqlite-journal");
+    fs::write(&journal_new, [0u8; ROLLBACK_JOURNAL_HDR_LEN]).unwrap();
+
+    let ((), ro_a) = open_read_only_guarded_in(reg, &db_a, |_| Ok(())).unwrap();
+    let ((), w_b) = open_writable_guarded_in(reg, &db_b, || Ok(())).unwrap();
+    let ((), ro_c) = open_read_only_guarded_in(reg, &db_c, |_| Ok(())).unwrap();
+    drop(ro_c);
+    drop(w_b);
+
+    let meta_c = fs::metadata(&db_c).unwrap();
+    let key_c = (meta_c.dev(), meta_c.ino());
+    {
+        let state = reg.lock().unwrap();
+        assert_eq!(state.active_writers, 0);
+        assert!(!state.counts.contains_key(&FileIdentity {
+            dev: key_c.0,
+            ino: key_c.1
+        }));
+        assert_eq!(state.deferred_fds.get(&key_c).map(Vec::len), Some(1));
     }
 
+    let lock_c = rusqlite::Connection::open(&db_c).unwrap();
+    lock_c.execute_batch("BEGIN IMMEDIATE;").unwrap();
+    assert_preflight_exclusive_lock(&db_c, true);
+
+    {
+        let mut state = reg.lock().unwrap();
+        let id = inspect_sqlite_header_with_opener(&mut state, &db_new, |path| {
+            fs::remove_file(path)?;
+            fs::hard_link(&db_c, path)?;
+            open_no_follow_read_only(path)
+        })
+        .unwrap();
+        assert_eq!(
+            id,
+            FileIdentity {
+                dev: key_c.0,
+                ino: key_c.1
+            }
+        );
+    }
+    assert_preflight_exclusive_lock(&db_c, true);
+    assert_eq!(
+        reg.lock().unwrap().deferred_fds.get(&key_c).map(Vec::len),
+        Some(2)
+    );
+
+    let j_err = probe_rollback_journal_open_with_opener(reg, &journal_new, false, |path| {
+        fs::remove_file(path)?;
+        fs::hard_link(&db_c, path)?;
+        open_no_follow_read_only(path)
+    })
+    .unwrap_err();
+    assert!(matches!(j_err, LedgerError::Integrity(_)));
+    assert_preflight_exclusive_lock(&db_c, true);
+    assert_eq!(
+        reg.lock().unwrap().deferred_fds.get(&key_c).map(Vec::len),
+        Some(3)
+    );
+
+    lock_c.execute_batch("ROLLBACK;").unwrap();
+    drop(lock_c);
+    drop(ro_a);
+    assert!(reg.lock().unwrap().deferred_fds.is_empty());
+    assert_preflight_exclusive_lock(&db_c, false);
+}
+
+#[cfg(unix)]
+#[test]
+fn saturated_deferred_fds_after_writer_drop_classifies_symlink_and_fifo_journal_as_integrity() {
+    use std::os::unix::fs::symlink;
+    use std::process::Command;
+
+    static REG: OnceLock<Mutex<ActiveHandleRegistry>> = OnceLock::new();
+    let reg = REG.get_or_init(|| Mutex::new(ActiveHandleRegistry::default()));
+
+    let dir = TempDir::new().unwrap();
+    let db_a = write_valid_header_file(&dir.path().join("cls_a.sqlite"));
+    let db_b = write_valid_header_file(&dir.path().join("cls_b.sqlite"));
+    let db_new = write_valid_header_file(&dir.path().join("cls_new.sqlite"));
+    let journal_new = dir.path().join("cls_new.sqlite-journal");
+    let zero_target = dir.path().join("zero_target.journal");
+    fs::write(&zero_target, [0u8; ROLLBACK_JOURNAL_HDR_LEN]).unwrap();
+
+    let ro_a = saturate_registry_for_reader_only_state(reg, dir.path(), &db_a, &db_b);
+
+    symlink(&zero_target, &journal_new).unwrap();
+    let sym_res = open_read_only_guarded_in(reg, &db_new, |_| Ok(()));
+    assert!(
+        matches!(&sym_res, Err(LedgerError::Integrity(m)) if m.contains("symlink")),
+        "expected symlink Integrity error with saturated deferred_fds after writer drop"
+    );
+    let sym_probe_err = probe_rollback_journal_once(reg, &journal_new).unwrap_err();
+    assert!(
+        matches!(&sym_probe_err, LedgerError::Integrity(m) if m.contains("symlink")),
+        "expected symlink Integrity error from probe_rollback_journal_once, got: {sym_probe_err:?}"
+    );
+    fs::remove_file(&journal_new).unwrap();
+
+    if assert_supported_unix_open_flag(UNIX_O_NONBLOCK, "UNIX_O_NONBLOCK") {
+        let mkfifo_status = Command::new("mkfifo").arg(&journal_new).status().unwrap();
+        assert!(mkfifo_status.success(), "mkfifo must succeed");
+
+        let fifo_guarded_res = open_read_only_guarded_in(reg, &db_new, |_| Ok(()));
+        assert!(
+            matches!(&fifo_guarded_res, Err(LedgerError::Integrity(m)) if m.contains("invalid non-file")),
+            "expected FIFO Integrity error from open_read_only_guarded_in"
+        );
+
+        let fifo_path = journal_new.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let handle = std::thread::spawn(move || {
+            let open_err = probe_rollback_journal_open_with_opener(
+                reg,
+                &fifo_path,
+                false,
+                open_no_follow_read_only,
+            );
+            let hdr_err = {
+                let mut state = reg.lock().unwrap();
+                inspect_sqlite_header_locked(&mut state, &fifo_path)
+            };
+            let _ = tx.send((open_err, hdr_err));
+        });
+        let (open_res, hdr_res) = rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("FIFO probe timed out");
+        handle.join().unwrap();
+
+        assert!(
+            matches!(&open_res, Err(LedgerError::Integrity(m)) if m.contains("invalid non-file")),
+            "expected FIFO Integrity error from probe_rollback_journal_open_with_opener, got: {open_res:?}"
+        );
+        assert!(
+            matches!(&hdr_res, Err(LedgerError::Integrity(m)) if m.contains("not a regular file")),
+            "expected FIFO Integrity error from inspect_sqlite_header_locked, got: {hdr_res:?}"
+        );
+        fs::remove_file(&journal_new).unwrap();
+    }
+
+    assert_eq!(reg.lock().unwrap().total_deferred_fds(), MAX_DEFERRED_FDS);
     drop(ro_a);
     assert!(reg.lock().unwrap().deferred_fds.is_empty());
 }

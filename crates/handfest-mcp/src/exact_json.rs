@@ -4,8 +4,10 @@
 pub(crate) use handfest_core::exact_json::{write_json_string, ExactJson, JsonNumber};
 pub(crate) use handfest_core::json_num::{
     canonicalize_json_number, is_canonical_json_int_syntax, parse_canonical_json_int,
-    parse_decimal_str, parse_json_decimal, CanonicalJsonNumber, NumberError,
+    CanonicalJsonNumber, NumberError,
 };
+#[cfg(test)]
+use handfest_core::json_num::{parse_decimal_str, parse_json_decimal};
 
 /// Returns `true` when `raw` is a canonical JSON integer literal representable as a signed 64-bit integer.
 pub(crate) fn is_valid_json_int(raw: &str) -> bool {

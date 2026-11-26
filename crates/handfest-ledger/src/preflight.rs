@@ -100,7 +100,9 @@ impl ActiveHandleRegistry {
 
     #[cfg(unix)]
     fn should_defer_inode(&self, (dev, ino): (u64, u64)) -> bool {
-        self.active_writers > 0 || self.counts.contains_key(&FileIdentity { dev, ino })
+        self.active_writers > 0
+            || self.counts.contains_key(&FileIdentity { dev, ino })
+            || self.deferred_fds.contains_key(&(dev, ino))
     }
 
     #[cfg(unix)]
@@ -121,7 +123,7 @@ impl ActiveHandleRegistry {
     fn ensure_deferred_fd_capacity(&self, key: Option<(u64, u64)>) -> Result<(), LedgerError> {
         let will_defer = match key {
             Some(id) => self.should_defer_inode(id),
-            None => self.has_active_handles(),
+            None => self.active_writers > 0,
         };
         if will_defer && self.total_deferred_fds() >= MAX_DEFERRED_FDS {
             return Err(Self::deferred_fd_cap_error());
@@ -134,11 +136,11 @@ impl ActiveHandleRegistry {
         if !self.should_defer_inode(key) {
             return Ok(());
         }
-        if self.total_deferred_fds() >= MAX_DEFERRED_FDS {
-            drop(file);
+        let at_cap = self.total_deferred_fds() >= MAX_DEFERRED_FDS;
+        self.deferred_fds.entry(key).or_default().push(file);
+        if at_cap {
             return Err(Self::deferred_fd_cap_error());
         }
-        self.deferred_fds.entry(key).or_default().push(file);
         Ok(())
     }
 
@@ -206,8 +208,10 @@ impl Drop for PendingWriterGuard {
 /// While `counts[id] > 0`, `open_read_only_guarded` skips raw `File::open` on that inode so POSIX
 /// `close()` never drops in-process `fcntl` locks. On Unix, raw header/journal `File` handles are
 /// deferred in `deferred_fds` by `(st_dev, st_ino)` (reusing the first retained `File` via
-/// `SeekFrom::Start(0)` and appending duplicates) whenever `active_writers > 0` or the probed inode
-/// is currently tracked in `counts`. With `active_writers == 0`, uncounted header/journal probes
+/// `SeekFrom::Start(0)` and appending duplicates) whenever `active_writers > 0`, the probed inode
+/// is currently tracked in `counts`, or the inode is already retained in `deferred_fds` (never
+/// dropping a protected fd even if an inode-swap race lands at `MAX_DEFERRED_FDS`). With
+/// `active_writers == 0`, uncounted non-deferred header/journal probes
 /// close immediately so a long-lived reader never exhausts the fd cap. `deferred_fds` is cleared
 /// only when BOTH `active_writers == 0` and `counts.is_empty()` (never removing individual entries
 /// while any handle remains active, so an fd retained for an inode holding an external POSIX lock

@@ -499,6 +499,89 @@ impl<'a> JsonParser<'a> {
     }
 }
 
+/// Rejects any key in `obj` that is not present in `allowed`.
+pub fn reject_unknown_keys(
+    obj: &BTreeMap<String, ExactJson>,
+    allowed: &[&str],
+    context: &str,
+) -> Result<(), String> {
+    if let Some(key) = obj.keys().find(|k| !allowed.contains(&k.as_str())) {
+        return Err(alloc::format!("unexpected {context} key '{key}'"));
+    }
+    Ok(())
+}
+
+/// Key validation failure detected while inspecting an [`ExactJson`] object tree.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum JsonKeyError<'a> {
+    NonAscii(&'a str),
+    CaseCollision {
+        existing: &'a str,
+        colliding: &'a str,
+    },
+}
+
+impl JsonKeyError<'_> {
+    /// Formats this key validation failure with an outer field/context label.
+    #[must_use]
+    pub fn format_with_context(&self, context: &str) -> String {
+        match self {
+            Self::NonAscii(key) => alloc::format!("{context}: non-ASCII key '{key}'"),
+            Self::CaseCollision {
+                existing,
+                colliding,
+            } => alloc::format!(
+                "{context}: key '{colliding}' collides case-insensitively with '{existing}'"
+            ),
+        }
+    }
+}
+
+/// Recursively validates that every JSON object in `val` has strictly ASCII keys with no
+/// ASCII case-insensitive collisions.
+pub fn validate_json_keys_recursive(val: &ExactJson) -> Result<(), JsonKeyError<'_>> {
+    match val {
+        ExactJson::Object(map) => {
+            if let Some(key) = find_non_ascii_key(map) {
+                return Err(JsonKeyError::NonAscii(key));
+            }
+            if let Some((existing, colliding)) = find_case_colliding_keys(map) {
+                return Err(JsonKeyError::CaseCollision {
+                    existing,
+                    colliding,
+                });
+            }
+            for child in map.values() {
+                validate_json_keys_recursive(child)?;
+            }
+            Ok(())
+        }
+        ExactJson::Array(items) => {
+            for item in items {
+                validate_json_keys_recursive(item)?;
+            }
+            Ok(())
+        }
+        ExactJson::Null | ExactJson::Bool(_) | ExactJson::Number(_) | ExactJson::Str(_) => Ok(()),
+    }
+}
+
+fn find_non_ascii_key(obj: &BTreeMap<String, ExactJson>) -> Option<&str> {
+    obj.keys().find(|k| !k.is_ascii()).map(String::as_str)
+}
+
+fn find_case_colliding_keys(obj: &BTreeMap<String, ExactJson>) -> Option<(&str, &str)> {
+    let mut seen: BTreeMap<String, &str> = BTreeMap::new();
+    for key in obj.keys() {
+        let folded = key.to_ascii_lowercase();
+        if let Some(&prev) = seen.get(&folded) {
+            return Some((prev, key.as_str()));
+        }
+        seen.insert(folded, key.as_str());
+    }
+    None
+}
+
 #[cfg(test)]
 #[path = "exact_json_tests.rs"]
 mod tests;

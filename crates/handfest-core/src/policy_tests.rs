@@ -391,3 +391,77 @@ fn serde_deserialize_rejects_duplicate_map_keys() {
         "expected map visitor expecting message, got: {err}"
     );
 }
+
+#[test]
+fn mapping_error_display_formats_every_variant() {
+    let cases = [
+        (
+            MappingError::Io("read failed".into()),
+            "policy map I/O error: read failed",
+        ),
+        (
+            MappingError::InvalidJson("bad".into()),
+            "invalid policy map JSON: bad",
+        ),
+        (
+            MappingError::InvalidPolicy("pol".into()),
+            "invalid policy map: pol",
+        ),
+        (
+            MappingError::UnmappedTool("bash".into()),
+            "unmapped MCP tool 'bash'",
+        ),
+        (
+            MappingError::NonObjectArguments { tool: "t".into() },
+            "tool 't': arguments must be a JSON object",
+        ),
+        (
+            MappingError::MissingResourceId {
+                tool: "t".into(),
+                arg: "r".into(),
+            },
+            "tool 't': missing required resource_id argument 'r'",
+        ),
+        (
+            MappingError::InvalidResourceId {
+                tool: "t".into(),
+                arg: "r".into(),
+                detail: "bad".into(),
+            },
+            "tool 't': invalid resource_id argument 'r': bad",
+        ),
+        (
+            MappingError::MissingArgumentFact {
+                tool: "t".into(),
+                arg: "a".into(),
+            },
+            "tool 't': missing required argument fact 'a'",
+        ),
+        (
+            MappingError::InvalidArgumentFact {
+                tool: "t".into(),
+                arg: "a".into(),
+                detail: "bad".into(),
+            },
+            "tool 't': invalid argument fact 'a': bad",
+        ),
+        (
+            MappingError::CaseCollidingArgumentKey {
+                tool: "t".into(),
+                key: "A".into(),
+                collides_with: "a".into(),
+            },
+            "tool 't': argument key 'A' collides case-insensitively with 'a'",
+        ),
+        (
+            MappingError::NonAsciiArgumentKey {
+                tool: "t".into(),
+                key: "é".into(),
+            },
+            "tool 't': argument key 'é' must be ASCII",
+        ),
+    ];
+    for (err, expected) in cases {
+        assert_eq!(err.to_string(), expected);
+    }
+}

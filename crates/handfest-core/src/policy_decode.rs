@@ -1,12 +1,13 @@
 //! Direct single-pass decoding of [`ToolPolicyMap`] from a duplicate-checked [`ExactJson`] AST.
 
-use std::collections::BTreeMap;
+use alloc::collections::BTreeMap;
+use alloc::format;
+use alloc::string::{String, ToString};
 
-use handfest_core::ast::parse_rfc3339_utc;
-
-use crate::exact_json::{parse_canonical_json_int, parse_decimal_str, ExactJson};
-use crate::framing::reject_unknown_keys;
-use crate::mapping::{FactSpec, FactType, MappingError, ToolPolicy, ToolPolicyMap, TypedScalar};
+use crate::ast::parse_rfc3339_utc;
+use crate::exact_json::{reject_unknown_keys, ExactJson};
+use crate::json_num::{parse_canonical_json_int, parse_decimal_str};
+use crate::policy::{FactSpec, FactType, MappingError, ToolPolicy, ToolPolicyMap, TypedScalar};
 
 /// Decodes a [`ToolPolicyMap`] directly from a pre-parsed, duplicate-checked [`ExactJson`] tree.
 pub(super) fn decode_tool_policy_map(root: &ExactJson) -> Result<ToolPolicyMap, MappingError> {

@@ -1212,3 +1212,126 @@ fn check_policy_map_mode_shares_mcp_codec_and_emits_typed_mapping_errors() {
     assert_eq!(bad_pol_json["error"], "policy_mapping_failed");
     assert_eq!(bad_pol_json["code"], "invalid_policy_map");
 }
+
+#[test]
+fn check_rejects_conflicting_policy_map_and_facts_flags() {
+    let dir = TempDir::new().unwrap();
+    let (signed_path, agent_key) = setup_merge_mandate_fixture(dir.path());
+    let ledger = dir.path().join("conflict_flags.sqlite");
+    let policy_path = dir.path().join("policy.json");
+    fs::write(
+        &policy_path,
+        r#"{
+  "tools": {
+    "merge_pull_request": {
+      "action": "git.pr.merge",
+      "resource_kind": "repo",
+      "resource_id_arg": "repo",
+      "static_facts": { "resource.environment": { "str": "staging" } }
+    }
+  }
+}"#,
+    )
+    .unwrap();
+
+    let out = Command::new(env!("CARGO_BIN_EXE_handfest"))
+        .args([
+            "check",
+            "--ledger",
+            ledger.to_str().unwrap(),
+            "--chain",
+            signed_path.to_str().unwrap(),
+            "--actor-key",
+            &agent_key,
+            "--policy-map",
+            policy_path.to_str().unwrap(),
+            "--tool-name",
+            "merge_pull_request",
+            "--tool-input",
+            r#"{"repo":"feedback-loop-ai/handfest"}"#,
+            "--facts",
+            r#"{"resource.environment":"staging"}"#,
+            "--now",
+            "2026-11-24T18:30:00Z",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(
+        !out.status.success(),
+        "passing both --policy-map and --facts must fail closed; stdout={} stderr={}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("--facts") && stderr.contains("--policy-map"),
+        "expected clap conflict diagnostic naming --facts and --policy-map, got: {stderr}"
+    );
+    assert!(
+        !ledger.exists(),
+        "conflicting CLI flags must fail before opening/creating the ledger"
+    );
+}
+
+#[test]
+fn check_policy_map_rejects_invalid_utf8_stdin_before_opening_ledger() {
+    let dir = TempDir::new().unwrap();
+    let (signed_path, agent_key) = setup_merge_mandate_fixture(dir.path());
+    let ledger = dir.path().join("bad_utf8_stdin.sqlite");
+    let policy_path = dir.path().join("policy.json");
+    fs::write(
+        &policy_path,
+        r#"{
+  "tools": {
+    "merge_pull_request": {
+      "action": "git.pr.merge",
+      "resource_kind": "repo",
+      "resource_id_arg": "repo",
+      "static_facts": { "resource.environment": { "str": "staging" } }
+    }
+  }
+}"#,
+    )
+    .unwrap();
+
+    // Test both bare invalid UTF-8 bytes ([0xff, 0xfe]) and invalid UTF-8 embedded inside an
+    // otherwise valid JSON object so lossy UTF-8 decoding cannot mask the error as JSON syntax.
+    let payloads: [&[u8]; 2] = [
+        &[0xff, 0xfe],
+        b"{\"repo\":\"feedback-loop-ai/handfest\xff\xfe\"}",
+    ];
+    for raw_bytes in payloads {
+        let out = run_policy_map_check(
+            &ledger,
+            &signed_path,
+            &agent_key,
+            &policy_path,
+            "merge_pull_request",
+            "-",
+            Some(raw_bytes),
+        );
+
+        assert_eq!(
+            out.status.code(),
+            Some(1),
+            "invalid UTF-8 stdin must exit 1; stdout={} stderr={}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let err_json: serde_json::Value = serde_json::from_slice(&out.stderr)
+            .expect("invalid UTF-8 stdin must emit structured JSON on stderr");
+        assert_eq!(err_json["error"], "policy_mapping_failed");
+        assert_eq!(err_json["code"], "invalid_input");
+        assert!(
+            err_json["message"]
+                .as_str()
+                .is_some_and(|m| m.contains("UTF-8")),
+            "expected UTF-8 refusal message, got: {err_json}"
+        );
+        assert!(
+            !ledger.exists(),
+            "invalid UTF-8 stdin must fail closed before opening/creating the ledger"
+        );
+    }
+}

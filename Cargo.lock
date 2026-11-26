@@ -319,7 +319,6 @@ dependencies = [
  "handfest-anchors",
  "handfest-core",
  "handfest-ledger",
- "handfest-mcp",
  "serde",
  "serde_json",
  "tempfile",
@@ -329,6 +328,8 @@ dependencies = [
 name = "handfest-core"
 version = "0.1.0"
 dependencies = [
+ "serde",
+ "serde_json",
  "sha2",
 ]
 

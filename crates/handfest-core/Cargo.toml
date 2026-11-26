@@ -9,6 +9,10 @@ description = "Pure, no_std-capable Ricardian mandate AST, Controlled-English co
 
 [dependencies]
 sha2.workspace = true
+serde.workspace = true # no_std+alloc typed config serialization/deserialization for ToolPolicyMap (prototyping debt)
+
+[dev-dependencies]
+serde_json.workspace = true # test-only JSON roundtrip and unique-key serde verification
 
 [lints]
 workspace = true
