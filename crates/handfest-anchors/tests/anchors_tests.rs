@@ -869,7 +869,7 @@ mod registry_tests {
         );
         assert!(matches!(
             verdict,
-            Verdict::Deny { ref reason } if reason.contains("invalid anchor proof validity window")
+            Verdict::Deny { ref reason } if reason.contains("outside anchor proof validity window")
         ));
     }
 }

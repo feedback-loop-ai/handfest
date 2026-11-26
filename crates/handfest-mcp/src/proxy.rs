@@ -7,7 +7,8 @@ use std::time::Duration;
 
 use handfest_core::ast::{KeyId, MandateId};
 use handfest_core::gate::{
-    evaluate_predicate_if_known, verify_chain_runtime, ActionRequest, VerifiedMandate,
+    evaluate_predicate_if_known, verify_chain_runtime, ActionRequest, VerifiedFacts,
+    VerifiedMandate,
 };
 use handfest_core::Verdict;
 pub use handfest_ledger::ReceiptLedger;
@@ -20,7 +21,8 @@ pub use crate::adapters::{
 use crate::exact_json::ExactJson;
 use crate::framing::{
     fail_upstream_protocol, reject_unknown_keys, validate_json_keys_recursive,
-    write_denied_response, write_jsonrpc_error, write_raw_line, JsonRpcId, JSONRPC_INTERNAL_ERROR,
+    validate_optional_meta, write_denied_response, write_jsonrpc_error, write_raw_line, JsonRpcId,
+    JSONRPC_INTERNAL_ERROR,
 };
 use crate::mapping::{denial_resource_id, ToolPolicyMap};
 use crate::session::{DispatchCtx, PendingKind};
@@ -40,6 +42,7 @@ pub struct McpProxy<C: Clock, L: ReceiptLedger = SqliteLedger> {
     pub(crate) chain_ids: Vec<MandateId>,
     pub(crate) actor_key: KeyId,
     pub(crate) policy_map: ToolPolicyMap,
+    pub(crate) static_facts_by_tool: BTreeMap<String, VerifiedFacts>,
     pub(crate) ledger: L,
     pub(crate) clock: C,
     pub(crate) max_line_bytes: usize,
@@ -72,11 +75,13 @@ impl<C: Clock, L: ReceiptLedger> McpProxy<C, L> {
             .validate()
             .map_err(|err| ProxyError::InvalidChain(format!("invalid actor_key: {err}")))?;
         policy_map.validate()?;
+        let static_facts_by_tool = policy_map.compile_static_facts()?;
         Ok(Self {
             verified_chain,
             chain_ids,
             actor_key,
             policy_map,
+            static_facts_by_tool,
             ledger,
             clock,
             max_line_bytes: DEFAULT_MAX_LINE_BYTES,
@@ -147,28 +152,29 @@ impl<C: Clock, L: ReceiptLedger> McpProxy<C, L> {
             }
         };
 
-        let (request, facts) =
-            match self
-                .policy_map
-                .map_call_exact(&self.actor_key, tool_name, arguments)
-            {
-                Ok(mapped) => mapped,
-                Err(err) => {
-                    let denial_req = build_mapping_denial_request(
-                        &self.actor_key,
-                        &self.policy_map,
-                        tool_name,
-                        arguments,
-                    );
-                    return self.record_denial_and_respond(
-                        &req_id,
-                        &denial_req,
-                        now,
-                        err.to_string(),
-                        ctx.client_out,
-                    );
-                }
-            };
+        let (request, facts) = match self.policy_map.map_call_exact_prevalidated(
+            &self.actor_key,
+            tool_name,
+            arguments,
+            self.static_facts_by_tool.get(tool_name),
+        ) {
+            Ok(mapped) => mapped,
+            Err(err) => {
+                let denial_req = build_mapping_denial_request(
+                    &self.actor_key,
+                    &self.policy_map,
+                    tool_name,
+                    arguments,
+                );
+                return self.record_denial_and_respond(
+                    &req_id,
+                    &denial_req,
+                    now,
+                    err.to_string(),
+                    ctx.client_out,
+                );
+            }
+        };
 
         self.ensure_upstream_alive(&req_id, ctx)?;
 
@@ -306,7 +312,7 @@ impl<C: Clock, L: ReceiptLedger> McpProxy<C, L> {
         let Some(policy) = self.policy_map.get(tool_name) else {
             return false;
         };
-        let Ok(static_facts) = policy.static_verified_facts() else {
+        let Some(static_facts) = self.static_facts_by_tool.get(tool_name) else {
             return false;
         };
         self.verified_chain.iter().all(|vm| {
@@ -324,7 +330,7 @@ impl<C: Clock, L: ReceiptLedger> McpProxy<C, L> {
                     .any(|sel| sel.kind() == policy.resource_kind),
             };
             let predicates_allowed = vm.ast.where_clauses().iter().all(|pred| {
-                evaluate_predicate_if_known(pred, &static_facts, evaluated_at).unwrap_or(true)
+                evaluate_predicate_if_known(pred, static_facts, evaluated_at).unwrap_or(true)
             });
             action_allowed && resource_allowed && predicates_allowed
         })
@@ -371,16 +377,10 @@ fn validate_tools_list_result_fields(
             );
         }
     }
-    if let Some(meta) = result_obj.get("_meta") {
-        if meta.as_object().is_none() {
-            return Err(
-                "malformed upstream tools/list response: result._meta must be a JSON object"
-                    .to_string(),
-            );
-        }
-        validate_json_keys_recursive(meta)
-            .map_err(|err| err.format_with_context("malformed upstream tools/list _meta"))?;
-    }
+    validate_optional_meta(
+        result_obj,
+        "malformed upstream tools/list response: result._meta",
+    )?;
     Ok(())
 }
 
@@ -420,6 +420,7 @@ fn extract_tool_call_params(
         return Err("tools/call params must be a JSON object".to_string());
     };
     reject_unknown_keys(params, &["name", "arguments", "_meta"], "tools/call params")?;
+    validate_optional_meta(params, "tools/call params._meta")?;
     let Some(name) = params.get("name").and_then(ExactJson::as_str) else {
         return Err("tools/call params.name must be a string".to_string());
     };

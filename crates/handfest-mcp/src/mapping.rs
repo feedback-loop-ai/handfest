@@ -6,8 +6,8 @@ use std::fs;
 use std::path::Path;
 
 use handfest_core::ast::{
-    is_valid_field_path, is_valid_ident, is_valid_quoted_str, parse_rfc3339_utc, ActionPat, KeyId,
-    Scalar,
+    format_rfc3339_utc, is_valid_field_path, is_valid_ident, is_valid_quoted_str,
+    is_valid_timestamp, parse_rfc3339_utc, ActionPat, Decimal, KeyId, Scalar,
 };
 use handfest_core::gate::{ActionRequest, VerifiedFacts};
 use serde::{Deserialize, Serialize};
@@ -43,7 +43,49 @@ pub struct FactSpec {
     pub fact_type: FactType,
 }
 
+mod serde_static_decimal {
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    use super::{parse_decimal_str, Decimal};
+
+    pub(super) fn serialize<S: Serializer>(val: &Decimal, ser: S) -> Result<S::Ok, S::Error> {
+        ser.serialize_str(&val.to_string())
+    }
+
+    pub(super) fn deserialize<'de, D: Deserializer<'de>>(de: D) -> Result<Decimal, D::Error> {
+        let raw = String::deserialize(de)?;
+        parse_decimal_str(&raw).map_err(|err| {
+            serde::de::Error::custom(format!("invalid static decimal '{raw}': {err}"))
+        })
+    }
+}
+
+mod serde_static_timestamp {
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    use super::{format_rfc3339_utc, is_valid_timestamp, parse_rfc3339_utc};
+
+    pub(super) fn serialize<S: Serializer>(ts: &i64, ser: S) -> Result<S::Ok, S::Error> {
+        if !is_valid_timestamp(*ts) {
+            return Err(serde::ser::Error::custom(format!(
+                "static timestamp {ts} outside valid RFC 3339 UTC range"
+            )));
+        }
+        ser.serialize_str(&format_rfc3339_utc(*ts))
+    }
+
+    pub(super) fn deserialize<'de, D: Deserializer<'de>>(de: D) -> Result<i64, D::Error> {
+        let raw = String::deserialize(de)?;
+        parse_rfc3339_utc(&raw).map_err(|err| {
+            serde::de::Error::custom(format!("invalid static timestamp '{raw}': {err}"))
+        })
+    }
+}
+
 /// Operator/broker-supplied static scalar fact with explicit type tagging.
+///
+/// Decimals and RFC 3339 UTC timestamps are parsed once at configuration deserialization so
+/// runtime discovery and `tools/call` mapping never reparse string literals.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TypedScalar {
@@ -51,12 +93,12 @@ pub enum TypedScalar {
     Str(String),
     #[serde(alias = "Int")]
     Int(i64),
-    #[serde(alias = "Decimal")]
-    Decimal(String),
+    #[serde(alias = "Decimal", with = "serde_static_decimal")]
+    Decimal(Decimal),
     #[serde(alias = "Bool")]
     Bool(bool),
-    #[serde(alias = "Timestamp")]
-    Timestamp(String),
+    #[serde(alias = "Timestamp", with = "serde_static_timestamp")]
+    Timestamp(i64),
 }
 
 impl TypedScalar {
@@ -72,19 +114,9 @@ impl TypedScalar {
                 Scalar::Str(s.clone())
             }
             Self::Int(n) => Scalar::Int(*n),
-            Self::Decimal(raw) => {
-                let dec = parse_decimal_str(raw).map_err(|err| {
-                    MappingError::InvalidPolicy(format!("invalid static decimal '{raw}': {err}"))
-                })?;
-                Scalar::Decimal(dec)
-            }
+            Self::Decimal(dec) => Scalar::Decimal(*dec),
             Self::Bool(b) => Scalar::Bool(*b),
-            Self::Timestamp(raw) => {
-                let ts = parse_rfc3339_utc(raw).map_err(|err| {
-                    MappingError::InvalidPolicy(format!("invalid static timestamp '{raw}': {err}"))
-                })?;
-                Scalar::Timestamp(ts)
-            }
+            Self::Timestamp(ts) => Scalar::Timestamp(*ts),
         };
         scalar
             .validate()
@@ -375,6 +407,18 @@ impl ToolPolicyMap {
         self.map_call_exact(actor_key, tool_name, parsed.as_ref())
     }
 
+    /// Pre-compiles validated static [`VerifiedFacts`] per tool once at startup so neither
+    /// `tools/list` discovery nor `tools/call` mapping rebuilds static facts per request.
+    pub(crate) fn compile_static_facts(
+        &self,
+    ) -> Result<BTreeMap<String, VerifiedFacts>, MappingError> {
+        let mut compiled = BTreeMap::new();
+        for (tool_name, policy) in &self.tools {
+            compiled.insert(tool_name.clone(), policy.static_verified_facts()?);
+        }
+        Ok(compiled)
+    }
+
     pub(crate) fn map_call_exact(
         &self,
         actor_key: &KeyId,
@@ -386,34 +430,25 @@ impl ToolPolicyMap {
             .get(tool_name)
             .ok_or_else(|| MappingError::UnmappedTool(tool_name.to_string()))?;
         policy.validate(tool_name)?;
+        let static_facts = policy.static_verified_facts()?;
+        map_policy_call(actor_key, tool_name, policy, arguments, &static_facts)
+    }
 
-        let empty_args = BTreeMap::new();
-        let args_map = match arguments {
-            None => &empty_args,
-            Some(ExactJson::Object(map)) => map,
-            Some(_) => {
-                return Err(MappingError::NonObjectArguments {
-                    tool: tool_name.to_string(),
-                });
-            }
+    pub(crate) fn map_call_exact_prevalidated(
+        &self,
+        actor_key: &KeyId,
+        tool_name: &str,
+        arguments: Option<&ExactJson>,
+        static_facts: Option<&VerifiedFacts>,
+    ) -> Result<(ActionRequest, VerifiedFacts), MappingError> {
+        let policy = self
+            .tools
+            .get(tool_name)
+            .ok_or_else(|| MappingError::UnmappedTool(tool_name.to_string()))?;
+        let Some(precompiled) = static_facts else {
+            return Err(MappingError::UnmappedTool(tool_name.to_string()));
         };
-
-        if let Some(args_val) = arguments {
-            check_argument_case_collisions(tool_name, policy, args_val, args_map)?;
-        }
-
-        let resource_id = resolve_resource_id(tool_name, policy, args_map)?;
-        let facts = build_verified_facts(tool_name, policy, args_map)?;
-
-        Ok((
-            ActionRequest {
-                actor_key: actor_key.clone(),
-                action: policy.action.clone(),
-                resource_kind: policy.resource_kind.clone(),
-                resource_id,
-            },
-            facts,
-        ))
+        map_policy_call(actor_key, tool_name, policy, arguments, precompiled)
     }
 }
 
@@ -493,10 +528,47 @@ fn resolve_resource_id(
     }
 }
 
+fn map_policy_call(
+    actor_key: &KeyId,
+    tool_name: &str,
+    policy: &ToolPolicy,
+    arguments: Option<&ExactJson>,
+    static_facts: &VerifiedFacts,
+) -> Result<(ActionRequest, VerifiedFacts), MappingError> {
+    let empty_args = BTreeMap::new();
+    let args_map = match arguments {
+        None => &empty_args,
+        Some(ExactJson::Object(map)) => map,
+        Some(_) => {
+            return Err(MappingError::NonObjectArguments {
+                tool: tool_name.to_string(),
+            });
+        }
+    };
+
+    if let Some(args_val) = arguments {
+        check_argument_case_collisions(tool_name, policy, args_val, args_map)?;
+    }
+
+    let resource_id = resolve_resource_id(tool_name, policy, args_map)?;
+    let facts = build_verified_facts(tool_name, policy, args_map, static_facts)?;
+
+    Ok((
+        ActionRequest {
+            actor_key: actor_key.clone(),
+            action: policy.action.clone(),
+            resource_kind: policy.resource_kind.clone(),
+            resource_id,
+        },
+        facts,
+    ))
+}
+
 fn build_verified_facts(
     tool_name: &str,
     policy: &ToolPolicy,
     args_map: &BTreeMap<String, ExactJson>,
+    static_facts: &VerifiedFacts,
 ) -> Result<VerifiedFacts, MappingError> {
     let mut facts = VerifiedFacts::new();
 
@@ -515,8 +587,8 @@ fn build_verified_facts(
 
     // Operator/broker-supplied static facts ALWAYS override argument-derived facts.
     // `context.time` is exclusively sourced from `Clock`, never from static or argument facts.
-    for (field, scalar) in policy.static_verified_facts()?.0 {
-        facts.insert(field, scalar);
+    for (field, scalar) in &static_facts.0 {
+        facts.insert(field.clone(), scalar.clone());
     }
 
     Ok(facts)
@@ -648,121 +720,5 @@ fn is_valid_concrete_action(action: &str) -> bool {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn test_actor() -> KeyId {
-        KeyId::parse("ed25519:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef")
-            .unwrap()
-    }
-
-    #[test]
-    fn rejects_wrong_types_missing_facts_and_invalid_policy_configs() {
-        let json = r#"{
-            "tools": {
-                "pay": {
-                    "action": "finance.pay",
-                    "resource_kind": "account",
-                    "resource_id_arg": "acct",
-                    "arg_facts": {
-                        "count": { "field": "resource.count", "type": "int" }
-                    }
-                }
-            }
-        }"#;
-        let map = ToolPolicyMap::from_json_str(json).unwrap();
-
-        // Wrong type: float and negative zero given for int
-        assert!(matches!(
-            map.map_call_json(&test_actor(), "pay", Some(r#"{"acct":"a1","count":1.5}"#)),
-            Err(MappingError::InvalidArgumentFact { .. })
-        ));
-        assert!(matches!(
-            map.map_call_json(&test_actor(), "pay", Some(r#"{"acct":"a1","count":-0}"#)),
-            Err(MappingError::InvalidArgumentFact { .. })
-        ));
-        let (_, zero_facts) = map
-            .map_call_json(&test_actor(), "pay", Some(r#"{"acct":"a1","count":0}"#))
-            .unwrap();
-        assert_eq!(zero_facts.get("resource.count"), Some(&Scalar::Int(0)));
-        // Missing arg fact
-        assert!(matches!(
-            map.map_call_json(&test_actor(), "pay", Some(r#"{"acct":"a1"}"#)),
-            Err(MappingError::MissingArgumentFact { .. })
-        ));
-        // Unmapped tool
-        assert!(matches!(
-            map.map_call_json(&test_actor(), "unknown", Some("{}")),
-            Err(MappingError::UnmappedTool(_))
-        ));
-        // Duplicate JSON keys rejected
-        assert!(matches!(
-            ToolPolicyMap::from_json_str(
-                r#"{"tools":{"a":{"action":"x.y","resource_kind":"r","static_resource_id":"1"},"a":{"action":"x.z","resource_kind":"r","static_resource_id":"2"}}}"#
-            ),
-            Err(MappingError::InvalidJson(msg)) if msg.contains("duplicate JSON object key")
-        ));
-        // Both resource_id_arg and static_resource_id rejected
-        assert!(matches!(
-            ToolPolicyMap::from_json_str(
-                r#"{"tools":{"a":{"action":"x.y","resource_kind":"r","resource_id_arg":"id","static_resource_id":"1"}}}"#
-            ),
-            Err(MappingError::InvalidPolicy(msg)) if msg.contains("cannot declare both")
-        ));
-        // Wildcard action rejected via handfest_core::ast::ActionPat delegation
-        assert!(matches!(
-            ToolPolicyMap::from_json_str(
-                r#"{"tools":{"a":{"action":"x.*","resource_kind":"r","static_resource_id":"1"}}}"#
-            ),
-            Err(MappingError::InvalidPolicy(msg)) if msg.contains("invalid concrete action")
-        ));
-    }
-
-    #[test]
-    fn denial_resource_id_preserves_supplied_strings_and_uses_empty_when_missing() {
-        let arg_policy = ToolPolicy {
-            action: "git.pr.merge".to_string(),
-            resource_kind: "repo".to_string(),
-            resource_id_arg: Some("repo".to_string()),
-            static_resource_id: None,
-            arg_facts: BTreeMap::new(),
-            static_facts: BTreeMap::new(),
-        };
-        assert_eq!(denial_resource_id(&arg_policy, None), "");
-        let missing = parse_exact_json(r#"{}"#).unwrap();
-        assert_eq!(denial_resource_id(&arg_policy, Some(&missing)), "");
-        let non_str = parse_exact_json(r#"{"repo":42}"#).unwrap();
-        assert_eq!(denial_resource_id(&arg_policy, Some(&non_str)), "");
-        let valid = parse_exact_json(r#"{"repo":"acme/app"}"#).unwrap();
-        assert_eq!(denial_resource_id(&arg_policy, Some(&valid)), "acme/app");
-        let ctrl = parse_exact_json(r#"{"repo":"acme/app\ninjected"}"#).unwrap();
-        assert_eq!(
-            denial_resource_id(&arg_policy, Some(&ctrl)),
-            "acme/app\ninjected"
-        );
-
-        let static_policy = ToolPolicy {
-            action: "git.pr.merge".to_string(),
-            resource_kind: "repo".to_string(),
-            resource_id_arg: None,
-            static_resource_id: Some("prod-main".to_string()),
-            arg_facts: BTreeMap::new(),
-            static_facts: BTreeMap::new(),
-        };
-        assert_eq!(denial_resource_id(&static_policy, None), "prod-main");
-
-        let unconfigured = ToolPolicy {
-            action: "git.pr.merge".to_string(),
-            resource_kind: "repo".to_string(),
-            resource_id_arg: None,
-            static_resource_id: None,
-            arg_facts: BTreeMap::new(),
-            static_facts: BTreeMap::new(),
-        };
-        assert_eq!(denial_resource_id(&unconfigured, None), "");
-        assert!(matches!(
-            resolve_resource_id("merge_pr", &unconfigured, &BTreeMap::new()),
-            Err(MappingError::InvalidPolicy(msg)) if msg.contains("missing resource_id configuration")
-        ));
-    }
-}
+#[path = "mapping_tests.rs"]
+mod tests;

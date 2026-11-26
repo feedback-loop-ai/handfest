@@ -8,7 +8,7 @@ use crate::exact_json::{parse_exact_json, ExactJson};
 use crate::framing::{
     classify_upstream_frame, extract_id_value, fail_upstream_line_read, fail_upstream_protocol,
     format_jsonrpc_error_line, reject_unknown_keys, validate_client_envelope,
-    validate_json_keys_recursive, write_jsonrpc_error, write_raw_line, JsonRpcId, LineReadError,
+    validate_optional_meta, write_jsonrpc_error, write_raw_line, JsonRpcId, LineReadError,
     UpstreamFrame, JSONRPC_INTERNAL_ERROR, JSONRPC_INVALID_REQUEST, JSONRPC_METHOD_NOT_FOUND,
     JSONRPC_PARSE_ERROR,
 };
@@ -184,14 +184,8 @@ impl<C: Clock, L: ReceiptLedger> McpProxy<C, L> {
                 return Err(err);
             }
             self.drain_queued_client(&mut state, &mut transport, client_out)?;
-            if state.client_eof {
-                if state.queued_client.is_empty()
-                    && !transport.has_pending_upstream()
-                    && state.active_request.is_none()
-                {
-                    return transport.finish_writer(self.shutdown_timeout);
-                }
-                state.set_shutdown_timeout(self.shutdown_timeout);
+            if self.check_client_eof(&mut state, &transport) {
+                return transport.finish_writer(self.shutdown_timeout);
             }
 
             let outcome = transport.recv_event(state.shutdown_deadline);
@@ -201,6 +195,20 @@ impl<C: Clock, L: ReceiptLedger> McpProxy<C, L> {
                 LoopStep::FinishWriter => return transport.finish_writer(self.shutdown_timeout),
             }
         }
+    }
+
+    fn check_client_eof(&self, state: &mut SessionState, transport: &DuplexTransport) -> bool {
+        if !state.client_eof {
+            return false;
+        }
+        if state.queued_client.is_empty()
+            && !transport.has_pending_upstream()
+            && state.active_request.is_none()
+        {
+            return true;
+        }
+        state.set_shutdown_timeout(self.shutdown_timeout);
+        false
     }
 
     fn handle_recv_outcome<CW: Write>(
@@ -670,11 +678,7 @@ fn extract_cancel_request_id(obj: &BTreeMap<String, ExactJson>) -> Option<JsonRp
     if params.get("reason").is_some_and(|v| v.as_str().is_none()) {
         return None;
     }
-    if let Some(meta) = params.get("_meta") {
-        if meta.as_object().is_none() || validate_json_keys_recursive(meta).is_err() {
-            return None;
-        }
-    }
+    validate_optional_meta(params, "notifications/cancelled params._meta").ok()?;
     extract_id_value(params.get("requestId")?).ok()
 }
 

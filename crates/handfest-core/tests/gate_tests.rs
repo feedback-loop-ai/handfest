@@ -1236,15 +1236,27 @@ fn verify_chain_runtime_and_structure_typed_errors_and_precedence() {
             mandate_kind: ActorKind::Human,
         })
     );
-    let bad_window = make_vm(root_text, "aaaa", ActorKind::Human, (200, 200));
+    let inverted_window = make_vm(root_text, "aaaa", ActorKind::Human, (201, 200));
     assert_eq!(
-        verify_chain_runtime(&[bad_window], &leaf, 200),
+        verify_chain_runtime(&[inverted_window], &leaf, 200),
         Err(RuntimeChainError::InvalidProofValidityWindow {
             hop: 0,
-            valid_from: 200,
+            valid_from: 201,
             valid_until: 200,
         })
     );
+    let empty_window = make_vm(root_text, "aaaa", ActorKind::Human, (200, 200));
+    for eval_now in [199, 200, 201] {
+        assert_eq!(
+            verify_chain_runtime(std::slice::from_ref(&empty_window), &leaf, eval_now),
+            Err(RuntimeChainError::OutsideProofValidityWindow {
+                hop: 0,
+                now: eval_now,
+                valid_from: 200,
+                valid_until: 200,
+            })
+        );
+    }
 
     // Out-of-range proof validity bounds must be rejected by gate::verify_proofs even when `now` is valid.
     for out_of_range_win in [

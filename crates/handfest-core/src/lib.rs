@@ -7,6 +7,7 @@ extern crate alloc;
 
 pub mod ast;
 pub mod cnl;
+pub mod exact_json;
 pub mod gate;
 mod gate_errors;
 pub mod json_num;

@@ -115,6 +115,32 @@ const MALFORMED_CANCELS: &[&str] = &[
     r#"{"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":1,"_meta":{"re\u017fpo":1}}}"#,
 ];
 
+struct LineCountingWriter {
+    buf: Vec<u8>,
+    lines: usize,
+    threshold: usize,
+    reached_tx: Option<mpsc::SyncSender<()>>,
+}
+
+impl Write for LineCountingWriter {
+    fn write(&mut self, data: &[u8]) -> io::Result<usize> {
+        self.buf.extend_from_slice(data);
+        self.lines += data.iter().filter(|&&b| b == b'\n').count();
+        if self.lines >= self.threshold {
+            if let Some(tx) = self.reached_tx.take() {
+                let _ = tx.send(());
+            }
+        }
+        Ok(data.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+const FENCE_NOTIF: &str = r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#;
+
 #[test]
 fn round11_malformed_cancel_reason_and_meta_preserve_active_request_and_do_not_forward() {
     for &bad_cancel in MALFORMED_CANCELS {
@@ -132,7 +158,7 @@ fn round11_malformed_cancel_reason_and_meta_preserve_active_request_and_do_not_f
         let (up_in_w, mut up_in_r) = mem_pipe();
         let (mut up_out_w, up_out_r) = mem_pipe();
         let (ping_seen_tx, ping_seen_rx) = mpsc::sync_channel(1);
-        let (reply_tx, reply_rx) = mpsc::sync_channel(1);
+        let (fence_seen_tx, fence_seen_rx) = mpsc::sync_channel(1);
 
         let upstream = thread::spawn(move || {
             let mut forwarded = Vec::new();
@@ -141,7 +167,19 @@ fn round11_malformed_cancel_reason_and_meta_preserve_active_request_and_do_not_f
             forwarded.push(line.trim_end().to_string());
             ping_seen_tx.send(()).unwrap();
 
-            reply_rx.recv().unwrap();
+            // Wait until the FIFO fence arrives AFTER the proxy processed `bad_cancel` while id=1 is active.
+            loop {
+                line.clear();
+                assert!(up_in_r.read_line(&mut line).unwrap() > 0);
+                let trimmed = line.trim_end().to_string();
+                let is_fence = trimmed == FENCE_NOTIF;
+                forwarded.push(trimmed);
+                if is_fence {
+                    break;
+                }
+            }
+            fence_seen_tx.send(()).unwrap();
+
             writeln!(
                 up_out_w,
                 r#"{{"jsonrpc":"2.0","id":1,"result":{{"ok":true}}}}"#
@@ -162,7 +200,8 @@ fn round11_malformed_cancel_reason_and_meta_preserve_active_request_and_do_not_f
             writeln!(client_w, r#"{{"jsonrpc":"2.0","id":1,"method":"ping"}}"#).unwrap();
             ping_seen_rx.recv().unwrap();
             writeln!(client_w, "{bad_cancel_owned}").unwrap();
-            reply_tx.send(()).unwrap();
+            writeln!(client_w, "{FENCE_NOTIF}").unwrap();
+            fence_seen_rx.recv().unwrap();
         });
 
         let mut client_out = Vec::new();
@@ -174,7 +213,7 @@ fn round11_malformed_cancel_reason_and_meta_preserve_active_request_and_do_not_f
 
         assert_eq!(
             forwarded,
-            vec![r#"{"jsonrpc":"2.0","id":1,"method":"ping"}"#],
+            vec![r#"{"jsonrpc":"2.0","id":1,"method":"ping"}"#, FENCE_NOTIF],
             "malformed cancel {bad_cancel} must NOT be forwarded upstream"
         );
         let resp: Value =
@@ -199,13 +238,12 @@ fn round11_malformed_cancel_preserves_interleaved_budget() {
         let (mut client_w, client_r) = mem_pipe();
         let (up_in_w, mut up_in_r) = mem_pipe();
         let (mut up_out_w, up_out_r) = mem_pipe();
-        let (ping_tx, ping_rx) = mpsc::sync_channel(1);
-        let (spam_tx, spam_rx) = mpsc::sync_channel(1);
+        let (six_hundred_tx, six_hundred_rx) = mpsc::sync_channel(1);
+        let (done_tx, done_rx) = mpsc::sync_channel(1);
 
         let upstream = thread::spawn(move || {
             let mut line = String::new();
             assert!(up_in_r.read_line(&mut line).unwrap() > 0);
-            ping_tx.send(()).unwrap();
             for i in 0..600 {
                 writeln!(
                     up_out_w,
@@ -213,8 +251,19 @@ fn round11_malformed_cancel_preserves_interleaved_budget() {
                 )
                 .unwrap();
             }
-            spam_rx.recv().unwrap();
-            for i in 600..1100 {
+            // Wait until the FIFO fence arrives, proving `bad_cancel` was processed strictly
+            // AFTER the proxy forwarded all 600 progress frames.
+            loop {
+                line.clear();
+                if up_in_r.read_line(&mut line).unwrap() == 0 {
+                    break;
+                }
+                if line.trim_end() == FENCE_NOTIF {
+                    break;
+                }
+            }
+            // Send ONLY 425 more frames (600 + 425 = 1025 > 1024, while 425 < 1024).
+            for i in 600..1025 {
                 if writeln!(
                     up_out_w,
                     r#"{{"jsonrpc":"2.0","method":"notifications/progress","params":{{"n":{i}}}}}"#
@@ -224,18 +273,28 @@ fn round11_malformed_cancel_preserves_interleaved_budget() {
                     break;
                 }
             }
+            let _ = writeln!(
+                up_out_w,
+                r#"{{"jsonrpc":"2.0","id":1,"result":{{"ok":true}}}}"#
+            );
+            let _ = done_tx.send(());
         });
 
         let bad_cancel_owned = bad_cancel.to_string();
         let client = thread::spawn(move || {
             writeln!(client_w, r#"{{"jsonrpc":"2.0","id":1,"method":"ping"}}"#).unwrap();
-            ping_rx.recv().unwrap();
+            six_hundred_rx.recv().unwrap();
             writeln!(client_w, "{bad_cancel_owned}").unwrap();
-            spam_tx.send(()).unwrap();
-            let _ = client_w.flush();
+            writeln!(client_w, "{FENCE_NOTIF}").unwrap();
+            let _ = done_rx.recv();
         });
 
-        let mut client_out = Vec::new();
+        let mut client_out = LineCountingWriter {
+            buf: Vec::new(),
+            lines: 0,
+            threshold: 600,
+            reached_tx: Some(six_hundred_tx),
+        };
         let res = proxy.run(client_r, &mut client_out, up_in_w, up_out_r);
         client.join().unwrap();
         upstream.join().unwrap();
@@ -544,4 +603,413 @@ fn round11_tools_list_validates_next_cursor_and_meta() {
         assert_eq!(parsed["id"], json!(1));
         assert_eq!(parsed["error"]["code"], json!(-32603));
     }
+}
+
+#[test]
+fn round11_tools_call_rejects_malformed_meta_without_consuming_quota_or_forwarding() {
+    let (verified, agent_kp, now) =
+        build_single_hop("ops.exec", "sandbox \"main\"", "LIMIT 1 call\n");
+    let policy_map = ToolPolicyMap::from_json_str(
+        r#"{"tools":{"run_sandbox":{"action":"ops.exec","resource_kind":"sandbox","static_resource_id":"main"}}}"#,
+    )
+    .unwrap();
+    let mut proxy = McpProxy::new(
+        verified,
+        agent_kp.key_id(),
+        policy_map,
+        SqliteLedger::open_in_memory().unwrap(),
+        FixedClock::new(now),
+    )
+    .unwrap();
+
+    let malformed_calls = [
+        (
+            1,
+            r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"run_sandbox","arguments":{},"_meta":123}}"#,
+            "tools/call params._meta must be a JSON object",
+        ),
+        (
+            2,
+            r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"run_sandbox","arguments":{},"_meta":null}}"#,
+            "tools/call params._meta must be a JSON object",
+        ),
+        (
+            3,
+            r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"run_sandbox","arguments":{},"_meta":{"a":1,"A":2}}}"#,
+            "collides case-insensitively",
+        ),
+        (
+            4,
+            r#"{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"run_sandbox","arguments":{},"_meta":{"nested":[{"x":1,"X":2}]}}}"#,
+            "collides case-insensitively",
+        ),
+        (
+            5,
+            r#"{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"run_sandbox","arguments":{},"_meta":{"re\u017fpo":1}}}"#,
+            "non-ASCII key",
+        ),
+    ];
+
+    let valid_call = r#"{"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"run_sandbox","arguments":{},"_meta":{"traceId":"ok"}}}"#;
+    let over_quota = r#"{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"run_sandbox","arguments":{},"_meta":{"traceId":"second"}}}"#;
+    let mut client_script: String = malformed_calls
+        .iter()
+        .map(|(_, f, _)| format!("{f}\n"))
+        .collect();
+    client_script.push_str(&format!("{valid_call}\n{over_quota}\n"));
+
+    let (up_in_w, mut up_in_r) = mem_pipe();
+    let (mut up_out_w, up_out_r) = mem_pipe();
+    let upstream = thread::spawn(move || {
+        let mut forwarded = Vec::new();
+        let mut line = String::new();
+        while up_in_r.read_line(&mut line).unwrap() > 0 {
+            forwarded.push(line.trim_end().to_string());
+            writeln!(
+                up_out_w,
+                r#"{{"jsonrpc":"2.0","id":6,"result":{{"ok":true}}}}"#
+            )
+            .unwrap();
+            line.clear();
+        }
+        forwarded
+    });
+
+    let mut client_out = Vec::new();
+    proxy
+        .run(
+            BufReader::new(Cursor::new(client_script.into_bytes())),
+            &mut client_out,
+            up_in_w,
+            up_out_r,
+        )
+        .expect("session must stay healthy across malformed _meta denials");
+    assert_eq!(upstream.join().unwrap(), vec![valid_call]);
+
+    let responses: Vec<Value> = String::from_utf8(client_out)
+        .unwrap()
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    assert_eq!(responses.len(), 7);
+    for (idx, (id, _, expected)) in malformed_calls.iter().enumerate() {
+        assert_eq!(responses[idx]["id"], json!(id));
+        assert_eq!(responses[idx]["error"]["code"], json!(-32001));
+        assert!(responses[idx]["error"]["data"]["reason"]
+            .as_str()
+            .unwrap()
+            .contains(expected));
+    }
+    assert_eq!(
+        responses[5],
+        json!({"jsonrpc":"2.0","id":6,"result":{"ok":true}})
+    );
+    assert_eq!(responses[6]["id"], json!(7));
+    assert_eq!(responses[6]["error"]["code"], json!(-32001));
+    assert!(responses[6]["error"]["data"]["reason"]
+        .as_str()
+        .unwrap()
+        .contains("quota"));
+}
+
+#[test]
+fn round11_wire_refusal_oversized_upstream_and_invalid_utf8_frames() {
+    let (verified, agent_kp, now) = build_single_hop("ops.exec", "sandbox \"*\"", "");
+    let policy_map = ToolPolicyMap::from_json_str(r#"{"tools":{}}"#).unwrap();
+
+    // Oversized upstream frame emits -32603 and returns ProxyError::UpstreamFrameTooLarge.
+    let mut proxy = McpProxy::new(
+        verified.clone(),
+        agent_kp.key_id(),
+        policy_map.clone(),
+        SqliteLedger::open_in_memory().unwrap(),
+        FixedClock::new(now),
+    )
+    .unwrap()
+    .with_max_line_bytes(64)
+    .unwrap();
+    let (up_in_w, mut up_in_r) = mem_pipe();
+    let (mut up_out_w, up_out_r) = mem_pipe();
+    let upstream = thread::spawn(move || {
+        let mut req = String::new();
+        up_in_r.read_line(&mut req).unwrap();
+        let big = format!(
+            r#"{{"jsonrpc":"2.0","id":1,"result":{{"pad":"{}"}}}}"#,
+            "x".repeat(80)
+        );
+        writeln!(up_out_w, "{big}").unwrap();
+    });
+    let mut client_out = Vec::new();
+    let res = proxy.run(
+        BufReader::new(Cursor::new(
+            b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"ping\"}\n".to_vec(),
+        )),
+        &mut client_out,
+        up_in_w,
+        up_out_r,
+    );
+    upstream.join().unwrap();
+    assert!(matches!(
+        res,
+        Err(ProxyError::UpstreamFrameTooLarge { max_bytes: 64 })
+    ));
+    let err_resp: Value =
+        serde_json::from_str(String::from_utf8(client_out).unwrap().trim()).unwrap();
+    assert_eq!(err_resp["id"], json!(1));
+    assert_eq!(err_resp["error"]["code"], json!(-32603));
+
+    // Invalid UTF-8 from client yields -32700; invalid UTF-8 from upstream yields -32603 + error.
+    let mut proxy2 = McpProxy::new(
+        verified,
+        agent_kp.key_id(),
+        policy_map,
+        SqliteLedger::open_in_memory().unwrap(),
+        FixedClock::new(now),
+    )
+    .unwrap();
+    let (up_in_w2, mut up_in_r2) = mem_pipe();
+    let (mut up_out_w2, up_out_r2) = mem_pipe();
+    let upstream2 = thread::spawn(move || {
+        let mut req = String::new();
+        up_in_r2.read_line(&mut req).unwrap();
+        up_out_w2.write_all(b"\xff\xfe\n").unwrap();
+    });
+    let mut client_bytes = b"\xff\xfe\n".to_vec();
+    client_bytes.extend_from_slice(b"{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"ping\"}\n");
+    let mut client_out2 = Vec::new();
+    let res2 = proxy2.run(
+        BufReader::new(Cursor::new(client_bytes)),
+        &mut client_out2,
+        up_in_w2,
+        up_out_r2,
+    );
+    upstream2.join().unwrap();
+    assert!(matches!(
+        res2,
+        Err(ProxyError::UpstreamProtocol(ref msg)) if msg.contains("non-UTF-8")
+    ));
+    let lines: Vec<Value> = String::from_utf8(client_out2)
+        .unwrap()
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    assert_eq!(lines.len(), 2);
+    assert_eq!(lines[0]["id"], Value::Null);
+    assert_eq!(lines[0]["error"]["code"], json!(-32700));
+    assert!(lines[0]["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("invalid UTF-8"));
+    assert_eq!(lines[1]["id"], json!(2));
+    assert_eq!(lines[1]["error"]["code"], json!(-32603));
+}
+
+#[test]
+fn round11_wire_refusal_malformed_tools_list_payloads() {
+    let (verified, agent_kp, now) = build_single_hop("ops.exec", "sandbox \"*\"", "");
+    let policy_map = ToolPolicyMap::from_json_str(
+        r#"{"tools":{"run_sandbox":{"action":"ops.exec","resource_kind":"sandbox","static_resource_id":"main"}}}"#,
+    )
+    .unwrap();
+
+    for (bad_resp, expected_substr) in [
+        (
+            r#"{"jsonrpc":"2.0","id":1,"result":123}"#,
+            "missing result object",
+        ),
+        (
+            r#"{"jsonrpc":"2.0","id":1,"result":{}}"#,
+            "missing result.tools array",
+        ),
+        (
+            r#"{"jsonrpc":"2.0","id":1,"result":{"tools":{}}}"#,
+            "missing result.tools array",
+        ),
+        (
+            r#"{"jsonrpc":"2.0","id":1,"result":{"tools":[123]}}"#,
+            "expected JSON object",
+        ),
+        (
+            r#"{"jsonrpc":"2.0","id":1,"result":{"tools":[{}]}}"#,
+            "missing or non-string 'name'",
+        ),
+        (
+            r#"{"jsonrpc":"2.0","id":1,"result":{"tools":[{"name":42}]}}"#,
+            "missing or non-string 'name'",
+        ),
+        (
+            r#"{"jsonrpc":"2.0","id":1,"result":{"tools":[{"name":""}]}}"#,
+            "'name' must not be empty",
+        ),
+    ] {
+        let (res, out) = run_tools_list_once(&verified, &agent_kp, &policy_map, now, bad_resp);
+        assert!(
+            matches!(res, Err(ProxyError::UpstreamProtocol(ref msg)) if msg.contains(expected_substr)),
+            "expected UpstreamProtocol containing {expected_substr:?} for {bad_resp}, got {res:?}"
+        );
+        let parsed: Value = serde_json::from_str(out.trim()).unwrap();
+        assert_eq!(parsed["id"], json!(1));
+        assert_eq!(parsed["error"]["code"], json!(-32603));
+    }
+}
+
+#[test]
+fn round11_wire_refusal_malformed_tools_call_params() {
+    let (verified, agent_kp, now) = build_single_hop("ops.exec", "sandbox \"*\"", "");
+    let policy_map = ToolPolicyMap::from_json_str(
+        r#"{"tools":{"run_sandbox":{"action":"ops.exec","resource_kind":"sandbox","static_resource_id":"main"}}}"#,
+    )
+    .unwrap();
+    let mut proxy = McpProxy::new(
+        verified,
+        agent_kp.key_id(),
+        policy_map,
+        SqliteLedger::open_in_memory().unwrap(),
+        FixedClock::new(now),
+    )
+    .unwrap();
+    let bad_tool_calls = [
+        (
+            10,
+            r#"{"jsonrpc":"2.0","id":10,"method":"tools/call"}"#,
+            "tools/call params must be a JSON object",
+        ),
+        (
+            11,
+            r#"{"jsonrpc":"2.0","id":11,"method":"tools/call","params":[]}"#,
+            "tools/call params must be a JSON object",
+        ),
+        (
+            12,
+            r#"{"jsonrpc":"2.0","id":12,"method":"tools/call","params":{"name":"run_sandbox","extra":1}}"#,
+            "unexpected tools/call params key 'extra'",
+        ),
+        (
+            13,
+            r#"{"jsonrpc":"2.0","id":13,"method":"tools/call","params":{}}"#,
+            "tools/call params.name must be a string",
+        ),
+        (
+            14,
+            r#"{"jsonrpc":"2.0","id":14,"method":"tools/call","params":{"name":123}}"#,
+            "tools/call params.name must be a string",
+        ),
+        (
+            15,
+            r#"{"jsonrpc":"2.0","id":15,"method":"tools/call","params":{"name":""}}"#,
+            "tools/call params.name must not be empty",
+        ),
+    ];
+    let script: String = bad_tool_calls
+        .iter()
+        .map(|(_, line, _)| format!("{line}\n"))
+        .collect();
+    let (up_in_w, mut up_in_r) = mem_pipe();
+    let (_up_out_w, up_out_r) = mem_pipe();
+    let upstream = thread::spawn(move || {
+        let mut buf = String::new();
+        up_in_r.read_line(&mut buf).unwrap()
+    });
+    let mut client_out = Vec::new();
+    proxy
+        .run(
+            BufReader::new(Cursor::new(script.into_bytes())),
+            &mut client_out,
+            up_in_w,
+            up_out_r,
+        )
+        .expect("bad tools/call params must be denied cleanly");
+    assert_eq!(upstream.join().unwrap(), 0);
+    let responses: Vec<Value> = String::from_utf8(client_out)
+        .unwrap()
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    assert_eq!(responses.len(), bad_tool_calls.len());
+    for (idx, (id, _, expected)) in bad_tool_calls.iter().enumerate() {
+        assert_eq!(responses[idx]["id"], json!(id));
+        assert_eq!(responses[idx]["error"]["code"], json!(-32001));
+        assert!(responses[idx]["error"]["data"]["reason"]
+            .as_str()
+            .unwrap()
+            .contains(expected));
+    }
+}
+
+#[test]
+fn round11_tools_list_and_call_use_precompiled_static_decimal_and_timestamp_facts() {
+    let (verified, agent_kp, now) = build_single_hop(
+        "finance.quote",
+        "ledger \"main\"",
+        "WHERE policy.approved_at < 2026-06-02T00:00:00Z\n  AND pricing.fee <= 10.5\n",
+    );
+    let policy_map = ToolPolicyMap::from_json_str(
+        r#"{
+            "tools": {
+                "cheap_quote": {
+                    "action": "finance.quote",
+                    "resource_kind": "ledger",
+                    "static_resource_id": "main",
+                    "static_facts": {
+                        "pricing.fee": { "decimal": "9.99" },
+                        "policy.approved_at": { "timestamp": "2026-06-01T00:00:00Z" }
+                    }
+                },
+                "expensive_quote": {
+                    "action": "finance.quote",
+                    "resource_kind": "ledger",
+                    "static_resource_id": "main",
+                    "static_facts": {
+                        "pricing.fee": { "decimal": "20.00" },
+                        "policy.approved_at": { "timestamp": "2026-06-01T00:00:00Z" }
+                    }
+                }
+            }
+        }"#,
+    )
+    .unwrap();
+
+    let raw_list = r#"{"jsonrpc":"2.0","id":1,"result":{"tools":[{"name":"cheap_quote"},{"name":"expensive_quote"}]}}"#;
+    let (res, out) = run_tools_list_once(&verified, &agent_kp, &policy_map, now, raw_list);
+    res.expect("tools/list with static decimal & timestamp facts must succeed");
+    let parsed: Value = serde_json::from_str(out.trim()).unwrap();
+    let tools = parsed["result"]["tools"].as_array().unwrap();
+    assert_eq!(tools.len(), 1);
+    assert_eq!(tools[0]["name"], json!("cheap_quote"));
+
+    let mut proxy = McpProxy::new(
+        verified,
+        agent_kp.key_id(),
+        policy_map,
+        SqliteLedger::open_in_memory().unwrap(),
+        FixedClock::new(now),
+    )
+    .unwrap();
+    let call = "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\",\"params\":{\"name\":\"cheap_quote\",\"arguments\":{}}}\n";
+    let (up_in_w, mut up_in_r) = mem_pipe();
+    let (mut up_out_w, up_out_r) = mem_pipe();
+    let upstream = thread::spawn(move || {
+        let mut req = String::new();
+        up_in_r.read_line(&mut req).unwrap();
+        writeln!(
+            up_out_w,
+            r#"{{"jsonrpc":"2.0","id":2,"result":{{"quoted":true}}}}"#
+        )
+        .unwrap();
+    });
+    let mut client_out = Vec::new();
+    proxy
+        .run(
+            BufReader::new(Cursor::new(call.as_bytes().to_vec())),
+            &mut client_out,
+            up_in_w,
+            up_out_r,
+        )
+        .expect("cheap_quote call must succeed");
+    upstream.join().unwrap();
+    let resp: Value = serde_json::from_str(String::from_utf8(client_out).unwrap().trim()).unwrap();
+    assert_eq!(
+        resp,
+        json!({"jsonrpc":"2.0","id":2,"result":{"quoted":true}})
+    );
 }

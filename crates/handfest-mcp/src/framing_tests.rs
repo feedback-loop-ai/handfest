@@ -271,7 +271,6 @@ fn closed_envelope_keys_reject_case_colliding_and_unknown_top_level_fields() {
         let err = validate_client_envelope(parsed.as_object().unwrap()).unwrap_err();
         assert_eq!(err.message, expected, "client input: {raw}");
     }
-
     let bad_upstream = [
         (
             r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32603,"message":"fail"},"RESULT":{"tools":[]}}"#,
@@ -614,4 +613,240 @@ fn write_raw_line_retries_eintr_on_write_and_flush() {
         write_raw_line(&mut broken_flush, line),
         Err(ProxyError::Io(err)) if err.kind() == io::ErrorKind::BrokenPipe
     ));
+}
+
+#[test]
+fn read_bounded_line_rejects_invalid_utf8_with_newline_and_at_eof() {
+    let mut with_nl = Cursor::new(b"\xff\xfe\n".as_slice());
+    assert!(matches!(
+        read_bounded_line(&mut with_nl, 64),
+        Err(LineReadError::InvalidUtf8)
+    ));
+
+    let mut at_eof = Cursor::new(b"\xff\xfe".as_slice());
+    assert!(matches!(
+        read_bounded_line(&mut at_eof, 64),
+        Err(LineReadError::InvalidUtf8)
+    ));
+}
+
+#[test]
+fn fail_upstream_line_read_handles_all_error_variants() {
+    let req_id = JsonRpcId::Number {
+        raw: "7".to_string(),
+        value: 7,
+    };
+
+    let mut out_long = Vec::new();
+    let err_long =
+        fail_upstream_line_read(LineReadError::TooLong, 64, Some(&req_id), &mut out_long)
+            .unwrap_err();
+    assert!(matches!(
+        err_long,
+        ProxyError::UpstreamFrameTooLarge { max_bytes: 64 }
+    ));
+    let parsed_long = parse_exact_json(std::str::from_utf8(&out_long).unwrap().trim()).unwrap();
+    let long_err = parsed_long.as_object().unwrap()["error"]
+        .as_object()
+        .unwrap();
+    assert_eq!(long_err["code"], ExactJson::Number("-32603".to_string()));
+    assert!(long_err["message"]
+        .as_str()
+        .unwrap()
+        .contains("exceeded 64 bytes"));
+
+    let mut out_cr = Vec::new();
+    let err_cr =
+        fail_upstream_line_read(LineReadError::BareCr, 64, Some(&req_id), &mut out_cr).unwrap_err();
+    assert!(
+        matches!(err_cr, ProxyError::UpstreamProtocol(ref msg) if msg.contains("bare carriage return"))
+    );
+    let parsed_cr = parse_exact_json(std::str::from_utf8(&out_cr).unwrap().trim()).unwrap();
+    assert_eq!(
+        parsed_cr.as_object().unwrap()["error"].as_object().unwrap()["code"],
+        ExactJson::Number("-32700".to_string())
+    );
+
+    let mut out_utf8 = Vec::new();
+    let err_utf8 =
+        fail_upstream_line_read(LineReadError::InvalidUtf8, 64, Some(&req_id), &mut out_utf8)
+            .unwrap_err();
+    assert!(matches!(err_utf8, ProxyError::UpstreamProtocol(ref msg) if msg.contains("non-UTF-8")));
+    let parsed_utf8 = parse_exact_json(std::str::from_utf8(&out_utf8).unwrap().trim()).unwrap();
+    assert_eq!(
+        parsed_utf8.as_object().unwrap()["error"]
+            .as_object()
+            .unwrap()["code"],
+        ExactJson::Number("-32603".to_string())
+    );
+
+    let mut out_io = Vec::new();
+    let err_io = fail_upstream_line_read(
+        LineReadError::Io(std::io::Error::new(
+            std::io::ErrorKind::BrokenPipe,
+            "broken",
+        )),
+        64,
+        Some(&req_id),
+        &mut out_io,
+    )
+    .unwrap_err();
+    assert!(matches!(err_io, ProxyError::Io(ref e) if e.kind() == std::io::ErrorKind::BrokenPipe));
+    assert!(out_io.is_empty());
+}
+
+#[test]
+fn client_envelope_rejects_malformed_versions_methods_and_ids() {
+    let bad_client = [
+        (
+            r#"{"jsonrpc":"1.0","id":1,"method":"ping"}"#,
+            "jsonrpc version must be \"2.0\"",
+        ),
+        (
+            r#"{"id":1,"method":"ping"}"#,
+            "jsonrpc version must be \"2.0\"",
+        ),
+        (
+            r#"{"jsonrpc":"2.0","id":1}"#,
+            "missing or non-string JSON-RPC method",
+        ),
+        (
+            r#"{"jsonrpc":"2.0","id":1,"method":123}"#,
+            "missing or non-string JSON-RPC method",
+        ),
+        (
+            r#"{"jsonrpc":"2.0","id":1,"method":""}"#,
+            "JSON-RPC method must not be empty",
+        ),
+        (
+            r#"{"jsonrpc":"2.0","id":null,"method":"ping"}"#,
+            "JSON-RPC id must be a string or number",
+        ),
+    ];
+    for (raw, expected) in bad_client {
+        let parsed = parse_exact_json(raw).unwrap();
+        let err = validate_client_envelope(parsed.as_object().unwrap()).unwrap_err();
+        assert_eq!(err.message, expected, "client input: {raw}");
+    }
+}
+
+#[test]
+fn upstream_frame_rejects_malformed_versions_methods_params_and_ids() {
+    let bad_upstream = [
+        (
+            r#"{"jsonrpc":"1.0","id":1,"result":{}}"#,
+            "upstream frame jsonrpc version must be \"2.0\"",
+        ),
+        (
+            r#"{"id":1,"result":{}}"#,
+            "upstream frame jsonrpc version must be \"2.0\"",
+        ),
+        (
+            r#"{"jsonrpc":"2.0","method":123}"#,
+            "upstream frame method must be a string",
+        ),
+        (
+            r#"{"jsonrpc":"2.0","method":""}"#,
+            "upstream frame method must not be empty",
+        ),
+        (
+            r#"{"jsonrpc":"2.0","method":"notifications/progress","result":{}}"#,
+            "upstream request/notification must not contain result or error",
+        ),
+        (
+            r#"{"jsonrpc":"2.0","method":"notifications/progress","error":{"code":-1,"message":"x"}}"#,
+            "upstream request/notification must not contain result or error",
+        ),
+        (
+            r#"{"jsonrpc":"2.0","method":"notifications/progress","params":123}"#,
+            "upstream request/notification params must be a JSON object or array",
+        ),
+        (
+            r#"{"jsonrpc":"2.0","id":1.0,"method":"sampling/createMessage"}"#,
+            "JSON-RPC numeric id must be a plain integer without decimal point or exponent",
+        ),
+        (
+            r#"{"jsonrpc":"2.0","id":null,"method":"sampling/createMessage"}"#,
+            "JSON-RPC id must be a string or number",
+        ),
+        (
+            r#"{"jsonrpc":"2.0","result":{}}"#,
+            "upstream response missing required id",
+        ),
+        (
+            r#"{"jsonrpc":"2.0","id":null,"result":{}}"#,
+            "JSON-RPC id must be a string or number",
+        ),
+        (
+            r#"{"jsonrpc":"2.0","id":1,"result":{},"error":{"code":-1,"message":"x"}}"#,
+            "upstream JSON-RPC response must not contain both result and error",
+        ),
+        (
+            r#"{"jsonrpc":"2.0","id":1}"#,
+            "upstream JSON-RPC response must contain either result or error",
+        ),
+        (
+            r#"{"jsonrpc":"2.0","id":1,"error":{"code":1.5,"message":"x"}}"#,
+            "malformed JSON-RPC error object in upstream response",
+        ),
+        (
+            r#"{"jsonrpc":"2.0","id":1,"error":"not-an-object"}"#,
+            "malformed JSON-RPC error object in upstream response",
+        ),
+    ];
+    for (raw, expected) in bad_upstream {
+        let parsed = parse_exact_json(raw).unwrap();
+        let err = classify_upstream_frame(parsed.as_object().unwrap())
+            .err()
+            .expect("malformed upstream frame must fail");
+        assert_eq!(err, expected, "upstream input: {raw}");
+    }
+
+    let notif =
+        parse_exact_json(r#"{"jsonrpc":"2.0","method":"notifications/progress","params":{}}"#)
+            .unwrap();
+    assert!(matches!(
+        classify_upstream_frame(notif.as_object().unwrap()),
+        Ok(UpstreamFrame::Notification)
+    ));
+    let sreq = parse_exact_json(
+        r#"{"jsonrpc":"2.0","id":9,"method":"sampling/createMessage","params":[]}"#,
+    )
+    .unwrap();
+    assert!(matches!(
+        classify_upstream_frame(sreq.as_object().unwrap()),
+        Ok(UpstreamFrame::ServerRequest {
+            method: "sampling/createMessage",
+            ..
+        })
+    ));
+}
+
+#[test]
+fn validate_optional_meta_checks_object_shape_and_nested_keys() {
+    let ok = parse_exact_json(r#"{"_meta":{"traceId":"abc","items":[{"k":1}]}}"#).unwrap();
+    assert!(validate_optional_meta(ok.as_object().unwrap(), "ctx").is_ok());
+
+    let absent = parse_exact_json(r#"{}"#).unwrap();
+    assert!(validate_optional_meta(absent.as_object().unwrap(), "ctx").is_ok());
+
+    let non_obj = parse_exact_json(r#"{"_meta":123}"#).unwrap();
+    assert_eq!(
+        validate_optional_meta(non_obj.as_object().unwrap(), "ctx").unwrap_err(),
+        "ctx must be a JSON object"
+    );
+
+    let nested_collision = parse_exact_json(r#"{"_meta":{"items":[{"a":1,"A":2}]}}"#).unwrap();
+    assert!(
+        validate_optional_meta(nested_collision.as_object().unwrap(), "ctx")
+            .unwrap_err()
+            .contains("collides case-insensitively")
+    );
+
+    let non_ascii = parse_exact_json(r#"{"_meta":{"re\u017fpo":1}}"#).unwrap();
+    assert!(
+        validate_optional_meta(non_ascii.as_object().unwrap(), "ctx")
+            .unwrap_err()
+            .contains("non-ASCII key")
+    );
 }

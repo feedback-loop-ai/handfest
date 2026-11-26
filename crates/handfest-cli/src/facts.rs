@@ -3,14 +3,13 @@
 //! Numeric literals are lexed directly from raw JSON tokens without routing through IEEE-754 `f64`,
 //! preserving exact base-10 fixed-point precision up to `handfest_core::ast::MAX_DECIMAL_SCALE`.
 
-use std::collections::BTreeSet;
+use std::collections::BTreeMap;
 use std::fs;
 
 use handfest_core::ast::{is_valid_field_path, is_valid_quoted_str, parse_rfc3339_utc, Scalar};
+use handfest_core::exact_json::{parse_exact_json_with_max_depth, ExactJson};
 use handfest_core::gate::VerifiedFacts;
-use handfest_core::json_num::{
-    parse_canonical_json_int, parse_decimal_str, parse_json_decimal, scan_json_number_token,
-};
+use handfest_core::json_num::{parse_canonical_json_int, parse_decimal_str, parse_json_decimal};
 
 const MAX_JSON_DEPTH: usize = 16;
 
@@ -28,18 +27,14 @@ pub(crate) fn parse_facts_arg(raw: &str) -> Result<VerifiedFacts, String> {
         trimmed.to_string()
     };
 
-    let parsed =
-        parse_exact_json(&json_text).map_err(|err| format!("invalid facts JSON: {err}"))?;
+    let parsed = parse_exact_json_with_max_depth(&json_text, MAX_JSON_DEPTH)
+        .map_err(|err| format!("invalid facts JSON: {err}"))?;
     let ExactJson::Object(entries) = parsed else {
         return Err("facts JSON must be a top-level object".to_string());
     };
 
-    let mut seen_keys = BTreeSet::new();
     let mut facts = VerifiedFacts::new();
     for (key, value) in entries {
-        if !seen_keys.insert(key.clone()) {
-            return Err(format!("duplicate fact key '{key}' in facts JSON"));
-        }
         if !is_valid_field_path(&key) {
             return Err(format!("invalid fact field path '{key}'"));
         }
@@ -69,7 +64,7 @@ fn json_value_to_scalar(field: &str, value: &ExactJson) -> Result<Scalar, String
             }
         }
         ExactJson::Object(entries) => parse_typed_scalar_object(field, entries),
-        ExactJson::Null | ExactJson::Array => Err(format!(
+        ExactJson::Null | ExactJson::Array(_) => Err(format!(
             "fact '{field}': unsupported JSON type (expected string, number, bool, or typed scalar object)"
         )),
     }
@@ -77,14 +72,18 @@ fn json_value_to_scalar(field: &str, value: &ExactJson) -> Result<Scalar, String
 
 fn parse_typed_scalar_object(
     field: &str,
-    entries: &[(String, ExactJson)],
+    entries: &BTreeMap<String, ExactJson>,
 ) -> Result<Scalar, String> {
     if entries.len() != 1 {
         return Err(format!(
             "fact '{field}': typed scalar object must contain exactly one type key"
         ));
     }
-    let (tag, inner) = &entries[0];
+    let Some((tag, inner)) = entries.iter().next() else {
+        return Err(format!(
+            "fact '{field}': typed scalar object must contain exactly one type key"
+        ));
+    };
     match (tag.as_str(), inner) {
         ("str", ExactJson::Str(s)) => {
             if !is_valid_quoted_str(s) {
@@ -127,161 +126,6 @@ fn parse_exact_json_number(field: &str, raw: &str) -> Result<Scalar, String> {
     Ok(Scalar::Decimal(dec))
 }
 
-enum ExactJson {
-    Null,
-    Bool(bool),
-    Number(String),
-    Str(String),
-    Array,
-    Object(Vec<(String, ExactJson)>),
-}
-
-fn parse_exact_json(src: &str) -> Result<ExactJson, String> {
-    let mut parser = JsonParser {
-        src,
-        bytes: src.as_bytes(),
-        pos: 0,
-    };
-    let val = parser.parse_value(0)?;
-    parser.skip_ws();
-    if parser.pos != parser.bytes.len() {
-        return Err(format!("trailing characters at byte {}", parser.pos));
-    }
-    Ok(val)
-}
-
-struct JsonParser<'a> {
-    src: &'a str,
-    bytes: &'a [u8],
-    pos: usize,
-}
-
-impl<'a> JsonParser<'a> {
-    fn peek(&self) -> Option<u8> {
-        self.bytes.get(self.pos).copied()
-    }
-
-    fn skip_ws(&mut self) {
-        while matches!(self.peek(), Some(b' ' | b'\t' | b'\n' | b'\r')) {
-            self.pos += 1;
-        }
-    }
-
-    fn parse_value(&mut self, depth: usize) -> Result<ExactJson, String> {
-        if depth > MAX_JSON_DEPTH {
-            return Err("JSON nesting depth exceeded".to_string());
-        }
-        self.skip_ws();
-        match self.peek() {
-            Some(b'{') => self.parse_object(depth + 1),
-            Some(b'[') => self.parse_array(depth + 1),
-            Some(b'"') => self.parse_string().map(ExactJson::Str),
-            Some(b't') => self.expect_literal(b"true", ExactJson::Bool(true)),
-            Some(b'f') => self.expect_literal(b"false", ExactJson::Bool(false)),
-            Some(b'n') => self.expect_literal(b"null", ExactJson::Null),
-            Some(b'-' | b'0'..=b'9') => self.parse_number().map(ExactJson::Number),
-            Some(other) => Err(format!(
-                "unexpected byte 0x{other:02x} at offset {}",
-                self.pos
-            )),
-            None => Err("unexpected end of JSON input".to_string()),
-        }
-    }
-
-    fn expect_literal(&mut self, lit: &[u8], value: ExactJson) -> Result<ExactJson, String> {
-        if self.bytes[self.pos..].starts_with(lit) {
-            self.pos += lit.len();
-            Ok(value)
-        } else {
-            Err(format!("invalid JSON literal at offset {}", self.pos))
-        }
-    }
-
-    fn parse_object(&mut self, depth: usize) -> Result<ExactJson, String> {
-        self.pos += 1;
-        self.skip_ws();
-        let mut entries = Vec::new();
-        if self.peek() == Some(b'}') {
-            self.pos += 1;
-            return Ok(ExactJson::Object(entries));
-        }
-        loop {
-            self.skip_ws();
-            if self.peek() != Some(b'"') {
-                return Err(format!("expected string key at offset {}", self.pos));
-            }
-            let key = self.parse_string()?;
-            self.skip_ws();
-            if self.peek() != Some(b':') {
-                return Err(format!("expected ':' at offset {}", self.pos));
-            }
-            self.pos += 1;
-            let val = self.parse_value(depth)?;
-            entries.push((key, val));
-            self.skip_ws();
-            match self.peek() {
-                Some(b',') => self.pos += 1,
-                Some(b'}') => {
-                    self.pos += 1;
-                    return Ok(ExactJson::Object(entries));
-                }
-                _ => return Err(format!("expected ',' or '}}' at offset {}", self.pos)),
-            }
-        }
-    }
-
-    fn parse_array(&mut self, depth: usize) -> Result<ExactJson, String> {
-        self.pos += 1;
-        self.skip_ws();
-        if self.peek() == Some(b']') {
-            self.pos += 1;
-            return Ok(ExactJson::Array);
-        }
-        loop {
-            let _ = self.parse_value(depth)?;
-            self.skip_ws();
-            match self.peek() {
-                Some(b',') => self.pos += 1,
-                Some(b']') => {
-                    self.pos += 1;
-                    return Ok(ExactJson::Array);
-                }
-                _ => return Err(format!("expected ',' or ']' at offset {}", self.pos)),
-            }
-        }
-    }
-
-    fn parse_string(&mut self) -> Result<String, String> {
-        let start = self.pos;
-        self.pos += 1;
-        while self.pos < self.bytes.len() {
-            match self.bytes[self.pos] {
-                b'\\' => {
-                    self.pos += 2;
-                    if self.pos > self.bytes.len() {
-                        return Err("unterminated escape sequence in JSON string".to_string());
-                    }
-                }
-                b'"' => {
-                    self.pos += 1;
-                    let slice = &self.src[start..self.pos];
-                    return serde_json::from_str::<String>(slice)
-                        .map_err(|err| format!("invalid JSON string: {err}"));
-                }
-                _ => self.pos += 1,
-            }
-        }
-        Err("unterminated JSON string".to_string())
-    }
-
-    fn parse_number(&mut self) -> Result<String, String> {
-        let start = self.pos;
-        let end = scan_json_number_token(self.bytes, start).map_err(|err| err.to_string())?;
-        self.pos = end;
-        Ok(self.src[start..end].to_string())
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -289,7 +133,6 @@ mod tests {
 
     #[test]
     fn plain_decimals_with_redundant_trailing_zeros_match_scientific_spelling() {
-        // 30 fractional digits (> MAX_DECIMAL_SCALE = 28), but only 1 significant fractional digit.
         let plain =
             parse_facts_arg(r#"{"resource.amount": 1.500000000000000000000000000000}"#).unwrap();
         let sci =
@@ -318,7 +161,6 @@ mod tests {
         assert_eq!(tiny_plain.get("resource.amount"), Some(&expected_tiny));
         assert_eq!(tiny_sci.get("resource.amount"), Some(&expected_tiny));
 
-        // 29 non-zero fractional digits still exceed MAX_DECIMAL_SCALE (28).
         let err =
             parse_facts_arg(r#"{"resource.amount": 0.00000000000000000000000000001}"#).unwrap_err();
         assert!(err.contains("exceeds maximum"), "unexpected error: {err}");
@@ -339,7 +181,6 @@ mod tests {
             );
         }
 
-        // Non-zero significand with huge exponent must still be rejected.
         let err = parse_facts_arg(r#"{"resource.amount": 1e2147483648}"#).unwrap_err();
         assert!(
             err.contains("overflow") || err.contains("out of range"),
@@ -372,5 +213,20 @@ mod tests {
         assert_eq!(ok.get("mode"), Some(&Scalar::Int(0)));
         assert_eq!(ok.get("wrapped"), Some(&Scalar::Int(0)));
         assert_eq!(ok.get("dec"), Some(&Scalar::Decimal(Decimal::ZERO)));
+    }
+
+    #[test]
+    fn rejects_duplicate_keys_everywhere_including_objects_inside_arrays() {
+        for raw in [
+            r#"{"a":1,"a":2}"#,
+            r#"{"a":{"str":"x","str":"y"}}"#,
+            r#"{"a":[{"k":1,"k":2}]}"#,
+        ] {
+            let err = parse_facts_arg(raw).unwrap_err();
+            assert!(
+                err.contains("duplicate JSON object key"),
+                "expected duplicate JSON object key error for {raw}, got {err}"
+            );
+        }
     }
 }

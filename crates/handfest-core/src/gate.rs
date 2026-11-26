@@ -496,7 +496,7 @@ fn verify_proofs(chain: &[VerifiedMandate], now: i64) -> Result<(), RuntimeChain
                 valid_until: vm.proof.valid_until,
             });
         }
-        if vm.proof.valid_from >= vm.proof.valid_until {
+        if vm.proof.valid_from > vm.proof.valid_until {
             return Err(RuntimeChainError::InvalidProofValidityWindow {
                 hop: i,
                 valid_from: vm.proof.valid_from,

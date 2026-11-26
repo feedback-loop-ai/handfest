@@ -944,13 +944,27 @@ fn mapping_failure_never_masks_expired_not_yet_valid_or_unbound_chain() {
         "hop 0: proof actor kind Service does not match mandate FROM kind Human",
     );
 
-    let mut bad_window = verified;
-    bad_window[0].proof.valid_until = bad_window[0].proof.valid_from;
+    let mut empty_window = verified.clone();
+    empty_window[0].proof.valid_until = empty_window[0].proof.valid_from;
     assert_chain_denial_reason(
-        bad_window,
+        empty_window,
         agent_kp.key_id(),
         valid_now,
-        &format!("hop 0: invalid anchor proof validity window [{valid_from}..{valid_from})"),
+        &format!(
+            "hop 0: timestamp {valid_now} outside anchor proof validity window [{valid_from}..{valid_from})"
+        ),
+    );
+
+    let mut inverted_window = verified;
+    inverted_window[0].proof.valid_until = valid_from - 1;
+    assert_chain_denial_reason(
+        inverted_window,
+        agent_kp.key_id(),
+        valid_now,
+        &format!(
+            "hop 0: invalid anchor proof validity window [{valid_from}..{})",
+            valid_from - 1
+        ),
     );
 }
 

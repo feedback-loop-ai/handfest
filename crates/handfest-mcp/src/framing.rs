@@ -226,6 +226,21 @@ impl JsonKeyError<'_> {
 
 /// Recursively validates that every JSON object in `val` has strictly ASCII keys with no
 /// ASCII case-insensitive collisions.
+/// Validates an optional `_meta` field on a JSON-RPC object, requiring it to be a JSON object
+/// whose keys pass [`validate_json_keys_recursive`].
+pub(crate) fn validate_optional_meta(
+    obj: &BTreeMap<String, ExactJson>,
+    field_label: &str,
+) -> Result<(), String> {
+    if let Some(meta) = obj.get("_meta") {
+        if meta.as_object().is_none() {
+            return Err(format!("{field_label} must be a JSON object"));
+        }
+        validate_json_keys_recursive(meta).map_err(|err| err.format_with_context(field_label))?;
+    }
+    Ok(())
+}
+
 pub(crate) fn validate_json_keys_recursive(val: &ExactJson) -> Result<(), JsonKeyError<'_>> {
     match val {
         ExactJson::Object(map) => {

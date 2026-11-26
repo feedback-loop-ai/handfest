@@ -1,5 +1,6 @@
-use std::io::{self, BufReader, Read, Write};
+use std::io::{self, BufReader, Cursor, Read, Write};
 use std::sync::mpsc;
+use std::thread;
 use std::time::{Duration, Instant};
 
 use handfest_anchors::Ed25519Keypair;
@@ -48,6 +49,23 @@ impl Drop for BrokenPipeSignalingWriter {
     }
 }
 
+struct AcceptingSignalingWriter {
+    seen_tx: Option<mpsc::SyncSender<()>>,
+}
+
+impl Write for AcceptingSignalingWriter {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        if let Some(tx) = self.seen_tx.take() {
+            let _ = tx.send(());
+        }
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
 fn build_test_proxy() -> McpProxy<FixedClock, SqliteLedger> {
     let root_kp = Ed25519Keypair::generate();
     let agent_kp = Ed25519Keypair::generate();
@@ -79,12 +97,50 @@ fn build_test_proxy() -> McpProxy<FixedClock, SqliteLedger> {
 }
 
 #[test]
-fn post_eof_drain_timeout_dispatch_surfaces_broken_pipe_without_prior_polling() {
+fn client_eof_arms_shutdown_deadline_and_exits_on_timeout_in_run() {
+    let mut proxy = build_test_proxy().with_shutdown_timeout(Duration::from_millis(50));
+    let (seen_tx, seen_rx) = mpsc::sync_channel(1);
+    let (up_hold_tx, up_hold_rx) = mpsc::sync_channel(1);
+    let (done_tx, done_rx) = mpsc::sync_channel(1);
+    let client_in = "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"ping\"}\n";
+
+    // Upstream accepts `ping` cleanly (no BrokenPipe) and holds stdout silently open (no reply,
+    // no EOF). The ONLY way `McpProxy::run` can terminate is if client EOF arms
+    // `state.shutdown_deadline` and `recv_event` hits `RecvOutcome::Timeout`.
+    let handle = thread::spawn(move || {
+        let mut client_out = Vec::new();
+        let res = proxy.run(
+            BufReader::new(Cursor::new(client_in.as_bytes().to_vec())),
+            &mut client_out,
+            AcceptingSignalingWriter {
+                seen_tx: Some(seen_tx),
+            },
+            BufReader::new(BlockingReader(up_hold_rx)),
+        );
+        let _ = done_tx.send(res);
+    });
+
+    seen_rx
+        .recv_timeout(Duration::from_secs(2))
+        .expect("upstream received ping before EOF drain");
+    let res = done_rx
+        .recv_timeout(Duration::from_secs(2))
+        .expect("McpProxy::run hung instead of arming shutdown_deadline on client EOF");
+    let _ = up_hold_tx.send(());
+    handle.join().unwrap();
+    assert!(
+        res.is_ok(),
+        "expected clean Ok(()) on post-EOF timeout, got {res:?}"
+    );
+}
+
+#[test]
+fn post_eof_armed_deadline_timeout_surfaces_broken_pipe() {
     let (_client_hold_tx, client_hold_rx) = mpsc::sync_channel(1);
     let (_up_hold_tx, up_hold_rx) = mpsc::sync_channel(1);
     let (dropped_tx, dropped_rx) = mpsc::sync_channel(1);
 
-    let mut proxy = build_test_proxy();
+    let mut proxy = build_test_proxy().with_shutdown_timeout(Duration::from_millis(20));
     let mut state = SessionState::default();
     let mut client_out = Vec::new();
     let mut transport = DuplexTransport::start(
@@ -96,20 +152,38 @@ fn post_eof_drain_timeout_dispatch_surfaces_broken_pipe_without_prior_polling() 
         1024,
     );
 
-    transport
-        .send_upstream("{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"ping\"}".to_string())
-        .expect("initial enqueue into writer channel succeeds");
+    proxy
+        .on_client_read(
+            Ok(Some(
+                r#"{"jsonrpc":"2.0","id":1,"method":"ping"}"#.to_string(),
+            )),
+            &mut state,
+            &mut transport,
+            &mut client_out,
+        )
+        .expect("active request dispatched");
+    assert!(!proxy.check_client_eof(&mut state, &transport));
+    assert!(state.shutdown_deadline.is_none());
+
+    proxy
+        .on_client_read(Ok(None), &mut state, &mut transport, &mut client_out)
+        .expect("client EOF recorded");
+    assert!(!proxy.check_client_eof(&mut state, &transport));
+    let deadline = state
+        .shutdown_deadline
+        .expect("client EOF with active request must arm shutdown_deadline");
+
     dropped_rx
         .recv_timeout(Duration::from_secs(2))
         .expect("writer thread failed with BrokenPipe and populated writer_done_rx");
+    if let Some(rem) = deadline.checked_duration_since(Instant::now()) {
+        thread::sleep(rem + Duration::from_millis(5));
+    }
 
-    // Deterministically produce `RecvOutcome::Timeout` and drive `McpProxy::run`'s exact outcome
-    // dispatcher (`handle_recv_outcome`), proving the timeout arm itself surfaces `BrokenPipe`
-    // rather than relying on an earlier non-timeout `poll_writer_error` or `UpstreamWriteFailed`.
-    let outcome = transport.recv_event(Some(Instant::now()));
+    let outcome = transport.recv_event(state.shutdown_deadline);
     assert!(
         matches!(outcome, RecvOutcome::Timeout),
-        "expected RecvOutcome::Timeout, got {outcome:?}"
+        "expected RecvOutcome::Timeout from EOF-armed deadline, got {outcome:?}"
     );
     let step = proxy.handle_recv_outcome(outcome, &mut state, &mut transport, &mut client_out);
     assert!(
@@ -118,16 +192,16 @@ fn post_eof_drain_timeout_dispatch_surfaces_broken_pipe_without_prior_polling() 
             LoopStep::Finish(Err(ProxyError::Io(ref io_err)))
                 if io_err.kind() == io::ErrorKind::BrokenPipe
         ),
-        "expected LoopStep::Finish(Err(BrokenPipe)) on RecvOutcome::Timeout dispatch"
+        "expected LoopStep::Finish(Err(BrokenPipe)) on EOF-armed RecvOutcome::Timeout dispatch"
     );
 }
 
 #[test]
-fn post_eof_drain_timeout_dispatch_returns_ok_when_writer_has_no_error() {
+fn post_eof_armed_deadline_timeout_returns_ok_when_writer_has_no_error() {
     let (_client_hold_tx, client_hold_rx) = mpsc::sync_channel(1);
     let (_up_hold_tx, up_hold_rx) = mpsc::sync_channel(1);
 
-    let mut proxy = build_test_proxy();
+    let mut proxy = build_test_proxy().with_shutdown_timeout(Duration::from_millis(20));
     let mut state = SessionState::default();
     let mut client_out = Vec::new();
     let mut transport = DuplexTransport::start(
@@ -137,8 +211,32 @@ fn post_eof_drain_timeout_dispatch_returns_ok_when_writer_has_no_error() {
         1024,
     );
 
-    let outcome = transport.recv_event(Some(Instant::now()));
+    proxy
+        .on_client_read(
+            Ok(Some(
+                r#"{"jsonrpc":"2.0","id":1,"method":"ping"}"#.to_string(),
+            )),
+            &mut state,
+            &mut transport,
+            &mut client_out,
+        )
+        .expect("active request dispatched");
+    proxy
+        .on_client_read(Ok(None), &mut state, &mut transport, &mut client_out)
+        .expect("client EOF recorded");
+    assert!(!proxy.check_client_eof(&mut state, &transport));
+    assert!(state.shutdown_deadline.is_some());
+
+    let outcome = transport.recv_event(state.shutdown_deadline);
     assert!(matches!(outcome, RecvOutcome::Timeout));
     let step = proxy.handle_recv_outcome(outcome, &mut state, &mut transport, &mut client_out);
     assert!(matches!(step, LoopStep::Finish(Ok(()))));
+
+    // When idle at client EOF, `check_client_eof` finishes immediately without arming a deadline.
+    let mut idle_state = SessionState {
+        client_eof: true,
+        ..SessionState::default()
+    };
+    assert!(proxy.check_client_eof(&mut idle_state, &transport));
+    assert!(idle_state.shutdown_deadline.is_none());
 }
