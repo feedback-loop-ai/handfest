@@ -515,3 +515,75 @@ fn tool_policy_map_from_file_public_api_loads_valid_and_rejects_missing_file() {
         Err(handfest_mcp::MappingError::Io(ref msg)) if msg.contains("failed to read")
     ));
 }
+
+#[test]
+fn compiled_policy_map_borrows_mcp_tool_policy_map_and_supports_map_call_exact() {
+    use handfest_core::ast::{Decimal, KeyId, Scalar};
+
+    let policy_json = r#"{
+        "tools": {
+            "merge_pr": {
+                "action": "git.pr.merge",
+                "resource_kind": "repo",
+                "resource_id_arg": "repo",
+                "arg_facts": {
+                    "amount": { "field": "resource.amount", "type": "decimal" }
+                },
+                "static_facts": {
+                    "env": { "str": "prod" }
+                }
+            }
+        }
+    }"#;
+    let loaded = handfest_mcp::ToolPolicyMap::from_json_str(policy_json).unwrap();
+    let compiled: handfest_mcp::CompiledPolicyMap = loaded.clone().compile().unwrap();
+
+    // Direct type identity: CompiledPolicyMap::policy_map() borrows &handfest_mcp::ToolPolicyMap.
+    let m: &handfest_mcp::ToolPolicyMap = compiled.policy_map();
+    assert_eq!(m, &loaded);
+    assert_eq!(
+        m.get("merge_pr").map(|p| p.action.as_str()),
+        Some("git.pr.merge")
+    );
+
+    let actor =
+        KeyId::parse("ed25519:1111111111111111111111111111111111111111111111111111111111111111")
+            .unwrap();
+    let raw_args = r#"{"repo":"acme/handfest","amount":12.3450000000000001}"#;
+    let exact_args = parse_exact_json(raw_args).unwrap();
+
+    let (req_exact, facts_exact) =
+        handfest_mcp::ToolPolicyMap::map_call_exact(m, &actor, "merge_pr", Some(&exact_args))
+            .unwrap();
+    assert_eq!(req_exact.actor_key, actor);
+    assert_eq!(req_exact.action, "git.pr.merge");
+    assert_eq!(req_exact.resource_kind, "repo");
+    assert_eq!(req_exact.resource_id, "acme/handfest");
+    assert_eq!(
+        facts_exact.get("resource.amount"),
+        Some(&Scalar::Decimal(
+            Decimal::parse("12.3450000000000001").unwrap()
+        ))
+    );
+    assert_eq!(
+        facts_exact.get("env"),
+        Some(&Scalar::Str("prod".to_string()))
+    );
+
+    // Zero-clone map_call_json on the borrowed map must produce identical request and facts.
+    let (req_json, facts_json) = m.map_call_json(&actor, "merge_pr", Some(raw_args)).unwrap();
+    assert_eq!(req_json, req_exact);
+    assert_eq!(facts_json, facts_exact);
+
+    // Negative fail-closed checks on map_call_exact.
+    assert!(matches!(
+        handfest_mcp::ToolPolicyMap::map_call_exact(m, &actor, "unknown_tool", Some(&exact_args)),
+        Err(handfest_mcp::MappingError::UnmappedTool(ref name)) if name == "unknown_tool"
+    ));
+    let missing_repo = parse_exact_json(r#"{"amount":12.34}"#).unwrap();
+    assert!(matches!(
+        handfest_mcp::ToolPolicyMap::map_call_exact(m, &actor, "merge_pr", Some(&missing_repo)),
+        Err(handfest_mcp::MappingError::MissingResourceId { ref tool, ref arg })
+            if tool == "merge_pr" && arg == "repo"
+    ));
+}

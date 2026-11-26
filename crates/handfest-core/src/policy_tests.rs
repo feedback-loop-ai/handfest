@@ -489,3 +489,38 @@ fn compile_rejects_deserialized_invalid_policy_map() {
         Err(MappingError::InvalidPolicy(ref msg)) if msg.contains("duplicate arg_facts target field")
     ));
 }
+
+#[cfg(feature = "std")]
+#[test]
+fn from_file_loads_valid_json_and_reports_io_error_for_missing_file() {
+    let dir = std::env::temp_dir();
+    let pid = std::process::id();
+    let valid_path = dir.join(format!("handfest-core-policy-test-{pid}.json"));
+    let missing_path = dir.join(format!("handfest-core-policy-missing-{pid}.json"));
+    let _ = std::fs::remove_file(&missing_path);
+
+    let json = r#"{
+        "tools": {
+            "merge_pr": {
+                "action": "git.pr.merge",
+                "resource_kind": "repo",
+                "resource_id_arg": "repo"
+            }
+        }
+    }"#;
+    std::fs::write(&valid_path, json).unwrap();
+    let loaded = ToolPolicyMap::from_file(&valid_path);
+    let _ = std::fs::remove_file(&valid_path);
+
+    let map = loaded.unwrap();
+    assert_eq!(map.tools.len(), 1);
+    assert_eq!(
+        map.get("merge_pr").map(|p| p.action.as_str()),
+        Some("git.pr.merge")
+    );
+
+    assert!(matches!(
+        ToolPolicyMap::from_file(&missing_path),
+        Err(MappingError::Io(ref msg)) if msg.contains("failed to read")
+    ));
+}

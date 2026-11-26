@@ -330,7 +330,7 @@ impl<C: Clock, L: ReceiptLedger> McpProxy<C, L> {
 /// action and resource metadata when the tool is present in `policy_map`.
 fn build_mapping_denial_request(
     actor_key: &KeyId,
-    policy_map: &handfest_core::policy::ToolPolicyMap,
+    policy_map: &ToolPolicyMap,
     tool_name: &str,
     arguments: Option<&ExactJson>,
 ) -> ActionRequest {
