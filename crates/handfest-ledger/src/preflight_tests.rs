@@ -302,21 +302,38 @@ fn open_writable_guarded_error_and_deferred_fd_cap_fail_closed() {
         let overflow = write_valid_header_file(&dir.path().join("ro_target_overflow.sqlite"));
         let uncached_journal = dir.path().join("uncached_cap.sqlite-journal");
         fs::write(&uncached_journal, [0u8; ROLLBACK_JOURNAL_HDR_LEN]).unwrap();
+        let calls_before = raw_open_calls();
         assert!(matches!(
             open_read_only_guarded_in(reg, &overflow, |_| Ok(())),
             Err(LedgerError::Storage(_))
         ));
+        assert_eq!(
+            raw_open_calls(),
+            calls_before,
+            "header inspection cap check must reject before calling open_no_follow_read_only"
+        );
         assert!(matches!(
             probe_rollback_journal_once(reg, &uncached_journal),
             Err(LedgerError::Storage(_))
         ));
+        assert_eq!(
+            raw_open_calls(),
+            calls_before,
+            "journal cap check must reject before calling open_no_follow_read_only"
+        );
         assert_eq!(reg.lock().unwrap().total_deferred_fds(), MAX_DEFERRED_FDS);
 
         drop(writer_guard);
         assert!(reg.lock().unwrap().deferred_fds.is_empty());
+        let calls_before_clean = raw_open_calls();
         assert_eq!(
             probe_rollback_journal_once(reg, &uncached_journal).unwrap(),
             JournalProbe::Clean
+        );
+        assert_eq!(
+            raw_open_calls(),
+            calls_before_clean + 1,
+            "positive control: uncached clean journal probe must record one raw open"
         );
         let ((), ro_after) = open_read_only_guarded_in(reg, &overflow, |_| Ok(())).unwrap();
         drop(ro_after);
@@ -354,14 +371,25 @@ fn assert_duplicate_inode_cap_and_journal_guard(
         assert_eq!(state.deferred_fds[&key].len(), MAX_DEFERRED_FDS);
         assert_eq!(state.total_deferred_fds(), MAX_DEFERRED_FDS);
     }
+    let calls_before = raw_open_calls();
     assert!(matches!(
         open_read_only_guarded_in(reg, overflow, |_| Ok(())),
         Err(LedgerError::Storage(_))
     ));
+    assert_eq!(
+        raw_open_calls(),
+        calls_before,
+        "header inspection cap check on duplicate-inode pool must reject before opening"
+    );
     assert!(matches!(
         probe_rollback_journal_once(reg, uncached_journal),
         Err(LedgerError::Storage(_))
     ));
+    assert_eq!(
+        raw_open_calls(),
+        calls_before,
+        "journal cap check on duplicate-inode pool must reject before opening"
+    );
     assert_eq!(reg.lock().unwrap().total_deferred_fds(), MAX_DEFERRED_FDS);
 
     // Pushing an extra duplicate on the occupied key retains it rather than dropping while active.
@@ -393,17 +421,28 @@ fn open_no_follow_read_only_rejects_symlinks_atomically() {
         return;
     }
 
-    // Derive the platform-native ELOOP io::Error (ErrorKind::FilesystemLoop is still unstable
-    // behind #![feature(io_error_more)]) from a 2-symlink cycle so this assertion is portable
-    // across Linux x86_64/ARM (40), MIPS (90), SPARC (62), Android, macOS, and BSD.
-    let loop_a = dir.path().join("eloop_a.journal");
-    let loop_b = dir.path().join("eloop_b.journal");
-    symlink(&loop_b, &loop_a).unwrap();
-    symlink(&loop_a, &loop_b).unwrap();
-    let expected_eloop = fs::metadata(&loop_a).unwrap_err();
-    assert!(expected_eloop.raw_os_error().is_some());
+    // Derive the platform-native ELOOP io::Error (`ErrorKind::FilesystemLoop` is unstable behind
+    // `io_error_more`) only on targets where O_NOFOLLOW returns ELOOP. FreeBSD/DragonFlyBSD return
+    // EMLINK and NetBSD returns EFTYPE, so those targets assert only `err.kind() != NotFound`.
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "openbsd"
+    ))]
+    let expected_eloop = {
+        let loop_a = dir.path().join("eloop_a.journal");
+        let loop_b = dir.path().join("eloop_b.journal");
+        symlink(&loop_b, &loop_a).unwrap();
+        symlink(&loop_a, &loop_b).unwrap();
+        let eloop = fs::metadata(&loop_a).unwrap_err();
+        assert!(eloop.raw_os_error().is_some());
+        eloop
+    };
 
-    // Direct call on symlink to existing target (without symlink_metadata) fails atomically with ELOOP.
+    // Direct call on symlink to existing target (without symlink_metadata) fails atomically via
+    // O_NOFOLLOW (never follows to Ok(File) or NotFound).
     let live_sym = dir.path().join("live_sym.journal");
     symlink(&target, &live_sym).unwrap();
     let err = open_no_follow_read_only(&live_sym).unwrap_err();
@@ -412,36 +451,54 @@ fn open_no_follow_read_only_rejects_symlinks_atomically() {
         io::ErrorKind::NotFound,
         "symlink open must not be misclassified as NotFound: {err:?}"
     );
-    assert_eq!(
-        err.kind(),
-        expected_eloop.kind(),
-        "expected FilesystemLoop (ELOOP) from O_NOFOLLOW, got: {err:?}"
-    );
-    assert_eq!(
-        err.raw_os_error(),
-        expected_eloop.raw_os_error(),
-        "expected OS ELOOP errno from O_NOFOLLOW, got: {err:?}"
-    );
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "openbsd"
+    ))]
+    {
+        assert_eq!(
+            err.kind(),
+            expected_eloop.kind(),
+            "expected ELOOP ErrorKind from O_NOFOLLOW, got: {err:?}"
+        );
+        assert_eq!(
+            err.raw_os_error(),
+            expected_eloop.raw_os_error(),
+            "expected OS ELOOP errno from O_NOFOLLOW, got: {err:?}"
+        );
+    }
 
-    // Direct call on dangling symlink also fails atomically with ELOOP (never NotFound / Clean).
+    // Direct call on dangling symlink also fails atomically via O_NOFOLLOW (never NotFound / Clean).
     let dangling_sym = dir.path().join("dangling_sym.journal");
     symlink(dir.path().join("missing_target.journal"), &dangling_sym).unwrap();
     let dangling_err = open_no_follow_read_only(&dangling_sym).unwrap_err();
     assert_ne!(
         dangling_err.kind(),
         io::ErrorKind::NotFound,
-        "dangling symlink must fail with ELOOP, not NotFound: {dangling_err:?}"
+        "dangling symlink must fail via O_NOFOLLOW, not NotFound: {dangling_err:?}"
     );
-    assert_eq!(
-        dangling_err.kind(),
-        expected_eloop.kind(),
-        "expected FilesystemLoop (ELOOP) on dangling symlink, got: {dangling_err:?}"
-    );
-    assert_eq!(
-        dangling_err.raw_os_error(),
-        expected_eloop.raw_os_error(),
-        "expected OS ELOOP errno on dangling symlink, got: {dangling_err:?}"
-    );
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "openbsd"
+    ))]
+    {
+        assert_eq!(
+            dangling_err.kind(),
+            expected_eloop.kind(),
+            "expected ELOOP ErrorKind on dangling symlink, got: {dangling_err:?}"
+        );
+        assert_eq!(
+            dangling_err.raw_os_error(),
+            expected_eloop.raw_os_error(),
+            "expected OS ELOOP errno on dangling symlink, got: {dangling_err:?}"
+        );
+    }
 }
 
 #[cfg(unix)]
@@ -648,6 +705,7 @@ where
 fn open_read_only_guarded_rejects_concurrent_path_replacement_and_drops_conn() {
     let dir = TempDir::new().unwrap();
 
+    // Unix verifies immutable `(st_dev, st_ino)` identity as well as symlink substitution.
     #[cfg(unix)]
     {
         use std::os::unix::fs::symlink;
@@ -667,6 +725,25 @@ fn open_read_only_guarded_rejects_concurrent_path_replacement_and_drops_conn() {
         });
     }
 
+    // Windows post-open check rejects symlink substitution when symlink privileges are enabled
+    // (without claiming Unix inode-level identity on non-Unix platforms).
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::symlink_file;
+
+        let other_db = write_valid_header_file(&dir.path().join("other_win.sqlite"));
+        let probe_sym = dir.path().join("probe_win_symlink.sqlite");
+        if symlink_file(&other_db, &probe_sym).is_ok() {
+            let _ = fs::remove_file(&probe_sym);
+            let swap_sym = write_valid_header_file(&dir.path().join("swap_win_symlink.sqlite"));
+            assert_concurrent_open_rejected(&swap_sym, |path| {
+                fs::remove_file(path).unwrap();
+                symlink_file(&other_db, path).unwrap();
+            });
+        }
+    }
+
+    // Portable post-open checks (Unix and non-Unix): concurrent unlink and directory substitution.
     let unlink_db = write_valid_header_file(&dir.path().join("unlink_during_open.sqlite"));
     assert_concurrent_open_rejected(&unlink_db, |path| {
         fs::remove_file(path).unwrap();
@@ -677,6 +754,29 @@ fn open_read_only_guarded_rejects_concurrent_path_replacement_and_drops_conn() {
         fs::remove_file(path).unwrap();
         fs::create_dir(path).unwrap();
     });
+}
+
+#[test]
+fn file_identity_and_post_open_check_tolerate_in_place_file_growth() {
+    use std::io::Write;
+
+    let dir = TempDir::new().unwrap();
+    let growing_db = write_valid_header_file(&dir.path().join("growing.sqlite"));
+    let id_before = FileIdentity::from_path(&growing_db).unwrap();
+
+    // Growing the same file during open (e.g. concurrent page write / schema init) must never
+    // mutate `FileIdentity` or trigger a spurious post-open Integrity error or refcount leak.
+    let ((), guard) = open_read_only_guarded(&growing_db, |path| {
+        let mut f = fs::OpenOptions::new().append(true).open(path).unwrap();
+        f.write_all(&[0u8; 4096]).unwrap();
+        Ok(())
+    })
+    .unwrap();
+    let id_after = FileIdentity::from_path(&growing_db).unwrap();
+    assert_eq!(id_before, id_after);
+    assert_eq!(active_handle_count(&growing_db), 1);
+    drop(guard);
+    assert_eq!(active_handle_count(&growing_db), 0);
 }
 
 #[cfg(unix)]

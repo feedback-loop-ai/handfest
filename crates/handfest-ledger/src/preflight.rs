@@ -79,7 +79,8 @@ const UNIX_O_NONBLOCK: Option<i32> = if cfg!(all(
         target_arch = "powerpc",
         target_arch = "powerpc64",
         target_arch = "s390x",
-        target_arch = "loongarch64"
+        target_arch = "loongarch64",
+        target_arch = "m68k"
     )
 )) {
     Some(0o4000) // 0x800
@@ -120,12 +121,13 @@ const fn combine_unix_open_flags(no_follow: Option<i32>, non_block: Option<i32>)
 
 /// Process-local file identity for POSIX `fcntl` lock preservation and post-open identity checks.
 ///
-/// Unix keys by `(st_dev, st_ino)`; Windows pairs `canonical` with `creation_time()` and
-/// `file_size()` (`std::os::windows::fs::MetadataExt`) to detect same-path replacement; other
-/// targets fall back to `canonical`. Under `#![forbid(unsafe_code)]`,
-/// `rusqlite::Connection::open_with_flags` opens by pathname (not fd), so concurrent in-place ABA
-/// replacement (`A -> B -> A`) during `sqlite3_open_v2` is outside SQLite's supported
-/// local-filesystem concurrency contract ("How To Corrupt An SQLite Database File" §2.1 & §2.4).
+/// On Unix, keys by immutable `(st_dev, st_ino)`. On non-Unix platforms (including Windows), keys
+/// solely by `canonical` (`PathBuf`) — never by mutable metadata such as `file_size` or
+/// `creation_time`, which would break `ActiveHandleRegistry` refcounting across schema init or
+/// page growth. Under `#![forbid(unsafe_code)]`, `rusqlite` opens by pathname and Windows uses
+/// handle-based mandatory locks rather than POSIX `fcntl` close-drops-locks, while in-place file
+/// replacement during SQLite open is outside SQLite's documented concurrency contract
+/// ("How To Corrupt An SQLite Database File" §2.1 & §2.4).
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) struct FileIdentity {
     #[cfg(unix)]
@@ -134,10 +136,6 @@ pub(crate) struct FileIdentity {
     ino: u64,
     #[cfg(not(unix))]
     canonical: PathBuf,
-    #[cfg(windows)]
-    creation_time: u64,
-    #[cfg(windows)]
-    file_size: u64,
 }
 
 impl FileIdentity {
@@ -150,17 +148,7 @@ impl FileIdentity {
         }
     }
 
-    #[cfg(windows)]
-    fn from_metadata(canonical: &Path, meta: &fs::Metadata) -> Self {
-        use std::os::windows::fs::MetadataExt;
-        Self {
-            canonical: canonical.to_path_buf(),
-            creation_time: meta.creation_time(),
-            file_size: meta.file_size(),
-        }
-    }
-
-    #[cfg(not(any(unix, windows)))]
+    #[cfg(not(unix))]
     fn from_metadata(canonical: &Path, _meta: &fs::Metadata) -> Self {
         Self {
             canonical: canonical.to_path_buf(),
@@ -406,12 +394,12 @@ where
     open_read_only_guarded_in(active_handles(), canonical, open_conn)
 }
 
-/// Opens a read-only handle inside `registry` and verifies post-open [`FileIdentity`].
+/// Opens a read-only handle inside `registry` and verifies post-open canonical file state.
 ///
 /// Trust boundary: under `#![forbid(unsafe_code)]`, `rusqlite::Connection::open_with_flags` opens
-/// by pathname (not fd). Post-open verification rejects concurrent unlink or replacement with a
-/// different identity, whereas concurrent in-place ABA replacement (`A -> B -> A`) during
-/// `sqlite3_open_v2` is outside SQLite's supported local-filesystem concurrency contract
+/// by pathname (not fd). Post-open verification rejects concurrent unlink or symlink/non-file
+/// substitution (and on Unix, replacement with a different `(st_dev, st_ino)`), whereas in-place
+/// file replacement during `sqlite3_open_v2` is outside SQLite's documented concurrency contract
 /// ("How To Corrupt An SQLite Database File" §2.1 & §2.4).
 fn open_read_only_guarded_in<T, F>(
     registry: &'static Mutex<ActiveHandleRegistry>,
@@ -447,22 +435,25 @@ where
     ))
 }
 
+/// Verifies post-open that `canonical` is still a regular non-symlink file (and on Unix, matches
+/// immutable `(st_dev, st_ino)`). On non-Unix/Windows, never compares mutable file size or claims
+/// inode identity: under `#![forbid(unsafe_code)]`, `rusqlite` opens by pathname and Windows uses
+/// handle-based mandatory locks rather than POSIX `fcntl` close-drops-locks; in-place replacement
+/// during SQLite open is outside SQLite's documented concurrency contract (§2.1 & §2.4).
 fn verify_post_open_canonical_identity(
     canonical: &Path,
     expected_id: &FileIdentity,
 ) -> Result<(), LedgerError> {
-    let Ok(post_meta) = fs::symlink_metadata(canonical) else {
-        return Err(LedgerError::Integrity(
-            "read-only ledger path changed concurrently during open".to_string(),
-        ));
-    };
-    if post_meta.file_type().is_symlink()
-        || !post_meta.file_type().is_file()
-        || FileIdentity::from_metadata(canonical, &post_meta) != *expected_id
-    {
-        return Err(LedgerError::Integrity(
-            "read-only ledger path changed concurrently during open".to_string(),
-        ));
+    const CHANGED: &str = "read-only ledger path changed concurrently during open";
+    let post_meta =
+        fs::symlink_metadata(canonical).map_err(|_| LedgerError::Integrity(CHANGED.to_string()))?;
+    let unchanged = !post_meta.file_type().is_symlink() && post_meta.is_file();
+    #[cfg(unix)]
+    let unchanged = unchanged && FileIdentity::from_metadata(canonical, &post_meta) == *expected_id;
+    #[cfg(not(unix))]
+    let _ = expected_id;
+    if !unchanged {
+        return Err(LedgerError::Integrity(CHANGED.to_string()));
     }
     Ok(())
 }
@@ -646,7 +637,20 @@ fn check_rollback_journal_sidecar_with_budget_in(
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    static RAW_OPEN_CALLS: std::sync::atomic::AtomicUsize =
+        const { std::sync::atomic::AtomicUsize::new(0) };
+}
+
+#[cfg(test)]
+fn raw_open_calls() -> usize {
+    RAW_OPEN_CALLS.with(|c| c.load(std::sync::atomic::Ordering::SeqCst))
+}
+
 fn open_no_follow_read_only(path: &Path) -> io::Result<File> {
+    #[cfg(test)]
+    RAW_OPEN_CALLS.with(|c| c.fetch_add(1, std::sync::atomic::Ordering::SeqCst));
     let mut opts = fs::OpenOptions::new();
     opts.read(true);
     #[cfg(unix)]

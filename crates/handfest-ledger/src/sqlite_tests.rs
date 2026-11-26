@@ -935,3 +935,86 @@ fn duplicate_deferred_fd_on_same_inode_preserves_writer_lock() {
         dir.path(),
     );
 }
+
+#[test]
+fn open_existing_classifies_directory_cannot_open_as_storage_and_missing_as_not_found() {
+    let dir = TempDir::new().unwrap();
+    let missing_path = dir.path().join("does_not_exist.sqlite");
+
+    // End-to-end SqliteLedger::open_existing: directory -> Storage, missing -> NotFound.
+    let dir_err = SqliteLedger::open_existing(dir.path()).unwrap_err();
+    assert!(
+        matches!(dir_err, LedgerError::Storage(_)),
+        "existing directory must map to LedgerError::Storage, got: {dir_err:?}"
+    );
+    let missing_err = SqliteLedger::open_existing(&missing_path).unwrap_err();
+    assert!(
+        matches!(missing_err, LedgerError::NotFound(_)),
+        "missing file must map to LedgerError::NotFound, got: {missing_err:?}"
+    );
+
+    // Direct branch-binding tests for map_open_existing_error:
+    // 1. extended_code == SQLITE_CANTOPEN_ISDIR (526) -> Storage even if path does not exist.
+    let isdir_code_err = map_open_existing_error(
+        &missing_path,
+        rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error {
+                code: rusqlite::ErrorCode::CannotOpen,
+                extended_code: SQLITE_CANTOPEN_ISDIR,
+            },
+            None,
+        ),
+    );
+    assert!(
+        matches!(isdir_code_err, LedgerError::Storage(_)),
+        "SQLITE_CANTOPEN_ISDIR (526) must map to Storage, got: {isdir_code_err:?}"
+    );
+
+    // 2. Generic CannotOpen (14) on an existing directory -> Storage via metadata is_dir() check.
+    let dir_fallback_err = map_open_existing_error(
+        dir.path(),
+        rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error {
+                code: rusqlite::ErrorCode::CannotOpen,
+                extended_code: rusqlite::ffi::SQLITE_CANTOPEN,
+            },
+            None,
+        ),
+    );
+    assert!(
+        matches!(dir_fallback_err, LedgerError::Storage(_)),
+        "generic CannotOpen on existing directory must map to Storage, got: {dir_fallback_err:?}"
+    );
+
+    // 3. Generic CannotOpen (14) on missing path -> NotFound.
+    let generic_missing_err = map_open_existing_error(
+        &missing_path,
+        rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error {
+                code: rusqlite::ErrorCode::CannotOpen,
+                extended_code: rusqlite::ffi::SQLITE_CANTOPEN,
+            },
+            None,
+        ),
+    );
+    assert!(
+        matches!(generic_missing_err, LedgerError::NotFound(_)),
+        "generic CannotOpen on missing path must map to NotFound, got: {generic_missing_err:?}"
+    );
+
+    // 4. Non-CannotOpen SQLite error passes through as Storage.
+    let other_err = map_open_existing_error(
+        &missing_path,
+        rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error {
+                code: rusqlite::ErrorCode::DatabaseBusy,
+                extended_code: rusqlite::ffi::SQLITE_BUSY,
+            },
+            None,
+        ),
+    );
+    assert!(
+        matches!(other_err, LedgerError::Storage(_)),
+        "non-CannotOpen error must map to Storage, got: {other_err:?}"
+    );
+}

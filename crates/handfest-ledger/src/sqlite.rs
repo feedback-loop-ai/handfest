@@ -67,7 +67,7 @@ impl SqliteLedger {
         validate_file_path(path, "SqliteLedger::open_existing")?;
         let (conn, handle_guard) = open_writable_guarded(path, || {
             Connection::open_with_flags(path, EXISTING_LEDGER_OPEN_FLAGS)
-                .map_err(map_open_existing_error)
+                .map_err(|err| map_open_existing_error(path, err))
         })?;
         Self::init(conn, Some(handle_guard), "delete", false)
     }
@@ -310,17 +310,20 @@ fn load_latest_receipt_hash(tx: &Transaction<'_>) -> Result<Option<MandateId>, L
     }
 }
 
-fn map_open_existing_error(err: rusqlite::Error) -> LedgerError {
-    if matches!(
-        err,
-        rusqlite::Error::SqliteFailure(
-            rusqlite::ffi::Error {
-                code: rusqlite::ErrorCode::CannotOpen,
-                ..
-            },
-            _,
-        )
-    ) {
+const SQLITE_CANTOPEN_ISDIR: std::os::raw::c_int = 526;
+
+fn map_open_existing_error(path: &Path, err: rusqlite::Error) -> LedgerError {
+    if let rusqlite::Error::SqliteFailure(
+        rusqlite::ffi::Error {
+            code: rusqlite::ErrorCode::CannotOpen,
+            extended_code,
+        },
+        _,
+    ) = err
+    {
+        if extended_code == SQLITE_CANTOPEN_ISDIR || fs::metadata(path).is_ok_and(|m| m.is_dir()) {
+            return LedgerError::Storage(err.to_string());
+        }
         return LedgerError::NotFound(err.to_string());
     }
     LedgerError::from(err)

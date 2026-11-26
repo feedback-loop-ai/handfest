@@ -921,10 +921,9 @@ fn check_require_existing_ledger_rejects_missing_zero_byte_and_empty_schema() {
     assert_existing_ledger_open_error(&out, "invalid_ledger", "corrupt non-SQLite ledger");
     assert_eq!(fs::read(&corrupt).unwrap(), garbage);
 
-    // 5. Existing non-openable directory path fails closed with `missing_ledger`
-    //    (SQLite `CannotOpen` mapped directly without a post-hoc stat race).
+    // 5. Existing directory path fails closed with exit 1 and `storage_error` (NOT `missing_ledger`).
     let out = run_check_on_ledger(&signed_path, &agent_key, dir.path(), true);
-    assert_existing_ledger_open_error(&out, "missing_ledger", "directory path as ledger");
+    assert_existing_ledger_open_error(&out, "storage_error", "directory path as ledger");
 
     // 6. `:memory:` with `--require-existing-ledger` fails closed with `storage_error` (NOT `missing_ledger`).
     let out = run_check_on_ledger(&signed_path, &agent_key, Path::new(":memory:"), true);
