@@ -11,3 +11,7 @@ You are an independent reviewer auditing **every single citation and link** in `
    - `security-hold` (integrity hold, `has_security_residual: true`, `max_residual_severity: "high"`): ANY fabricated, hallucinated, unverifiable, or materially misattributed citation, or any broken/mismatched DOI/URL.
    - `residual`: minor BibTeX formatting, capitalization, or citation precision issues.
    - `clean`: every single citation and link is 100% verified and semantically accurate.
+
+## Result JSON Contract (Strict)
+- Write ONLY `{"result": "clean"|"residual"|"security-hold", "inputs": {"has_security_residual": true|false, "max_residual_severity": "none"|"info"|"low"|"medium"|"high"}, "notes": "..."}`.
+- Do **NOT** include a top-level `"findings"` array in your result JSON — only the chief gate seat emits `"findings"` (Brokkr Decision 0109 ruling 1). Put all detailed findings inside `"notes"`.
