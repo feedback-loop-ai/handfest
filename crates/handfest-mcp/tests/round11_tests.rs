@@ -451,7 +451,18 @@ fn round11_verify_mandate_chain_with_enforces_postconditions_on_custom_verifier(
     assert!(matches!(
         verify_mandate_chain_with(&v_window, std::slice::from_ref(&signed)),
         Err(ProxyError::Anchor(AnchorError::ChainHop { hop: 0, ref source }))
-            if matches!(source.as_ref(), AnchorError::InvalidValidityWindow { .. })
+            if matches!(
+                source.as_ref(),
+                AnchorError::ValidityWindowMismatch {
+                    expected_from,
+                    expected_until,
+                    actual_from,
+                    actual_until,
+                } if *expected_from == from
+                    && *expected_until == until
+                    && *actual_from == from
+                    && *actual_until == until + 1
+            )
     ));
 
     let widened_ast = parse_mandate(

@@ -200,3 +200,143 @@ fn typed_scalar_parses_decimal_and_timestamp_at_boundary_and_roundtrips_json() {
     ));
     assert!(serde_json::to_string(&bad_ts).is_err());
 }
+
+#[test]
+fn single_pass_exact_json_decoder_accepts_aliases_and_null_optionals() {
+    let alias_json = r#"{
+        "tools": {
+            "t": {
+                "action": "ops.run",
+                "resource_kind": "target",
+                "resource_id_arg": null,
+                "static_resource_id": "staging",
+                "arg_facts": {
+                    "s": { "field": "f.s", "type": "Str" },
+                    "i": { "field": "f.i", "type": "Int" },
+                    "d": { "field": "f.d", "type": "Decimal" },
+                    "b": { "field": "f.b", "type": "Bool" },
+                    "ts": { "field": "f.ts", "type": "Timestamp" }
+                },
+                "static_facts": {
+                    "k.s": { "Str": "ok" },
+                    "k.i": { "Int": -42 },
+                    "k.d": { "Decimal": "1.25" },
+                    "k.b": { "Bool": false },
+                    "k.ts": { "Timestamp": "2026-06-01T00:00:00Z" }
+                }
+            }
+        }
+    }"#;
+    let map = ToolPolicyMap::from_json_str(alias_json).expect("aliases and null optional decode");
+    let pol = map.get("t").unwrap();
+    assert_eq!(pol.resource_id_arg, None);
+    assert_eq!(pol.static_resource_id.as_deref(), Some("staging"));
+    assert_eq!(pol.arg_facts["s"].fact_type, FactType::Str);
+    assert_eq!(pol.arg_facts["i"].fact_type, FactType::Int);
+    assert_eq!(pol.arg_facts["d"].fact_type, FactType::Decimal);
+    assert_eq!(pol.arg_facts["b"].fact_type, FactType::Bool);
+    assert_eq!(pol.arg_facts["ts"].fact_type, FactType::Timestamp);
+    assert_eq!(pol.static_facts["k.s"], TypedScalar::Str("ok".to_string()));
+    assert_eq!(pol.static_facts["k.i"], TypedScalar::Int(-42));
+    assert_eq!(
+        pol.static_facts["k.d"],
+        TypedScalar::Decimal(Decimal::parse("1.25").unwrap())
+    );
+    assert_eq!(pol.static_facts["k.b"], TypedScalar::Bool(false));
+    assert_eq!(
+        pol.static_facts["k.ts"],
+        TypedScalar::Timestamp(parse_rfc3339_utc("2026-06-01T00:00:00Z").unwrap())
+    );
+}
+
+#[test]
+fn single_pass_exact_json_decoder_rejects_malformed_shapes() {
+    let malformed_cases = [
+        ("non-object root", "[]"),
+        ("missing tools", "{}"),
+        ("unknown root field", r#"{"tools":{},"extra":1}"#),
+        ("non-object tools", r#"{"tools":[]}"#),
+        ("non-object policy", r#"{"tools":{"a":1}}"#),
+        (
+            "unknown policy field",
+            r#"{"tools":{"a":{"action":"x.y","resource_kind":"r","static_resource_id":"1","extra":true}}}"#,
+        ),
+        (
+            "missing action",
+            r#"{"tools":{"a":{"resource_kind":"r","static_resource_id":"1"}}}"#,
+        ),
+        (
+            "non-string action",
+            r#"{"tools":{"a":{"action":1,"resource_kind":"r","static_resource_id":"1"}}}"#,
+        ),
+        (
+            "non-string optional resource_id_arg",
+            r#"{"tools":{"a":{"action":"x.y","resource_kind":"r","resource_id_arg":123}}}"#,
+        ),
+        (
+            "non-object arg_facts",
+            r#"{"tools":{"a":{"action":"x.y","resource_kind":"r","static_resource_id":"1","arg_facts":[]}}}"#,
+        ),
+        (
+            "unknown arg_facts spec field",
+            r#"{"tools":{"a":{"action":"x.y","resource_kind":"r","static_resource_id":"1","arg_facts":{"x":{"field":"f.x","type":"str","extra":1}}}}}"#,
+        ),
+        (
+            "unknown fact type",
+            r#"{"tools":{"a":{"action":"x.y","resource_kind":"r","static_resource_id":"1","arg_facts":{"x":{"field":"f.x","type":"float"}}}}}"#,
+        ),
+        (
+            "non-object static_facts",
+            r#"{"tools":{"a":{"action":"x.y","resource_kind":"r","static_resource_id":"1","static_facts":[]}}}"#,
+        ),
+        (
+            "empty typed scalar",
+            r#"{"tools":{"a":{"action":"x.y","resource_kind":"r","static_resource_id":"1","static_facts":{"x":{}}}}}"#,
+        ),
+        (
+            "multi-key typed scalar",
+            r#"{"tools":{"a":{"action":"x.y","resource_kind":"r","static_resource_id":"1","static_facts":{"x":{"str":"a","int":1}}}}}"#,
+        ),
+        (
+            "unknown scalar tag",
+            r#"{"tools":{"a":{"action":"x.y","resource_kind":"r","static_resource_id":"1","static_facts":{"x":{"float":1.5}}}}}"#,
+        ),
+        (
+            "str wrong type",
+            r#"{"tools":{"a":{"action":"x.y","resource_kind":"r","static_resource_id":"1","static_facts":{"x":{"str":1}}}}}"#,
+        ),
+        (
+            "int wrong type",
+            r#"{"tools":{"a":{"action":"x.y","resource_kind":"r","static_resource_id":"1","static_facts":{"x":{"int":"1"}}}}}"#,
+        ),
+        (
+            "int negative zero",
+            r#"{"tools":{"a":{"action":"x.y","resource_kind":"r","static_resource_id":"1","static_facts":{"x":{"int":-0}}}}}"#,
+        ),
+        (
+            "int float",
+            r#"{"tools":{"a":{"action":"x.y","resource_kind":"r","static_resource_id":"1","static_facts":{"x":{"int":1.5}}}}}"#,
+        ),
+        (
+            "decimal wrong type",
+            r#"{"tools":{"a":{"action":"x.y","resource_kind":"r","static_resource_id":"1","static_facts":{"x":{"decimal":1.5}}}}}"#,
+        ),
+        (
+            "bool wrong type",
+            r#"{"tools":{"a":{"action":"x.y","resource_kind":"r","static_resource_id":"1","static_facts":{"x":{"bool":"true"}}}}}"#,
+        ),
+        (
+            "timestamp wrong type",
+            r#"{"tools":{"a":{"action":"x.y","resource_kind":"r","static_resource_id":"1","static_facts":{"x":{"timestamp":12345}}}}}"#,
+        ),
+    ];
+    for (label, raw) in malformed_cases {
+        assert!(
+            matches!(
+                ToolPolicyMap::from_json_str(raw),
+                Err(MappingError::InvalidJson(_))
+            ),
+            "expected InvalidJson for {label}: {raw}"
+        );
+    }
+}

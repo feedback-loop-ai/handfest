@@ -718,35 +718,51 @@ mod registry_tests {
             Err(AnchorError::InvalidAnchorId(ref msg)) if msg.contains("does not match")
         ));
 
-        // 3. Mismatched signer_key (proof != envelope) and (proof != ast.from)
-        let mut v = MutatingStubVerifier::clean();
-        v.override_signer_key = Some(KeyId::parse("passkey:other").unwrap());
-        assert!(matches!(
-            verify_with_stub(&base_signed, v),
-            Err(AnchorError::SignerMismatch { .. })
-        ));
+        // 3a. Mismatched signer_key (proof != envelope) isolated from AST binding:
+        // `vm.proof.signer_key == ast.from().key()` ("passkey:cred1"), ONLY `signed.signer_key` differs.
         let mut mismatched_env = base_signed.clone();
         mismatched_env.signer_key = "passkey:other".to_string();
-        assert!(matches!(
-            verify_with_stub(&mismatched_env, MutatingStubVerifier::clean()),
-            Err(AnchorError::SignerMismatch { .. })
-        ));
-
-        // 4. Mismatched actor_kind (proof != envelope) and (proof != ast.from)
         let mut v = MutatingStubVerifier::clean();
-        v.override_actor_kind = Some(ActorKind::Agent);
-        assert!(matches!(
-            verify_with_stub(&base_signed, v),
-            Err(AnchorError::ActorKindMismatch { .. })
-        ));
+        v.override_signer_key = Some(KeyId::parse("passkey:cred1").unwrap());
+        assert_eq!(
+            verify_with_stub(&mismatched_env, v),
+            Err(AnchorError::SignerMismatch {
+                expected: "passkey:other".to_string(),
+                actual: "passkey:cred1".to_string(),
+            })
+        );
+        // 3b. Mismatched signer_key (proof != ast.from) isolated from envelope binding:
+        // `vm.proof.signer_key == signed.signer_key` ("passkey:other"), ONLY `ast.from().key()` differs.
+        assert_eq!(
+            verify_with_stub(&mismatched_env, MutatingStubVerifier::clean()),
+            Err(AnchorError::SignerMismatch {
+                expected: "passkey:cred1".to_string(),
+                actual: "passkey:other".to_string(),
+            })
+        );
+
+        // 4a. Mismatched actor_kind (proof != envelope) isolated from AST binding:
+        // `vm.proof.actor_kind == ast.from().kind()` (Human), ONLY `signed.actor_kind` differs.
         let mut wrong_kind_env = base_signed.clone();
         wrong_kind_env.actor_kind = "agent".to_string();
+        assert_eq!(
+            verify_with_stub(&wrong_kind_env, MutatingStubVerifier::clean()),
+            Err(AnchorError::ActorKindMismatch {
+                expected: ActorKind::Agent,
+                actual: ActorKind::Human,
+            })
+        );
+        // 4b. Mismatched actor_kind (proof != ast.from) isolated from envelope binding:
+        // `vm.proof.actor_kind == signed.actor_kind` (Agent), ONLY `ast.from().kind()` differs.
         let mut v = MutatingStubVerifier::clean();
         v.override_actor_kind = Some(ActorKind::Agent);
-        assert!(matches!(
+        assert_eq!(
             verify_with_stub(&wrong_kind_env, v),
-            Err(AnchorError::ActorKindMismatch { .. })
-        ));
+            Err(AnchorError::ActorKindMismatch {
+                expected: ActorKind::Human,
+                actual: ActorKind::Agent,
+            })
+        );
     }
 
     #[test]
@@ -770,23 +786,40 @@ mod registry_tests {
         let mut inverted_signed = base_signed.clone();
         inverted_signed.valid_from = until;
         inverted_signed.valid_until = from;
+        let inverted_err =
+            verify_with_stub(&inverted_signed, MutatingStubVerifier::clean()).unwrap_err();
         assert_eq!(
-            verify_with_stub(&inverted_signed, MutatingStubVerifier::clean()),
-            Err(AnchorError::InvalidValidityWindow {
+            inverted_err,
+            AnchorError::InvalidValidityWindow {
                 valid_from: until,
                 valid_until: from,
-            })
+            }
         );
-        // 5c. Mismatched window isolated (proof window itself is valid_from <= valid_until)
+        assert!(
+            inverted_err
+                .to_string()
+                .contains("valid_from must be less than or equal to valid_until"),
+            "unexpected inverted-window diagnostic: {inverted_err}"
+        );
+        // 5c. Mismatched well-ordered window isolated from inverted bounds
         for (wf, wu) in [(from + 1, until), (from, until + 1)] {
             let mut v = MutatingStubVerifier::clean();
             v.override_window = Some((wf, wu));
+            let mismatch_err = verify_with_stub(&base_signed, v).unwrap_err();
             assert_eq!(
-                verify_with_stub(&base_signed, v),
-                Err(AnchorError::InvalidValidityWindow {
-                    valid_from: wf,
-                    valid_until: wu,
-                })
+                mismatch_err,
+                AnchorError::ValidityWindowMismatch {
+                    expected_from: from,
+                    expected_until: until,
+                    actual_from: wf,
+                    actual_until: wu,
+                }
+            );
+            let msg = mismatch_err.to_string();
+            assert!(
+                msg.contains("validity window mismatch")
+                    && !msg.contains("valid_from must be less than or equal to valid_until"),
+                "unexpected window-mismatch diagnostic: {msg}"
             );
         }
 

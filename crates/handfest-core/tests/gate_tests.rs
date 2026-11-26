@@ -1618,3 +1618,101 @@ fn evaluate_predicate_if_known_covers_context_time_known_and_unknown_facts() {
         None
     );
 }
+
+#[test]
+fn verify_proofs_checks_signer_and_actor_kind_before_proof_shape_bounds() {
+    use handfest_core::gate::{verify_chain_runtime, RuntimeChainError};
+    use handfest_core::ActorKind;
+
+    let ast = parse_mandate(
+        "HANDFEST v1\n\
+         FROM human \"Root\" (key: ed25519:aaaa)\n\
+         TO agent \"Leaf\" (key: ed25519:bbbb)\n\
+         DELEGATION max 0 hops\n\
+         ALLOW git.pr.merge\n\
+         ON repo \"org/*\"\n",
+    )
+    .unwrap();
+    let req = ActionRequest {
+        actor_key: KeyId::parse("ed25519:bbbb").unwrap(),
+        action: "git.pr.merge".into(),
+        resource_kind: "repo".into(),
+        resource_id: "org/app".into(),
+    };
+    let wrong_signer = KeyId::parse("ed25519:cccc").unwrap();
+
+    // Signer mismatch MUST take precedence over inverted proof bounds and invalid anchor_id.
+    let signer_and_inverted = vec![VerifiedMandate {
+        ast: ast.clone(),
+        proof: VerifiedAnchorProof {
+            anchor_id: String::new(),
+            assurance: AssuranceLevel::LocalKey,
+            signer_key: wrong_signer.clone(),
+            actor_kind: ActorKind::Human,
+            valid_from: 500,
+            valid_until: 100,
+        },
+    }];
+    assert_eq!(
+        verify_chain_runtime(&signer_and_inverted, &req.actor_key, 200),
+        Err(RuntimeChainError::ProofSignerMismatch {
+            hop: 0,
+            proof_key: wrong_signer,
+            mandate_key: KeyId::parse("ed25519:aaaa").unwrap(),
+        })
+    );
+    let (verdict, receipt) = authorize(
+        &signer_and_inverted,
+        &req,
+        &VerifiedFacts::new(),
+        &QuotaSnapshot::new(),
+        200,
+        None,
+    );
+    assert_eq!(
+        verdict,
+        Verdict::Deny {
+            reason:
+                "hop 0: proof signer key ed25519:cccc does not match mandate FROM key ed25519:aaaa"
+                    .to_string(),
+        }
+    );
+    assert!(receipt.verify_hash());
+
+    // Actor-kind mismatch MUST also take precedence over inverted proof bounds.
+    let actor_kind_and_inverted = vec![VerifiedMandate {
+        ast,
+        proof: VerifiedAnchorProof {
+            anchor_id: String::new(),
+            assurance: AssuranceLevel::LocalKey,
+            signer_key: KeyId::parse("ed25519:aaaa").unwrap(),
+            actor_kind: ActorKind::Agent,
+            valid_from: 500,
+            valid_until: 100,
+        },
+    }];
+    assert_eq!(
+        verify_chain_runtime(&actor_kind_and_inverted, &req.actor_key, 200),
+        Err(RuntimeChainError::ProofActorKindMismatch {
+            hop: 0,
+            proof_kind: ActorKind::Agent,
+            mandate_kind: ActorKind::Human,
+        })
+    );
+    let (verdict, receipt) = authorize(
+        &actor_kind_and_inverted,
+        &req,
+        &VerifiedFacts::new(),
+        &QuotaSnapshot::new(),
+        200,
+        None,
+    );
+    assert_eq!(
+        verdict,
+        Verdict::Deny {
+            reason: "hop 0: proof actor kind Agent does not match mandate FROM kind Human"
+                .to_string(),
+        }
+    );
+    assert!(receipt.verify_hash());
+}

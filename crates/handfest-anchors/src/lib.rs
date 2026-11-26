@@ -46,6 +46,12 @@ pub enum AnchorError {
         valid_from: i64,
         valid_until: i64,
     },
+    ValidityWindowMismatch {
+        expected_from: i64,
+        expected_until: i64,
+        actual_from: i64,
+        actual_until: i64,
+    },
     KeyIdMismatch {
         expected: String,
         actual: String,
@@ -88,6 +94,15 @@ impl fmt::Display for AnchorError {
             } => write!(
                 f,
                 "invalid validity window [{valid_from}..{valid_until}): valid_from must be less than or equal to valid_until"
+            ),
+            Self::ValidityWindowMismatch {
+                expected_from,
+                expected_until,
+                actual_from,
+                actual_until,
+            } => write!(
+                f,
+                "validity window mismatch: envelope has [{expected_from}..{expected_until}), proof has [{actual_from}..{actual_until})"
             ),
             Self::KeyIdMismatch { expected, actual } => {
                 write!(f, "key_id mismatch in key file: derived '{expected}', file has '{actual}'")
@@ -403,9 +418,11 @@ fn enforce_proof_window_and_ast_postconditions(
     vm: &VerifiedMandate,
 ) -> Result<(), AnchorError> {
     if vm.proof.valid_from != signed.valid_from || vm.proof.valid_until != signed.valid_until {
-        return Err(AnchorError::InvalidValidityWindow {
-            valid_from: vm.proof.valid_from,
-            valid_until: vm.proof.valid_until,
+        return Err(AnchorError::ValidityWindowMismatch {
+            expected_from: signed.valid_from,
+            expected_until: signed.valid_until,
+            actual_from: vm.proof.valid_from,
+            actual_until: vm.proof.valid_until,
         });
     }
     let rendered = try_render_canonical(&vm.ast)

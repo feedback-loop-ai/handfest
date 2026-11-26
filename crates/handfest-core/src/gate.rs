@@ -500,6 +500,20 @@ pub fn validate_proof_shape(
 
 fn verify_proofs(chain: &[VerifiedMandate], now: i64) -> Result<(), RuntimeChainError> {
     for (i, vm) in chain.iter().enumerate() {
+        if &vm.proof.signer_key != vm.ast.from().key() {
+            return Err(RuntimeChainError::ProofSignerMismatch {
+                hop: i,
+                proof_key: vm.proof.signer_key.clone(),
+                mandate_key: vm.ast.from().key().clone(),
+            });
+        }
+        if vm.proof.actor_kind != vm.ast.from().kind() {
+            return Err(RuntimeChainError::ProofActorKindMismatch {
+                hop: i,
+                proof_kind: vm.proof.actor_kind,
+                mandate_kind: vm.ast.from().kind(),
+            });
+        }
         validate_proof_shape(
             &vm.proof.anchor_id,
             vm.proof.valid_from,
@@ -525,20 +539,6 @@ fn verify_proofs(chain: &[VerifiedMandate], now: i64) -> Result<(), RuntimeChain
                 valid_until,
             },
         })?;
-        if &vm.proof.signer_key != vm.ast.from().key() {
-            return Err(RuntimeChainError::ProofSignerMismatch {
-                hop: i,
-                proof_key: vm.proof.signer_key.clone(),
-                mandate_key: vm.ast.from().key().clone(),
-            });
-        }
-        if vm.proof.actor_kind != vm.ast.from().kind() {
-            return Err(RuntimeChainError::ProofActorKindMismatch {
-                hop: i,
-                proof_kind: vm.proof.actor_kind,
-                mandate_kind: vm.ast.from().kind(),
-            });
-        }
         if now < vm.proof.valid_from || now >= vm.proof.valid_until {
             return Err(RuntimeChainError::OutsideProofValidityWindow {
                 hop: i,

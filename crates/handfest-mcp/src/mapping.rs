@@ -18,6 +18,9 @@ use crate::exact_json::{
 };
 use crate::framing::{validate_json_keys_recursive, JsonKeyError};
 
+#[path = "mapping_decode.rs"]
+mod mapping_decode;
+
 /// Expected scalar type for an argument-derived fact.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -360,11 +363,11 @@ impl fmt::Display for MappingError {
 impl std::error::Error for MappingError {}
 
 impl ToolPolicyMap {
-    /// Parses and validates a [`ToolPolicyMap`] from a JSON string, rejecting duplicate keys.
+    /// Parses and validates a [`ToolPolicyMap`] in a single pass via `ExactJson`, rejecting
+    /// duplicate keys without double-parsing.
     pub fn from_json_str(raw: &str) -> Result<Self, MappingError> {
-        let _ = parse_exact_json(raw).map_err(MappingError::InvalidJson)?;
-        let map: Self =
-            serde_json::from_str(raw).map_err(|err| MappingError::InvalidJson(err.to_string()))?;
+        let parsed = parse_exact_json(raw).map_err(MappingError::InvalidJson)?;
+        let map = mapping_decode::decode_tool_policy_map(&parsed)?;
         map.validate()?;
         Ok(map)
     }

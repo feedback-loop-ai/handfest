@@ -49,6 +49,39 @@ impl Drop for BrokenPipeSignalingWriter {
     }
 }
 
+struct GatedBrokenPipeWriter {
+    seen_tx: Option<mpsc::SyncSender<()>>,
+    fail_rx: Option<mpsc::Receiver<()>>,
+    dropped_tx: Option<mpsc::SyncSender<()>>,
+}
+
+impl Write for GatedBrokenPipeWriter {
+    fn write(&mut self, _buf: &[u8]) -> io::Result<usize> {
+        if let Some(tx) = self.seen_tx.take() {
+            let _ = tx.send(());
+        }
+        if let Some(rx) = self.fail_rx.take() {
+            let _ = rx.recv();
+        }
+        Err(io::Error::new(
+            io::ErrorKind::BrokenPipe,
+            "simulated post-eof upstream broken pipe",
+        ))
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+impl Drop for GatedBrokenPipeWriter {
+    fn drop(&mut self) {
+        if let Some(tx) = self.dropped_tx.take() {
+            let _ = tx.send(());
+        }
+    }
+}
+
 struct AcceptingSignalingWriter {
     seen_tx: Option<mpsc::SyncSender<()>>,
 }
@@ -94,6 +127,72 @@ fn build_test_proxy() -> McpProxy<FixedClock, SqliteLedger> {
         FixedClock::new(now),
     )
     .unwrap()
+}
+
+#[test]
+fn post_eof_drain_timeout_in_run_loop_surfaces_broken_pipe() {
+    let mut proxy = build_test_proxy().with_shutdown_timeout(Duration::from_millis(20));
+    let (seen_tx, seen_rx) = mpsc::sync_channel(1);
+    let (fail_tx, fail_rx) = mpsc::sync_channel(1);
+    let (dropped_tx, dropped_rx) = mpsc::sync_channel(1);
+    let (up_hold_tx, up_hold_rx) = mpsc::sync_channel(1);
+    let (done_tx, done_rx) = mpsc::sync_channel(1);
+    let client_in = "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"ping\"}\n";
+
+    // Drive `McpProxy::run`'s exact event loop with upstream stdout held open (cannot exit via
+    // `Disconnected`). Once client EOF arms `state.shutdown_deadline` (strictly after top-of-loop
+    // `poll_writer_error()` checks), trigger `BrokenPipe` and wait past the deadline so
+    // `recv_event` deterministically returns `RecvOutcome::Timeout` and only
+    // `handle_post_eof_timeout`'s `poll_writer_error()` can surface `BrokenPipe`.
+    let handle = thread::spawn(move || {
+        let transport = DuplexTransport::start(
+            BufReader::new(Cursor::new(client_in.as_bytes().to_vec())),
+            GatedBrokenPipeWriter {
+                seen_tx: Some(seen_tx),
+                fail_rx: Some(fail_rx),
+                dropped_tx: Some(dropped_tx),
+            },
+            BufReader::new(BlockingReader(up_hold_rx)),
+            proxy.max_line_bytes,
+        );
+        let mut client_out = Vec::new();
+        let mut armed_deadline = false;
+        let mut fail_tx = Some(fail_tx);
+        let res = proxy.drive_session_loop(transport, &mut client_out, |state| {
+            let Some(deadline) = state.shutdown_deadline else {
+                return;
+            };
+            let Some(tx) = fail_tx.take() else {
+                return;
+            };
+            armed_deadline = true;
+            seen_rx
+                .recv_timeout(Duration::from_secs(2))
+                .expect("writer thread received ping before post-EOF fail");
+            let _ = tx.send(());
+            dropped_rx
+                .recv_timeout(Duration::from_secs(2))
+                .expect("writer thread populated writer_done_rx with BrokenPipe");
+            if let Some(rem) = deadline.checked_duration_since(Instant::now()) {
+                thread::sleep(rem + Duration::from_millis(5));
+            }
+        });
+        let _ = done_tx.send((armed_deadline, res));
+    });
+
+    let (armed_deadline, res) = done_rx
+        .recv_timeout(Duration::from_secs(2))
+        .expect("run loop hung instead of exiting via RecvOutcome::Timeout");
+    let _ = up_hold_tx.send(());
+    handle.join().unwrap();
+    assert!(
+        armed_deadline,
+        "client EOF with active request must arm shutdown_deadline before recv_event"
+    );
+    assert!(
+        matches!(res, Err(ProxyError::Io(ref io_err)) if io_err.kind() == io::ErrorKind::BrokenPipe),
+        "expected Err(ProxyError::Io(BrokenPipe)) via RecvOutcome::Timeout, got {res:?}"
+    );
 }
 
 #[test]

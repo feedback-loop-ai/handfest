@@ -166,10 +166,18 @@ impl<C: Clock, L: ReceiptLedger> McpProxy<C, L> {
         UR: BufRead + Send + 'static,
         UW: Write + Send + 'static,
     {
-        let mut transport =
+        let transport =
             DuplexTransport::start(client_in, upstream_in, upstream_out, self.max_line_bytes);
-        let mut state = SessionState::default();
+        self.drive_session_loop(transport, client_out, |_| {})
+    }
 
+    fn drive_session_loop<CW: Write>(
+        &mut self,
+        mut transport: DuplexTransport,
+        client_out: &mut CW,
+        mut before_recv: impl FnMut(&SessionState),
+    ) -> Result<(), ProxyError> {
+        let mut state = SessionState::default();
         loop {
             if let Some(err) = transport.poll_writer_error() {
                 return Err(err);
@@ -191,6 +199,7 @@ impl<C: Clock, L: ReceiptLedger> McpProxy<C, L> {
                 return transport.finish_writer(self.shutdown_timeout);
             }
 
+            before_recv(&state);
             let outcome = transport.recv_event(state.shutdown_deadline);
             match self.handle_recv_outcome(outcome, &mut state, &mut transport, client_out) {
                 LoopStep::Continue => {}
@@ -245,7 +254,9 @@ impl<C: Clock, L: ReceiptLedger> McpProxy<C, L> {
             RecvOutcome::Event(IoEvent::UpstreamWriteFailed) => {
                 LoopStep::Finish(Err(transport.take_writer_error()))
             }
-            RecvOutcome::Timeout => LoopStep::Finish(handle_post_eof_timeout(transport)),
+            RecvOutcome::Timeout => {
+                LoopStep::Finish(transport.poll_writer_error().map_or(Ok(()), Err))
+            }
             RecvOutcome::Disconnected => {
                 if let Some(err) = transport.poll_writer_error() {
                     return LoopStep::Finish(Err(err));
@@ -781,10 +792,6 @@ fn handle_notification<CW: Write>(
 fn fail_client_limit<CW: Write>(client_out: &mut CW, message: &str) -> Result<(), ProxyError> {
     let _ = write_jsonrpc_error(client_out, None, JSONRPC_INVALID_REQUEST, message, None);
     Err(ProxyError::UpstreamProtocol(message.to_string()))
-}
-
-fn handle_post_eof_timeout(transport: &DuplexTransport) -> Result<(), ProxyError> {
-    transport.poll_writer_error().map_or(Ok(()), Err)
 }
 
 #[cfg(test)]
