@@ -1,0 +1,351 @@
+{
+  "name": "arxiv-paper-verify",
+  "description": "Zero-mistake arXiv paper verification recipe: 5 single-responsibility deterministic gates (parse-bib, check-links, check-hygiene, build-pdf, verify-repro) followed by a 4-seat x 4-model (16-envelope) panel (Fable 5.2, Qwen 4.0-max, Neon 4, Astra 6.2 \u2014 all at highest effort) adjudicated by Astra 6.2 Chief.",
+  "cost": "high",
+  "policy": "policy.json",
+  "protected_phase": "review",
+  "seats": {
+    "revise": {
+      "results": [
+        "complete",
+        "broken",
+        "blocked"
+      ],
+      "class": "work",
+      "agent": "paper-revise-fable"
+    },
+    "parse-bib": {
+      "results": [
+        "pass",
+        "fail"
+      ],
+      "class": "gate",
+      "limits": {
+        "max_attempts": 2,
+        "timeout_seconds": 300
+      },
+      "driver": {
+        "command": [
+          "{brokkr}",
+          "driver",
+          "exec",
+          "--",
+          "bash",
+          "./scripts/parse-bib.sh",
+          "{prompt_file}"
+        ]
+      },
+      "hands": {
+        "kind": "workspace",
+        "network": false,
+        "binds": [
+          {
+            "path": "~/.cargo",
+            "mode": "overlay",
+            "mask": [
+              "credentials.toml",
+              "credentials"
+            ]
+          },
+          {
+            "path": "~/.rustup",
+            "mode": "ro"
+          }
+        ]
+      }
+    },
+    "check-links": {
+      "results": [
+        "pass",
+        "fail"
+      ],
+      "class": "gate",
+      "limits": {
+        "max_attempts": 2,
+        "timeout_seconds": 600
+      },
+      "driver": {
+        "command": [
+          "{brokkr}",
+          "driver",
+          "exec",
+          "--",
+          "bash",
+          "./scripts/check-links.sh",
+          "{prompt_file}"
+        ]
+      },
+      "hands": {
+        "kind": "workspace",
+        "network": true,
+        "binds": [
+          {
+            "path": "~/.cargo",
+            "mode": "overlay",
+            "mask": [
+              "credentials.toml",
+              "credentials"
+            ]
+          },
+          {
+            "path": "~/.rustup",
+            "mode": "ro"
+          }
+        ]
+      }
+    },
+    "check-hygiene": {
+      "results": [
+        "pass",
+        "fail"
+      ],
+      "class": "gate",
+      "limits": {
+        "max_attempts": 2,
+        "timeout_seconds": 300
+      },
+      "driver": {
+        "command": [
+          "{brokkr}",
+          "driver",
+          "exec",
+          "--",
+          "bash",
+          "./scripts/check-hygiene.sh",
+          "{prompt_file}"
+        ]
+      },
+      "hands": {
+        "kind": "workspace",
+        "network": false,
+        "binds": [
+          {
+            "path": "~/.cargo",
+            "mode": "overlay",
+            "mask": [
+              "credentials.toml",
+              "credentials"
+            ]
+          },
+          {
+            "path": "~/.rustup",
+            "mode": "ro"
+          }
+        ]
+      }
+    },
+    "build-pdf": {
+      "results": [
+        "pass",
+        "fail"
+      ],
+      "class": "gate",
+      "limits": {
+        "max_attempts": 2,
+        "timeout_seconds": 900
+      },
+      "driver": {
+        "command": [
+          "{brokkr}",
+          "driver",
+          "exec",
+          "--",
+          "bash",
+          "./scripts/build-pdf.sh",
+          "{prompt_file}"
+        ]
+      },
+      "hands": {
+        "kind": "workspace",
+        "network": true,
+        "binds": [
+          {
+            "path": "~/.cargo",
+            "mode": "overlay",
+            "mask": [
+              "credentials.toml",
+              "credentials"
+            ]
+          },
+          {
+            "path": "~/.rustup",
+            "mode": "ro"
+          },
+          {
+            "path": "~/.local/bin",
+            "mode": "ro"
+          },
+          {
+            "path": "~/.cache/Tectonic",
+            "mode": "rw"
+          }
+        ]
+      }
+    },
+    "verify-repro": {
+      "results": [
+        "pass",
+        "fail"
+      ],
+      "class": "gate",
+      "limits": {
+        "max_attempts": 2,
+        "timeout_seconds": 3600
+      },
+      "driver": {
+        "command": [
+          "{brokkr}",
+          "driver",
+          "exec",
+          "--",
+          "bash",
+          "./scripts/verify-repro.sh",
+          "{prompt_file}"
+        ]
+      },
+      "hands": {
+        "kind": "workspace",
+        "network": false,
+        "binds": [
+          {
+            "path": "~/.cargo",
+            "mode": "overlay",
+            "mask": [
+              "credentials.toml",
+              "credentials"
+            ]
+          },
+          {
+            "path": "~/.rustup",
+            "mode": "ro"
+          }
+        ]
+      }
+    },
+    "review": {
+      "results": [
+        "clean",
+        "residual",
+        "security-hold"
+      ],
+      "inputs": [
+        "has_security_residual",
+        "max_residual_severity"
+      ],
+      "limits": {
+        "max_attempts": 2,
+        "timeout_seconds": 28800
+      },
+      "sequence": [
+        {
+          "name": "positions",
+          "results": [
+            "clean",
+            "residual",
+            "security-hold"
+          ],
+          "aggregate": "review-panel",
+          "panel": {
+            "citations-fable": {
+              "agent": "paper-review-citations-fable",
+              "class": "work"
+            },
+            "citations-qwen": {
+              "agent": "paper-review-citations-qwen",
+              "class": "work"
+            },
+            "citations-neon": {
+              "agent": "paper-review-citations-neon",
+              "class": "work"
+            },
+            "citations-astra": {
+              "agent": "paper-review-citations-astra",
+              "class": "work"
+            },
+            "proofs-fable": {
+              "agent": "paper-review-proofs-fable",
+              "class": "work"
+            },
+            "proofs-qwen": {
+              "agent": "paper-review-proofs-qwen",
+              "class": "work"
+            },
+            "proofs-neon": {
+              "agent": "paper-review-proofs-neon",
+              "class": "work"
+            },
+            "proofs-astra": {
+              "agent": "paper-review-proofs-astra",
+              "class": "work"
+            },
+            "code-fable": {
+              "agent": "paper-review-code-fable",
+              "class": "work"
+            },
+            "code-qwen": {
+              "agent": "paper-review-code-qwen",
+              "class": "work"
+            },
+            "code-neon": {
+              "agent": "paper-review-code-neon",
+              "class": "work"
+            },
+            "code-astra": {
+              "agent": "paper-review-code-astra",
+              "class": "work"
+            },
+            "arxiv-fable": {
+              "agent": "paper-review-arxiv-fable",
+              "class": "work"
+            },
+            "arxiv-qwen": {
+              "agent": "paper-review-arxiv-qwen",
+              "class": "work"
+            },
+            "arxiv-neon": {
+              "agent": "paper-review-arxiv-neon",
+              "class": "work"
+            },
+            "arxiv-astra": {
+              "agent": "paper-review-arxiv-astra",
+              "class": "work"
+            }
+          }
+        },
+        {
+          "name": "chief",
+          "agent": "paper-review-chief-astra",
+          "class": "gate"
+        }
+      ]
+    },
+    "ship": {
+      "results": [
+        "ready",
+        "shipped"
+      ],
+      "class": "gate",
+      "limits": {
+        "max_attempts": 2,
+        "timeout_seconds": 1800
+      },
+      "driver": {
+        "command": [
+          "{brokkr}",
+          "driver",
+          "exec",
+          "--",
+          "bash",
+          "./scripts/ship-seat.sh",
+          "{prompt_file}",
+          "{brokkr}"
+        ]
+      },
+      "hands": {
+        "kind": "workspace",
+        "network": false,
+        "binds": []
+      }
+    }
+  }
+}

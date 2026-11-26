@@ -1,0 +1,258 @@
+{
+  "schema": "forge.phase-machine/v2",
+  "description": "Zero-mistake arXiv paper verification recipe: 5 single-responsibility deterministic exec gates (parse-bib, check-links, check-hygiene, build-pdf, verify-repro) followed by a 4-seat x 4-model (16-envelope) verification panel at highest effort adjudicated by Astra 6.2 Chief. Zero residuals allowed to ship.",
+  "phases": [
+    "revise",
+    "parse-bib",
+    "check-links",
+    "check-hygiene",
+    "build-pdf",
+    "verify-repro",
+    "review",
+    "ship",
+    "done",
+    "stop"
+  ],
+  "initial": "revise",
+  "terminal": [
+    "done",
+    "stop"
+  ],
+  "shippable_from": [
+    "review"
+  ],
+  "rules": [
+    {
+      "id": "REVISE-BROKEN-TWICE",
+      "from": "revise",
+      "result": "broken",
+      "when": { "consecutive_failures_gte": 2 },
+      "next": "stop",
+      "severity": "hard",
+      "reason": "Two consecutive broken revision attempts; stop and report."
+    },
+    {
+      "id": "REVISE-BROKEN-RETRY",
+      "from": "revise",
+      "result": "broken",
+      "next": "revise",
+      "reason": "First broken revision; one retry permitted."
+    },
+    {
+      "id": "REVISE-BLOCKED",
+      "from": "revise",
+      "result": "blocked",
+      "next": "stop",
+      "severity": "hard",
+      "reason": "Reviser blocked; report blocker."
+    },
+    {
+      "id": "REVISE-OK",
+      "from": "revise",
+      "result": "complete",
+      "next": "parse-bib",
+      "reason": "Revision committed; enter deterministic preflight at parse-bib."
+    },
+    {
+      "id": "PARSE-BIB-FAIL-EXHAUSTED",
+      "from": "parse-bib",
+      "result": "fail",
+      "when": { "visits_revise_gte": 4 },
+      "next": "stop",
+      "severity": "hard",
+      "reason": "parse-bib still red after 4 revision visits."
+    },
+    {
+      "id": "PARSE-BIB-FAIL",
+      "from": "parse-bib",
+      "result": "fail",
+      "next": "revise",
+      "severity": "flagged",
+      "reason": "BibTeX/cite mismatch; return to revise."
+    },
+    {
+      "id": "PARSE-BIB-PASS",
+      "from": "parse-bib",
+      "result": "pass",
+      "next": "check-links",
+      "reason": "1:1 BibTeX bijection verified; proceed to deterministic link/DOI/arXiv verification."
+    },
+    {
+      "id": "CHECK-LINKS-FAIL-EXHAUSTED",
+      "from": "check-links",
+      "result": "fail",
+      "when": { "visits_revise_gte": 4 },
+      "next": "stop",
+      "severity": "hard",
+      "reason": "check-links still red after 4 revision visits."
+    },
+    {
+      "id": "CHECK-LINKS-FAIL",
+      "from": "check-links",
+      "result": "fail",
+      "next": "revise",
+      "severity": "flagged",
+      "reason": "Dead URL or DOI/arXiv title mismatch; return to revise."
+    },
+    {
+      "id": "CHECK-LINKS-PASS",
+      "from": "check-links",
+      "result": "pass",
+      "next": "check-hygiene",
+      "reason": "Every URL, DOI, and arXiv ID deterministically verified; proceed to check-hygiene."
+    },
+    {
+      "id": "CHECK-HYGIENE-FAIL-EXHAUSTED",
+      "from": "check-hygiene",
+      "result": "fail",
+      "when": { "visits_revise_gte": 4 },
+      "next": "stop",
+      "severity": "hard",
+      "reason": "check-hygiene still red after 4 revision visits."
+    },
+    {
+      "id": "CHECK-HYGIENE-FAIL",
+      "from": "check-hygiene",
+      "result": "fail",
+      "next": "revise",
+      "severity": "flagged",
+      "reason": "Hygiene/disclosure/diagram gate failed; return to revise."
+    },
+    {
+      "id": "CHECK-HYGIENE-PASS",
+      "from": "check-hygiene",
+      "result": "pass",
+      "next": "build-pdf",
+      "reason": "Hygiene passed; proceed to deterministic PDF compile."
+    },
+    {
+      "id": "BUILD-PDF-FAIL-EXHAUSTED",
+      "from": "build-pdf",
+      "result": "fail",
+      "when": { "visits_revise_gte": 4 },
+      "next": "stop",
+      "severity": "hard",
+      "reason": "build-pdf still red after 4 revision visits."
+    },
+    {
+      "id": "BUILD-PDF-FAIL",
+      "from": "build-pdf",
+      "result": "fail",
+      "next": "revise",
+      "severity": "flagged",
+      "reason": "PDF build/layout failed; return to revise."
+    },
+    {
+      "id": "BUILD-PDF-PASS",
+      "from": "build-pdf",
+      "result": "pass",
+      "next": "verify-repro",
+      "reason": "PDF compiled cleanly; proceed to workspace reproducibility check."
+    },
+    {
+      "id": "VERIFY-REPRO-FAIL-EXHAUSTED",
+      "from": "verify-repro",
+      "result": "fail",
+      "when": { "visits_revise_gte": 4 },
+      "next": "stop",
+      "severity": "hard",
+      "reason": "verify-repro still red after 4 revision visits."
+    },
+    {
+      "id": "VERIFY-REPRO-FAIL",
+      "from": "verify-repro",
+      "result": "fail",
+      "next": "revise",
+      "severity": "flagged",
+      "reason": "Workspace reproducibility gate failed; return to revise."
+    },
+    {
+      "id": "VERIFY-REPRO-PASS",
+      "from": "verify-repro",
+      "result": "pass",
+      "next": "review",
+      "reason": "All 5 deterministic gates green; enter 4x4 (16-envelope) review panel."
+    },
+    {
+      "id": "REVIEW-INTEGRITY-HOLD",
+      "from": "review",
+      "result": "security-hold",
+      "next": "stop",
+      "severity": "hard",
+      "reason": "Hard stop: integrity/policy hold (hallucinated citation, false theorem, or arXiv policy violation)."
+    },
+    {
+      "id": "REVIEW-RESIDUAL-EXHAUSTED",
+      "from": "review",
+      "result": "residual",
+      "when": { "visits_revise_gte": 4 },
+      "park": true,
+      "reason": "Four revision rounds spent and a residual survives; zero-mistake policy parks for operator ruling."
+    },
+    {
+      "id": "REVIEW-REFORGE",
+      "from": "review",
+      "result": "residual",
+      "next": "revise",
+      "severity": "flagged",
+      "reason": "Zero-mistake policy: ANY residual returns to revise and re-runs all 5 deterministic gates + 4x4 panel."
+    },
+    {
+      "id": "REVIEW-CLEAN",
+      "from": "review",
+      "result": "clean",
+      "next": "ship",
+      "reason": "All 16 envelopes adjudicated clean by Astra 6.2 Chief with zero residuals."
+    },
+    {
+      "id": "SHIP-DRIFT",
+      "from": "ship",
+      "result": "ready",
+      "when": { "drift_detected": true },
+      "next": "review",
+      "severity": "flagged",
+      "reason": "HEAD moved after review verdict; re-verify."
+    },
+    {
+      "id": "SHIP-DIRTY",
+      "from": "ship",
+      "result": "ready",
+      "when": { "dirty_worktrees": true },
+      "next": "stop",
+      "severity": "hard",
+      "reason": "Dirty worktree at ship time."
+    },
+    {
+      "id": "SHIP-READY",
+      "from": "ship",
+      "result": "ready",
+      "next": "ship",
+      "reason": "Ledger written; confirm close-out."
+    },
+    {
+      "id": "SHIPPED-DRIFT",
+      "from": "ship",
+      "result": "shipped",
+      "when": { "drift_detected": true },
+      "next": "review",
+      "severity": "flagged",
+      "reason": "HEAD moved before close-out."
+    },
+    {
+      "id": "SHIPPED-DIRTY",
+      "from": "ship",
+      "result": "shipped",
+      "when": { "dirty_worktrees": true },
+      "next": "stop",
+      "severity": "hard",
+      "reason": "Dirty worktree at close-out."
+    },
+    {
+      "id": "SHIP-COMPLETE",
+      "from": "ship",
+      "result": "shipped",
+      "next": "done",
+      "reason": "arXiv submission verified with zero mistakes across all 5 deterministic gates and all 16 panel envelopes."
+    }
+  ]
+}
