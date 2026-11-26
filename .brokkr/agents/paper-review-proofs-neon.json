@@ -1,0 +1,37 @@
+{
+  "description": "Formal proofs, theorems, and complexity auditor (agy-neon at xhigh effort).",
+  "charter": "charters/paper-review-proofs.md",
+  "models": [
+    "agy-neon"
+  ],
+  "efforts": {
+    "agy-neon": "xhigh"
+  },
+  "results": [
+    "clean",
+    "residual",
+    "security-hold"
+  ],
+  "hands": {
+    "kind": "workspace",
+    "network": false,
+    "binds": [
+      {
+        "path": "~/.cargo",
+        "mode": "overlay",
+        "mask": [
+          "credentials.toml",
+          "credentials"
+        ]
+      },
+      {
+        "path": "~/.rustup",
+        "mode": "ro"
+      },
+      {
+        "path": "~/.cache/Tectonic",
+        "mode": "ro"
+      }
+    ]
+  }
+}

@@ -1,0 +1,32 @@
+{
+  "description": "Zero-mistake arXiv paper review chief (gpt-6.2-astra at max effort) adjudicating all 16 panel envelopes and 5 deterministic audit reports.",
+  "charter": "charters/paper-review-chief.md",
+  "models": [
+    "astra"
+  ],
+  "efforts": {
+    "astra": "max"
+  },
+  "hands": {
+    "kind": "workspace",
+    "network": false,
+    "binds": [
+      {
+        "path": "~/.cargo",
+        "mode": "overlay",
+        "mask": [
+          "credentials.toml",
+          "credentials"
+        ]
+      },
+      {
+        "path": "~/.rustup",
+        "mode": "ro"
+      },
+      {
+        "path": "~/.cache/Tectonic",
+        "mode": "ro"
+      }
+    ]
+  }
+}

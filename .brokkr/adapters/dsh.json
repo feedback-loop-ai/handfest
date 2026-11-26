@@ -1,0 +1,194 @@
+{
+  "provider": "dsh",
+  "trust_tier": "trusted",
+  "egress": "uncontracted",
+  "routes": {
+    "spark": "local",
+    "spark-glm": "local"
+  },
+  "credentials": {
+    "spark": "SPARK_API_KEY",
+    "spark-glm": "SPARK_API_KEY",
+    "meta": "OPENROUTER_API_KEY",
+    "meta-contributor": "OPENROUTER_API_KEY",
+    "deepseek-official": "DEEPSEEK_API_KEY",
+    "dashscope": "DASHSCOPE_API_KEY"
+  },
+  "harness_auth": {
+    "names": [],
+    "measured": "dsh 0.1.5-rc.2 authenticates each route with the variable its provider row's apiKeyEnv names, and those are exactly this adapter's credentials: DEEPSEEK_API_KEY (dsh-llm-deepseek DEFAULT_API_KEY_ENV), DASHSCOPE_API_KEY and OPENROUTER_API_KEY (dsh --profile headless --dump-config), SPARK_API_KEY (U0 S01's MISSING_CREDENTIAL); the loader reads them from credentials, so none is written twice (docs/evidence/adapters/slice-two-mcp-isolation.md, How the operator's dsh wires each route)"
+  },
+  "binary": "dsh",
+  "driver": [
+    "{brokkr}",
+    "driver",
+    "dsh",
+    "--"
+  ],
+  "models": {
+    "flash": "deepseek-flash",
+    "glm": "dashscope/glm-5.2",
+    "glm-flash": "spark-glm/GLM-5.3-Flash-EXL3",
+    "glm53": "dashscope/glm-5.3",
+    "muse": "meta/meta/muse-spark-1.3",
+    "muse-contributor": "meta-contributor/meta/muse-spark-1.3-contributor",
+    "pro": "deepseek-v4-pro",
+    "qwen-flash": "dashscope/qwen3.8-flash",
+    "qwen-max": "dashscope/qwen3.8-max",
+    "qwen-plus": "dashscope/qwen3.7-plus",
+    "qwen36-flash": "dashscope/qwen3.6-flash",
+    "qwen37-max": "dashscope/qwen3.7-max",
+    "qwen4-max": "dashscope/qwen4-max",
+    "spark-flash": "spark/qwen3.8-flash",
+    "studio-flash": "dashscope/deepseek-v4-flash-0731",
+    "studio-flash41": "dashscope/deepseek-v4.1-flash",
+    "studio-pro": "dashscope/deepseek-v4-pro"
+  },
+  "judges": [
+    "qwen4-max"
+  ],
+  "model_flag": "--model",
+  "efforts": [
+    "low",
+    "medium",
+    "high",
+    "xhigh"
+  ],
+  "effort_flag": "--effort",
+  "effortless_routes": {
+    "spark": "dsh 0.1.5-rc.1 refuses reasoningEffort at every level tried (low, none — runs task-framing-doctor-warns-when-a-088cb62b, task-framing-doctor-warns-when-a-b2b4fdc4, 2026-09-11); seats on this route pin no effort and record not applicable (decision 0035 addendum 2026-09-11)",
+    "spark-glm": "dsh 0.1.5-rc.1 refuses reasoningEffort on spark-glm/GLM-5.3-Flash-EXL3 (low — UNSUPPORTED_REASONING_EFFORT, measured 2026-09-16); the model entry states no reasoningEfforts so the lane materialises as non-reasoning, seats on this route pin no effort and record not applicable (decision 0035 addendum 2026-09-11)"
+  },
+  "tool_permissions": {
+    "unsupported": "dsh 0.2.1-rc.2 and rc.3 (measured 2026-10-26) disable a tool only as a whole profile row through the --patch overlay, which is how this adapter's hands are served; no row narrows bash to a command (no Bash(cargo:*) analogue), so an agent's tools.allow list has nothing to map onto"
+  },
+  "mcp": {
+    "carriage": {
+      "measured": "U0 D03 (dsh 0.1.5-rc.1, Linux, 2026-10-03, local spark-glm route): the engine's dsh-mcp-client row, inserted by the --patch overlay over an engine-only DSH_HOME, started the engine sentinel and answered its call; U0c K02, K05, K08 and K11t (2026-10-06) answered it on deepseek-official, dashscope, meta and meta-contributor (docs/evidence/adapters/slice-two-mcp-isolation.md)"
+    },
+    "shapes": [
+      {
+        "invocation": "cold",
+        "hands": "none",
+        "measured_on": {
+          "harness": "dsh",
+          "binary": "dsh",
+          "version": "0.1.5-rc.1",
+          "host": "linux"
+        },
+        "ambient": {
+          "measured": "U0 D03 and D04 (spark-glm) and U0c K01 to K12r (deepseek-official, dashscope, meta, meta-contributor): under an engine-only DSH_HOME no planted home- or profile-level sentinel started while the engine row loaded; D01 and U0c's positive controls answered both; D02's existing home fails; no plugin layer was planted; spark is not qualified (U0c S01 to S03: its model server was down)"
+        },
+        "native_write": {
+          "unmeasured": "U0 D04: dsh's default workspace-write sandbox denied one native write outside the workspace, but dsh offered an approval-gated escalation (policy ask) that was not exercised, so confinement is not established"
+        },
+        "store_read": {
+          "unsupported": "U0 D04: dsh's native shell under its default workspace-write sandbox, in an engine-only DSH_HOME, read the 0600 store canary outside the workspace"
+        },
+        "process_read": {
+          "measured": "U0 D04: dsh's native shell ran in a private pid namespace of 4 pids and found no process canary in /proc"
+        }
+      },
+      {
+        "invocation": "replacement",
+        "hands": "none",
+        "measured_on": {
+          "harness": "dsh",
+          "binary": "dsh",
+          "version": "0.2.1-rc.2",
+          "host": "linux"
+        },
+        "ambient": {
+          "measured": "U0b D06 (spark-glm) and pass 8 (2026-10-29, keyed: P8-deepseek-B, P8-dashscope-B, P8-meta-B, P8-metac-B): after positive controls loaded both sentinels, the replacement in a fresh engine-only DSH_HOME, after a first run in the workdir, started neither, sent only the engine's tool and composed one engine dsh-mcp-client; dashscope's quota refused the call; spark is not qualified (U0c S01 to S03)"
+        },
+        "native_write": {
+          "unmeasured": "U0b D07 (keyless spark-glm): dsh's workspace-write sandbox refused a native write outside the workdir (Read-only file system); a shape carries no route scope, so one route's result qualifies none"
+        },
+        "store_read": {
+          "unmeasured": "U0b D07 (keyless spark-glm): dsh's native bash read the 0600 store canary at its production path in the workdir, and D10-p5's still did after U8h, which masks the hands box alone; a shape carries no route scope, so this shape is recorded unmeasured"
+        },
+        "process_read": {
+          "unmeasured": "U0b D07 (keyless spark-glm): dsh's native bash found no process canary in /proc, in its private pid namespace; a shape carries no route scope, so one route's result qualifies none"
+        }
+      },
+      {
+        "invocation": "cold",
+        "hands": "boxed",
+        "measured_on": {
+          "harness": "dsh",
+          "binary": "dsh",
+          "version": "0.2.1-rc.2",
+          "host": "linux"
+        },
+        "ambient": {
+          "measured": "#896 (2026-11-01, dsh 0.2.1-rc.2, Linux, spark-glm): after positive controls loaded a planted home- and profile-level sentinel, a boxed hands launch in a fresh engine-only DSH_HOME started neither, composed the measured 99 rows with one brokkr-hands client, and the real hands tool listed as mcp__brokkr__workspace; unchanged under no_new_privs (docs/evidence/adapters/dsh-boxed-hands.md)"
+        },
+        "native_write": {
+          "measured": "#896 round 2 (2026-10-26, dsh 0.2.1-rc.2/rc.3): the ten hands rows disabled left 12 bookkeeping tools, the nine plus mcp-resources' three, which reach only the one MCP server in scope; each disabled row read disabled: true in --dump-config, and sandbox-policy is set from the office's access (docs/evidence/adapters/dsh-hands-round2)"
+        },
+        "store_read": {
+          "measured": "U0b D10-p5 with #896 round 2 (dsh 0.2.1-rc.2): the hands box, Brokkr's whatever the route, masks the 0600 store at its production path behind /dev/null (Permission denied) after U8h, and the hands rows compose no native read, search or shell tool; mcp-resources reaches only the seat's one MCP server (docs/evidence/adapters/dsh-hands-round2)"
+        },
+        "process_read": {
+          "measured": "U0b D10-p5 with #896 (dsh 0.2.1-rc.2): the hands box, Brokkr's whatever the route, found no process canary in /proc in its private pid namespace, and the hands rows compose no native shell (docs/evidence/adapters/slice-two-dsh-hands.md)"
+        }
+      },
+      {
+        "invocation": "replacement",
+        "hands": "boxed",
+        "measured_on": {
+          "harness": "dsh",
+          "binary": "dsh",
+          "version": "0.2.1-rc.2",
+          "host": "linux"
+        },
+        "ambient": {
+          "measured": "#896 (2026-11-01, dsh 0.2.1-rc.2, Linux, spark-glm): after a first boxed hands run in the workdir, a fresh engine-only DSH_HOME replacement (dsh's resume unmeasured, so the offer is declined) started no ambient sentinel, composed the measured 99 rows with one brokkr-hands client, and listed mcp__brokkr__workspace (docs/evidence/adapters/dsh-boxed-hands.md)"
+        },
+        "native_write": {
+          "unmeasured": "#896 (2026-11-01, dsh 0.2.1-rc.2, Linux, spark-glm): the replacement run composed and listed the engine's tool but re-measured none of the ten hands rows or their disabled state, so this shape borrows nothing from the cold boxed shape's round 2 measurement (docs/evidence/adapters/dsh-boxed-hands.md)"
+        },
+        "store_read": {
+          "unmeasured": "#896 (2026-11-01, dsh 0.2.1-rc.2, Linux, spark-glm): the replacement run read no store canary, so this shape borrows nothing from the cold boxed shape's U0b D10-p5 store measurement (docs/evidence/adapters/dsh-boxed-hands.md)"
+        },
+        "process_read": {
+          "unmeasured": "#896 (2026-11-01, dsh 0.2.1-rc.2, Linux, spark-glm): the replacement run read no process canary, so this shape borrows nothing from the cold boxed shape's U0b D10-p5 process measurement (docs/evidence/adapters/dsh-boxed-hands.md)"
+        }
+      }
+    ]
+  },
+  "native_capabilities": {
+    "unmeasured": "dsh's tool_permissions and mcp declarations cover command-line narrowing, ambient MCP exclusion and engine-server carriage only, which does not establish that dsh has no native egress. U0 and U0c listed native web_fetch and web_search under an engine-only DSH_HOME, and the web_search row (web-search-deepseek) reads DEEPSEEK_API_KEY on every route family; no cell exercised either. dsh 0.2's web-deepseek-api row (the Search and Fetch APIs, billed from 2026-11-01) reads it too. No OFF control is measured: nothing is granted through dsh and no native denial is claimed (decision 0065 slice one; owed to the controller)"
+  },
+  "hands": {
+    "workspace": []
+  },
+  "resume": {
+    "headless-work": {
+      "status": "unmeasured",
+      "identity": {
+        "version": "0.1.5-rc.1",
+        "applies_to": "0.1.5-rc.1"
+      },
+      "classes": [
+        "work"
+      ],
+      "boundaries": [
+        "not applicable"
+      ],
+      "hands": "none",
+      "evidence": {
+        "interface": ".forge/tasks/dsh-pair-qualification-015rc1.json (2026-09-12): isolated live cold+warm qualification of @deepseek-ai/dsh 0.1.5-rc.1 at 183f08e9 plus the repository-owned six-file adaptation of dsh-plugin-cli-session 0.2.0 at 0f487e74 under extensions/dsh/plugin-cli-session/; see controller-dsh-upstream-discovery.json and dsh-pair-incompatibility.json"
+      },
+      "reason": "main does not perform this rejoin: the forward-pinned route (@deepseek-ai/dsh 0.1.5-rc.1 plus the repository-owned six-file adaptation of dsh-plugin-cli-session 0.2.0 under extensions/dsh/plugin-cli-session/) is selected but disabled, because exact-root, restriction, multi-message accounting and composite-digest proof remain unmeasured",
+      "limitations": [
+        "core 0.1.5-rc.1 broke the plugin's post-turn fold (agent.session.events removed); the repository-owned adaptation restores the interval with snapshotEvents(firstSeq) and is the selected route, a measured one-expression fix, not a global DSH or extension limitation",
+        "the plugin's emitted session_id is request-derived and is not independent root confirmation; the retained depth-zero header, post-resume init event, same-root nonce continuity and absence of a fresh sibling root must be observed",
+        "the plugin's collectUsage() is last-wins over firstSeq and is not proven to attribute a multi-message/retry turn's aggregate; a numeric total that cannot be attributed must stay absent",
+        "the installed 0.1.2-rc.1 headless runner's one-shot entry mints a fresh root and cannot forward the launcher's TUI example; that is bounded history for that entry only, never a global DSH or extension limitation",
+        "the separate hands/tools plugin deferral above is a different matter and is not what blocks this shape",
+        "2026-09-10: the operator's ruling reversed this shape's earlier 0.1.0-rc.6 pin; the forward-pinned latest core with the repository-owned adaptation at 0f487e74 is the selected route, and the superseded .forge/tasks/dsh-pair-qualification-010rc6.json record is dated history, not a current route"
+      ]
+    }
+  }
+}

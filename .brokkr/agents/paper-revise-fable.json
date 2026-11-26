@@ -1,0 +1,36 @@
+{
+  "description": "Paper reviser and author assistant (claude-fable-5-2 at max effort) for human-written prose, TikZ diagrams, and arXiv compliance.",
+  "charter": "charters/paper-revise.md",
+  "models": [
+    "fable"
+  ],
+  "efforts": {
+    "fable": "max"
+  },
+  "hands": {
+    "kind": "workspace",
+    "network": true,
+    "binds": [
+      {
+        "path": "~/.cargo",
+        "mode": "overlay",
+        "mask": [
+          "credentials.toml",
+          "credentials"
+        ]
+      },
+      {
+        "path": "~/.rustup",
+        "mode": "ro"
+      },
+      {
+        "path": "~/.local/bin",
+        "mode": "ro"
+      },
+      {
+        "path": "~/.cache/Tectonic",
+        "mode": "rw"
+      }
+    ]
+  }
+}

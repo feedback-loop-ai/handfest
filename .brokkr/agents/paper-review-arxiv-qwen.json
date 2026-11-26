@@ -1,0 +1,15 @@
+{
+  "description": "arXiv compliance, human voice, WYSIWYS legal intent, and TikZ diagram auditor (qwen4-max at xhigh effort).",
+  "charter": "charters/paper-review-arxiv-qa.md",
+  "models": [
+    "qwen4-max"
+  ],
+  "efforts": {
+    "qwen4-max": "xhigh"
+  },
+  "results": [
+    "clean",
+    "residual",
+    "security-hold"
+  ]
+}

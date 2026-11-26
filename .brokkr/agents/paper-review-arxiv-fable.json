@@ -1,0 +1,37 @@
+{
+  "description": "arXiv compliance, human voice, WYSIWYS legal intent, and TikZ diagram auditor (fable at max effort).",
+  "charter": "charters/paper-review-arxiv-qa.md",
+  "models": [
+    "fable"
+  ],
+  "efforts": {
+    "fable": "max"
+  },
+  "results": [
+    "clean",
+    "residual",
+    "security-hold"
+  ],
+  "hands": {
+    "kind": "workspace",
+    "network": false,
+    "binds": [
+      {
+        "path": "~/.cargo",
+        "mode": "overlay",
+        "mask": [
+          "credentials.toml",
+          "credentials"
+        ]
+      },
+      {
+        "path": "~/.rustup",
+        "mode": "ro"
+      },
+      {
+        "path": "~/.cache/Tectonic",
+        "mode": "ro"
+      }
+    ]
+  }
+}

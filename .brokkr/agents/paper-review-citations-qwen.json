@@ -1,0 +1,15 @@
+{
+  "description": "Citation and link semantic fidelity auditor (qwen4-max at xhigh effort).",
+  "charter": "charters/paper-review-citations.md",
+  "models": [
+    "qwen4-max"
+  ],
+  "efforts": {
+    "qwen4-max": "xhigh"
+  },
+  "results": [
+    "clean",
+    "residual",
+    "security-hold"
+  ]
+}

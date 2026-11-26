@@ -1,0 +1,37 @@
+{
+  "description": "Codebase and empirical alignment auditor (astra at max effort).",
+  "charter": "charters/paper-review-code.md",
+  "models": [
+    "astra"
+  ],
+  "efforts": {
+    "astra": "max"
+  },
+  "results": [
+    "clean",
+    "residual",
+    "security-hold"
+  ],
+  "hands": {
+    "kind": "workspace",
+    "network": false,
+    "binds": [
+      {
+        "path": "~/.cargo",
+        "mode": "overlay",
+        "mask": [
+          "credentials.toml",
+          "credentials"
+        ]
+      },
+      {
+        "path": "~/.rustup",
+        "mode": "ro"
+      },
+      {
+        "path": "~/.cache/Tectonic",
+        "mode": "ro"
+      }
+    ]
+  }
+}
