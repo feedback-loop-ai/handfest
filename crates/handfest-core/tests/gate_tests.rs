@@ -1382,14 +1382,34 @@ fn verify_chain_runtime_rejects_bad_anchor_id_and_validity_windows() {
     for eval_now in [199, 200, 201] {
         assert_eq!(
             verify_chain_runtime(std::slice::from_ref(&empty_window), &leaf, eval_now),
-            Err(RuntimeChainError::OutsideProofValidityWindow {
+            Err(RuntimeChainError::InvalidProofValidityWindow {
                 hop: 0,
-                now: eval_now,
                 valid_from: 200,
                 valid_until: 200,
             })
         );
     }
+    let (verdict, receipt) = authorize(
+        std::slice::from_ref(&empty_window),
+        &ActionRequest {
+            actor_key: leaf.clone(),
+            action: "git.pr.merge".into(),
+            resource_kind: "repo".into(),
+            resource_id: "org/app".into(),
+        },
+        &VerifiedFacts::new(),
+        &QuotaSnapshot::new(),
+        200,
+        None,
+    );
+    assert_eq!(
+        verdict,
+        Verdict::Deny {
+            reason: "hop 0: invalid anchor proof validity window [200..200)".into(),
+        }
+    );
+    assert_eq!(receipt.verdict, verdict);
+    assert_eq!(receipt.receipt_hash, receipt.compute_hash());
 }
 
 #[test]

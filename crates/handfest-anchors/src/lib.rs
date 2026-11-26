@@ -67,21 +67,21 @@ pub enum AnchorError {
 impl fmt::Display for AnchorError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::InvalidSecretKey(msg) => write!(f, "invalid Ed25519 secret key: {msg}"),
-            Self::InvalidPublicKey(msg) => write!(f, "invalid Ed25519 public key: {msg}"),
-            Self::InvalidSignature(msg) => write!(f, "invalid Ed25519 signature: {msg}"),
+            Self::InvalidSecretKey(msg) => write!(f, "invalid anchor secret key: {msg}"),
+            Self::InvalidPublicKey(msg) => write!(f, "invalid anchor public key: {msg}"),
+            Self::InvalidSignature(msg) => write!(f, "invalid anchor signature: {msg}"),
             Self::NonCanonicalMandate(err) => write!(f, "invalid or non-canonical mandate: {err}"),
             Self::SignerMismatch { expected, actual } => {
-                write!(f, "signer key mismatch: mandate FROM is '{expected}', envelope has '{actual}'")
+                write!(f, "signer key mismatch: expected '{expected}', got '{actual}'")
             }
             Self::ActorKindMismatch { expected, actual } => {
-                write!(f, "actor kind mismatch: mandate FROM is {expected:?}, envelope has {actual:?}")
+                write!(f, "actor kind mismatch: expected {expected:?}, got {actual:?}")
             }
             Self::InvalidActorKind(raw) => write!(f, "unknown actor kind '{raw}'"),
             Self::InvalidAssurance(raw) => write!(f, "unknown assurance level '{raw}'"),
             Self::UnsupportedAssurance { expected, actual } => write!(
                 f,
-                "unsupported assurance level for Ed25519 verifier: expected {expected:?}, got {actual:?}"
+                "unsupported assurance level: expected {expected:?}, got {actual:?}"
             ),
             Self::InvalidAnchorId(msg) => write!(f, "invalid anchor_id: {msg}"),
             Self::InvalidTimestamp(ts) => write!(

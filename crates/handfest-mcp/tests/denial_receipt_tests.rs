@@ -975,9 +975,7 @@ fn mapping_failure_never_masks_expired_not_yet_valid_or_unbound_chain() {
         empty_window,
         agent_kp.key_id(),
         valid_now,
-        &format!(
-            "hop 0: timestamp {valid_now} outside anchor proof validity window [{valid_from}..{valid_from})"
-        ),
+        &format!("hop 0: invalid anchor proof validity window [{valid_from}..{valid_from})"),
     );
 
     let mut inverted_window = verified;

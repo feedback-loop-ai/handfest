@@ -6,8 +6,9 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
-use handfest_anchors::Ed25519Keypair;
+use handfest_anchors::{Ed25519Keypair, SignedMandate};
 use handfest_core::ast::parse_rfc3339_utc;
+use handfest_core::cnl::parse_canonical;
 use handfest_core::exact_json::{parse_exact_json, ExactJson};
 use tempfile::tempdir;
 
@@ -276,9 +277,8 @@ fn handfest_mcp_emits_structured_json_for_ledger_spawn_and_runtime_errors() {
             "--policy-map",
             policy,
             "--",
-            "sh",
-            "-c",
-            "read line; printf 'not-valid-json\\n'",
+            env!("CARGO_BIN_EXE_handfest-mcp"),
+            "--help",
         ])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -298,4 +298,124 @@ fn handfest_mcp_emits_structured_json_for_ledger_spawn_and_runtime_errors() {
     codes.insert(code);
 
     assert_eq!(codes.len(), 3);
+}
+
+#[test]
+fn handfest_mcp_emits_chain_invalid_for_tampered_signature() {
+    let dir = tempdir().unwrap();
+    let f = write_valid_fixtures(dir.path());
+    let policy = f.policy.to_str().unwrap();
+    let ledger = f.ledger.to_str().unwrap();
+
+    // Valid SignedMandate JSON with tampered signature -> fails in verify_mandate_chain_with.
+    let mut tampered: SignedMandate =
+        serde_json::from_str(&fs::read_to_string(&f.chain).unwrap()).unwrap();
+    let flipped = if tampered.signature_hex.starts_with('0') {
+        "1"
+    } else {
+        "0"
+    };
+    tampered.signature_hex.replace_range(0..1, flipped);
+    let tampered_chain = dir.path().join("tampered.signed.json");
+    fs::write(&tampered_chain, serde_json::to_string(&tampered).unwrap()).unwrap();
+    let (code, msg) = run_expect_failure(&[
+        "--chain",
+        tampered_chain.to_str().unwrap(),
+        "--ledger",
+        ledger,
+        "--actor-key",
+        &f.actor_key,
+        "--policy-map",
+        policy,
+        "--",
+        "true",
+    ]);
+    assert_eq!(code, "chain_invalid");
+    assert!(
+        msg.contains("startup mandate chain verification failed")
+            && msg.contains("invalid anchor signature"),
+        "expected verifier failure detail, got: {msg}"
+    );
+}
+
+#[test]
+fn handfest_mcp_emits_chain_invalid_for_broken_attenuation() {
+    let dir = tempdir().unwrap();
+    let f = write_valid_fixtures(dir.path());
+    let policy = f.policy.to_str().unwrap();
+    let ledger = f.ledger.to_str().unwrap();
+
+    // Validly signed 2-hop chain with widened child action -> fails attenuation in verify_mandate_chain_with.
+    let root_kp = Ed25519Keypair::generate();
+    let mid_kp = Ed25519Keypair::generate();
+    let leaf_kp = Ed25519Keypair::generate();
+    let valid_from = parse_rfc3339_utc("2026-01-01T00:00:00Z").unwrap();
+    let valid_until = parse_rfc3339_utc("2027-01-01T00:00:00Z").unwrap();
+    let root_text = format!(
+        "HANDFEST v1\n\
+         FROM human \"Root\" (key: {})\n\
+         TO agent \"Mid\" (key: {})\n\
+         DELEGATION max 1 hop\n\
+         ALLOW ops.run\n\
+         ON target \"staging\"\n",
+        root_kp.key_id(),
+        mid_kp.key_id(),
+    );
+    let root_id = parse_canonical(&root_text)
+        .unwrap()
+        .try_mandate_id()
+        .unwrap();
+    let root_signed = root_kp
+        .sign_mandate(&root_text, "r13-attenuation-root", valid_from, valid_until)
+        .unwrap();
+    let widened_child_text = format!(
+        "HANDFEST v1\n\
+         PARENT {root_id}\n\
+         FROM agent \"Mid\" (key: {})\n\
+         TO agent \"Leaf\" (key: {})\n\
+         DELEGATION max 0 hops\n\
+         ALLOW ops.*\n\
+         ON target \"staging\"\n",
+        mid_kp.key_id(),
+        leaf_kp.key_id(),
+    );
+    let child_signed = mid_kp
+        .sign_mandate(
+            &widened_child_text,
+            "r13-attenuation-child",
+            valid_from,
+            valid_until,
+        )
+        .unwrap();
+    let atten_root_path = dir.path().join("atten-root.signed.json");
+    let atten_child_path = dir.path().join("atten-child.signed.json");
+    fs::write(
+        &atten_root_path,
+        serde_json::to_string(&root_signed).unwrap(),
+    )
+    .unwrap();
+    fs::write(
+        &atten_child_path,
+        serde_json::to_string(&child_signed).unwrap(),
+    )
+    .unwrap();
+    let leaf_actor = leaf_kp.key_id().to_string();
+    let (code, msg) = run_expect_failure(&[
+        "--chain",
+        atten_root_path.to_str().unwrap(),
+        atten_child_path.to_str().unwrap(),
+        "--ledger",
+        ledger,
+        "--actor-key",
+        &leaf_actor,
+        "--policy-map",
+        policy,
+        "--",
+        "true",
+    ]);
+    assert_eq!(code, "chain_invalid");
+    assert!(
+        msg.contains("startup mandate chain verification failed"),
+        "expected attenuation failure detail, got: {msg}"
+    );
 }

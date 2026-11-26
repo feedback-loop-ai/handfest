@@ -690,13 +690,20 @@ mod registry_tests {
         // 1. Spoofed assurance (verifier upgrades passkey -> qualified_qes)
         let mut v = MutatingStubVerifier::clean();
         v.override_assurance = Some(AssuranceLevel::QualifiedQes);
+        let assurance_err = verify_with_stub(&base_signed, v).unwrap_err();
         assert_eq!(
-            verify_with_stub(&base_signed, v),
-            Err(AnchorError::UnsupportedAssurance {
+            assurance_err,
+            AnchorError::UnsupportedAssurance {
                 expected: AssuranceLevel::Passkey,
                 actual: AssuranceLevel::QualifiedQes,
-            })
+            }
         );
+        let assurance_msg = assurance_err.to_string();
+        assert_eq!(
+            assurance_msg,
+            "unsupported assurance level: expected Passkey, got QualifiedQes"
+        );
+        assert!(!assurance_msg.contains("Ed25519"));
 
         // 2a. Empty and control-char anchor_id isolated from mismatch (signed.anchor_id matches!)
         for bad_anchor in ["", "bad\nid"] {
@@ -724,44 +731,66 @@ mod registry_tests {
         mismatched_env.signer_key = "passkey:other".to_string();
         let mut v = MutatingStubVerifier::clean();
         v.override_signer_key = Some(KeyId::parse("passkey:cred1").unwrap());
+        let signer_env_err = verify_with_stub(&mismatched_env, v).unwrap_err();
         assert_eq!(
-            verify_with_stub(&mismatched_env, v),
-            Err(AnchorError::SignerMismatch {
+            signer_env_err,
+            AnchorError::SignerMismatch {
                 expected: "passkey:other".to_string(),
                 actual: "passkey:cred1".to_string(),
-            })
+            }
+        );
+        assert_eq!(
+            signer_env_err.to_string(),
+            "signer key mismatch: expected 'passkey:other', got 'passkey:cred1'"
         );
         // 3b. Mismatched signer_key (proof != ast.from) isolated from envelope binding:
         // `vm.proof.signer_key == signed.signer_key` ("passkey:other"), ONLY `ast.from().key()` differs.
+        let signer_ast_err =
+            verify_with_stub(&mismatched_env, MutatingStubVerifier::clean()).unwrap_err();
         assert_eq!(
-            verify_with_stub(&mismatched_env, MutatingStubVerifier::clean()),
-            Err(AnchorError::SignerMismatch {
+            signer_ast_err,
+            AnchorError::SignerMismatch {
                 expected: "passkey:cred1".to_string(),
                 actual: "passkey:other".to_string(),
-            })
+            }
+        );
+        assert_eq!(
+            signer_ast_err.to_string(),
+            "signer key mismatch: expected 'passkey:cred1', got 'passkey:other'"
         );
 
         // 4a. Mismatched actor_kind (proof != envelope) isolated from AST binding:
         // `vm.proof.actor_kind == ast.from().kind()` (Human), ONLY `signed.actor_kind` differs.
         let mut wrong_kind_env = base_signed.clone();
         wrong_kind_env.actor_kind = "agent".to_string();
+        let kind_env_err =
+            verify_with_stub(&wrong_kind_env, MutatingStubVerifier::clean()).unwrap_err();
         assert_eq!(
-            verify_with_stub(&wrong_kind_env, MutatingStubVerifier::clean()),
-            Err(AnchorError::ActorKindMismatch {
+            kind_env_err,
+            AnchorError::ActorKindMismatch {
                 expected: ActorKind::Agent,
                 actual: ActorKind::Human,
-            })
+            }
+        );
+        assert_eq!(
+            kind_env_err.to_string(),
+            "actor kind mismatch: expected Agent, got Human"
         );
         // 4b. Mismatched actor_kind (proof != ast.from) isolated from envelope binding:
         // `vm.proof.actor_kind == signed.actor_kind` (Agent), ONLY `ast.from().kind()` differs.
         let mut v = MutatingStubVerifier::clean();
         v.override_actor_kind = Some(ActorKind::Agent);
+        let kind_ast_err = verify_with_stub(&wrong_kind_env, v).unwrap_err();
         assert_eq!(
-            verify_with_stub(&wrong_kind_env, v),
-            Err(AnchorError::ActorKindMismatch {
+            kind_ast_err,
+            AnchorError::ActorKindMismatch {
                 expected: ActorKind::Human,
                 actual: ActorKind::Agent,
-            })
+            }
+        );
+        assert_eq!(
+            kind_ast_err.to_string(),
+            "actor kind mismatch: expected Human, got Agent"
         );
     }
 
@@ -878,10 +907,14 @@ mod registry_tests {
         // Invalid signer_key in envelope is rejected directly by verify_verifier_postconditions.
         let mut bad_key_signed = signed.clone();
         bad_key_signed.signer_key = "not-a-key-id".to_string();
-        assert!(matches!(
-            verify_verifier_postconditions(&bad_key_signed, &direct),
-            Err(AnchorError::InvalidPublicKey(_))
-        ));
+        let bad_key_err = verify_verifier_postconditions(&bad_key_signed, &direct).unwrap_err();
+        assert!(matches!(bad_key_err, AnchorError::InvalidPublicKey(_)));
+        let bad_key_msg = bad_key_err.to_string();
+        assert!(
+            bad_key_msg.starts_with("invalid anchor public key:")
+                && !bad_key_msg.contains("Ed25519"),
+            "unexpected scheme-agnostic public key diagnostic: {bad_key_msg}"
+        );
 
         // Gate evaluation still denies the empty [t, t) validity window at `now = t`.
         let (verdict, _) = authorize(
@@ -899,7 +932,7 @@ mod registry_tests {
         );
         assert!(matches!(
             verdict,
-            Verdict::Deny { ref reason } if reason.contains("outside anchor proof validity window")
+            Verdict::Deny { ref reason } if reason.contains("invalid anchor proof validity window")
         ));
     }
 }

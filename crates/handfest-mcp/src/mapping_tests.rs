@@ -340,3 +340,54 @@ fn single_pass_exact_json_decoder_rejects_malformed_shapes() {
         );
     }
 }
+
+#[test]
+fn serde_deserialize_rejects_duplicate_map_keys() {
+    let valid = r#"{
+        "tools": {
+            "pay": {
+                "action": "finance.pay",
+                "resource_kind": "account",
+                "resource_id_arg": "acct",
+                "arg_facts": {
+                    "amount": { "field": "resource.amount", "type": "decimal" }
+                },
+                "static_facts": {
+                    "context.env": { "str": "prod" }
+                }
+            }
+        }
+    }"#;
+    let parsed: ToolPolicyMap = serde_json::from_str(valid).expect("unique keys deserialize");
+    assert_eq!(parsed.tools.len(), 1);
+    assert_eq!(parsed.tools["pay"].arg_facts.len(), 1);
+    assert_eq!(parsed.tools["pay"].static_facts.len(), 1);
+
+    let dup_tools = r#"{"tools":{"a":{"action":"x.y","resource_kind":"r","static_resource_id":"1"},"a":{"action":"x.z","resource_kind":"r","static_resource_id":"2"}}}"#;
+    let err = serde_json::from_str::<ToolPolicyMap>(dup_tools).unwrap_err();
+    assert!(
+        err.to_string().contains("duplicate key 'a'"),
+        "expected duplicate key error for tools, got: {err}"
+    );
+
+    let dup_arg_facts = r#"{"tools":{"a":{"action":"x.y","resource_kind":"r","static_resource_id":"1","arg_facts":{"x":{"field":"f.x","type":"str"},"x":{"field":"f.y","type":"int"}}}}}"#;
+    let err = serde_json::from_str::<ToolPolicyMap>(dup_arg_facts).unwrap_err();
+    assert!(
+        err.to_string().contains("duplicate key 'x'"),
+        "expected duplicate key error for arg_facts, got: {err}"
+    );
+
+    let dup_static_facts = r#"{"tools":{"a":{"action":"x.y","resource_kind":"r","static_resource_id":"1","static_facts":{"env":{"str":"prod"},"env":{"str":"dev"}}}}}"#;
+    let err = serde_json::from_str::<ToolPolicyMap>(dup_static_facts).unwrap_err();
+    assert!(
+        err.to_string().contains("duplicate key 'env'"),
+        "expected duplicate key error for static_facts, got: {err}"
+    );
+
+    let non_object = r#"{"tools":[]}"#;
+    let err = serde_json::from_str::<ToolPolicyMap>(non_object).unwrap_err();
+    assert!(
+        err.to_string().contains("a JSON object with unique keys"),
+        "expected map visitor expecting message, got: {err}"
+    );
+}

@@ -138,9 +138,9 @@ pub struct ToolPolicy {
     pub resource_id_arg: Option<String>,
     #[serde(default)]
     pub static_resource_id: Option<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_unique_btreemap")]
     pub arg_facts: BTreeMap<String, FactSpec>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_unique_btreemap")]
     pub static_facts: BTreeMap<String, TypedScalar>,
 }
 
@@ -271,10 +271,43 @@ impl ToolPolicy {
     }
 }
 
+fn deserialize_unique_btreemap<'de, D, V>(de: D) -> Result<BTreeMap<String, V>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    V: Deserialize<'de>,
+{
+    struct UniqueMapVisitor<V>(std::marker::PhantomData<V>);
+
+    impl<'de, V: Deserialize<'de>> serde::de::Visitor<'de> for UniqueMapVisitor<V> {
+        type Value = BTreeMap<String, V>;
+
+        fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.write_str("a JSON object with unique keys")
+        }
+
+        fn visit_map<A>(self, mut access: A) -> Result<Self::Value, A::Error>
+        where
+            A: serde::de::MapAccess<'de>,
+        {
+            let mut map = BTreeMap::new();
+            while let Some((key, value)) = access.next_entry::<String, V>()? {
+                if map.contains_key(&key) {
+                    return Err(serde::de::Error::custom(format!("duplicate key '{key}'")));
+                }
+                map.insert(key, value);
+            }
+            Ok(map)
+        }
+    }
+
+    de.deserialize_map(UniqueMapVisitor(std::marker::PhantomData))
+}
+
 /// JSON-deserializable mapping from admitted upstream MCP tool names to [`ToolPolicy`] rules.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ToolPolicyMap {
+    #[serde(deserialize_with = "deserialize_unique_btreemap")]
     pub tools: BTreeMap<String, ToolPolicy>,
 }
 
