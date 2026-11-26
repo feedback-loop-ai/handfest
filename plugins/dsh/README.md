@@ -9,7 +9,7 @@ This plugin wraps upstream MCP servers in `dsh` behind `handfest-mcp` so every t
 
 ## Setup
 
-1. Ensure `handfest` (`crates/handfest-cli` on `main`) and `handfest-mcp` (planned `crates/handfest-mcp`, not yet shipped in this workspace) are installed and on `PATH`.
+1. Ensure `handfest` (`crates/handfest-cli`) and `handfest-mcp` (`crates/handfest-mcp`, built with `cargo build --release -p handfest-mcp`) are installed and on `PATH`.
 2. Out-of-band, create keys and sign a `HANDFEST v1` mandate for your `dsh` agent's public `KeyId`:
    ```bash
    handfest keygen --out ~/.handfest/human.key.json

@@ -37,8 +37,8 @@ import datetime, errno, json, os, re, shutil, subprocess, unicodedata
 
 IDENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_-]*\Z", re.ASCII)
 RFC3339_RE = re.compile(r"^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})Z\Z", re.ASCII)
-DECIMAL_NUM_RE = re.compile(r"^-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?\Z", re.ASCII)
-DECIMAL_STR_RE = re.compile(r"^-?(?:0|[1-9]\d*)\.\d+\Z", re.ASCII)
+DECIMAL_NUM_RE = re.compile(r"^-?(?:0|[1-9]\d*)(?:\.\d+)?(?:[eE][+-]?\d+)?\Z", re.ASCII)
+DECIMAL_STR_RE = re.compile(r"^-?(?:0|[1-9]\d*)(?:\.\d+)?\Z", re.ASCII)
 RECEIPT_HASH_RE = re.compile(r"^sha256:[0-9a-f]{64}\Z", re.ASCII)
 I64_MIN, I64_MAX = -(1 << 63), (1 << 63) - 1
 I128_MIN, I128_MAX = -(1 << 127), (1 << 127) - 1
@@ -259,8 +259,6 @@ def parse_decimal(raw: str, code: str, ctx: str, allow_exponent: bool = False) -
     neg = mant_part.startswith("-")
     unsigned = mant_part[1:] if neg else mant_part
     int_digits, frac_digits = unsigned.split(".", 1) if "." in unsigned else (unsigned, "")
-    if not allow_exponent and len(frac_digits) > MAX_DEC_SCALE:
-        raise HookError(code, f"{ctx}: decimal fractional scale exceeds {MAX_DEC_SCALE} '{raw}'")
     digits = (int_digits + frac_digits).lstrip("0")
     if not digits:
         if neg:

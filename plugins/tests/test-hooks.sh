@@ -490,8 +490,14 @@ assert_all_paths_safe(cc_settings, "settings.example.json")
 
 def assert_mcp_args_safe(args, loc):
     assert "--" in args, f"{loc} must separate upstream server command with '--'"
-    proxy_args = args[:args.index("--")]
+    sep_idx = args.index("--")
+    proxy_args = args[:sep_idx]
+    upstream_args = args[sep_idx + 1:]
+    assert upstream_args and all(isinstance(a, str) and a for a in upstream_args), (
+        f"{loc} must provide a non-empty upstream command after '--'"
+    )
     path_flags = {"--chain", "--ledger", "--policy-map"}
+    required_flags = path_flags | {"--actor-key"}
     seen_flags = set()
     i = 0
     while i < len(proxy_args):
@@ -505,8 +511,21 @@ def assert_mcp_args_safe(args, loc):
             assert_safe_outside_path(proxy_args[i + 1], f"{loc} {arg}")
             i += 2
             continue
+        if arg == "--actor-key":
+            assert "--actor-key" not in seen_flags, f"{loc} duplicates --actor-key"
+            seen_flags.add(arg)
+            assert i + 1 < len(proxy_args), f"{loc} missing value after --actor-key"
+            actor_key = proxy_args[i + 1]
+            assert isinstance(actor_key, str) and actor_key.startswith("ed25519:") and len(actor_key) > len("ed25519:"), (
+                f"{loc} --actor-key must be a non-empty public KeyId (ed25519:...), got {actor_key!r}"
+            )
+            assert "/" not in actor_key and not actor_key.endswith(".key.json"), (
+                f"{loc} --actor-key must be a public KeyId, not a key file path: {actor_key!r}"
+            )
+            i += 2
+            continue
         i += 1
-    assert seen_flags == path_flags, f"{loc} must include {sorted(path_flags)}, got {sorted(seen_flags)}"
+    assert seen_flags == required_flags, f"{loc} must include {sorted(required_flags)}, got {sorted(seen_flags)}"
 
 for mcp_rel in ("plugins/claude-code/mcp.example.json", "plugins/dsh/mcp.example.json", "plugins/agy/mcp.example.json"):
     srv = loaded[mcp_rel]["mcpServers"]["github-handfest"]
@@ -582,12 +601,13 @@ assert_eq "decimal int-15 permit rc" "$HOOK_RC" "0"
 assert_json "decimal int-15 stdout" "$(cat "$TMP_DIR/stdout.txt")" "d['verdict'] == 'permit'"
 assert_json "decimal int-15 formatted" "$(cat "$CAPTURED_FACTS")" "d['resource.amount'] == {'decimal': '15.0'}"
 
-# Zero, trailing zeros up to scale 28 in strings, bare JSON number 1. + 127 zeros, scale 28, and mixed "12.34"
+# Zero, integer-like decimal strings ("0", "1"), trailing zeros (including >28 redundant trailing zeros), scale 28, and bare JSON number 1. + 127 zeros
 MAX_SCALE_ZEROS="$(python3 -I -c 'print("1." + "0" * 28)')"
 OVER_SCALE_ONE_ZEROS="$(python3 -I -c 'print("1." + "0" * 29)')"
 OVER_SCALE_ZERO_ZEROS="$(python3 -I -c 'print("0." + "0" * 29)')"
+OVER_SCALE_SIG_ONE="$(python3 -I -c 'print("1." + "0" * 28 + "1")')"
 LONG_ZEROS="$(python3 -I -c 'print("1." + "0" * 127)')"
-for amt_json in '0' '"1.0000000000000000000"' '"0.0000000000000000000000000001"' "\"$MAX_SCALE_ZEROS\"" "$LONG_ZEROS"; do
+for amt_json in '0' '"0"' '"1"' '"1.0000000000000000000"' '"0.0000000000000000000000000001"' "\"$MAX_SCALE_ZEROS\"" "\"$OVER_SCALE_ONE_ZEROS\"" "\"$OVER_SCALE_ZERO_ZEROS\"" "\"$LONG_ZEROS\"" "$LONG_ZEROS"; do
   HOOK_RC=0
   rm -f "$CAPTURED_FACTS"
   HANDFEST_BIN="$CAPTURE_SHIM" HANDFEST_POLICY_MAP="$PAY_MAP" HANDFEST_LEDGER="$PAY_LEDGER" HANDFEST_CHAIN="$PAY_SIGNED" \
@@ -595,14 +615,12 @@ for amt_json in '0' '"1.0000000000000000000"' '"0.0000000000000000000000000001"'
     >"$TMP_DIR/stdout.txt" 2>"$TMP_DIR/stderr.txt" || HOOK_RC=$?
   assert_eq "decimal norm $amt_json rc" "$HOOK_RC" "0"
   assert_json "decimal norm $amt_json stdout" "$(cat "$TMP_DIR/stdout.txt")" "d['verdict'] == 'permit'"
-  if [[ "$amt_json" == "0" ]]; then
+  if [[ "$amt_json" == "0" || "$amt_json" == '"0"' || "$amt_json" == "\"$OVER_SCALE_ZERO_ZEROS\"" ]]; then
     assert_json "decimal zero formatted" "$(cat "$CAPTURED_FACTS")" "d['resource.amount'] == {'decimal': '0.0'}"
-  elif [[ "$amt_json" == '"1.0000000000000000000"' ]]; then
-    assert_json "decimal trailing zeros formatted" "$(cat "$CAPTURED_FACTS")" "d['resource.amount'] == {'decimal': '1.0'}"
   elif [[ "$amt_json" == '"0.0000000000000000000000000001"' ]]; then
     assert_json "decimal scale 28 formatted" "$(cat "$CAPTURED_FACTS")" "d['resource.amount'] == {'decimal': '0.0000000000000000000000000001'}"
-  elif [[ "$amt_json" == "\"$MAX_SCALE_ZEROS\"" || "$amt_json" == "$LONG_ZEROS" ]]; then
-    assert_json "decimal trailing zeros formatted" "$(cat "$CAPTURED_FACTS")" "d['resource.amount'] == {'decimal': '1.0'}"
+  else
+    assert_json "decimal one formatted" "$(cat "$CAPTURED_FACTS")" "d['resource.amount'] == {'decimal': '1.0'}"
   fi
 done
 
@@ -644,8 +662,8 @@ assert_eq "decimal bare sci over-scale 1e-29 rc" "$HOOK_RC" "2"
 assert_json "decimal bare sci over-scale 1e-29 stderr" "$(cat "$TMP_DIR/stderr.txt")" "d['verdict'] == 'deny' and d['code'] == 'invalid_argument'"
 assert_eq "decimal bare sci over-scale 1e-29 handfest not invoked" "$([[ -e "$NO_CALL_MARKER" ]] && echo called || echo not-called)" "not-called"
 
-# Reject integer-like typed decimal strings without '.', leading-zero decimals ("00.5"), negative zero (-0.0, -0.00, -0, -0e0), quoted scientific notation "1.5e1", pathological exponents, raw fractional scale > 28, i128::MAX+1, and i128::MIN-1
-for bad_amt in '"1"' '"-1"' '"0"' '"00.5"' '"-00.5"' '"01.5"' '"-0.0"' '"-0.00"' '-0.0' '-0.00' '-0' '-0e0' '"1.5e1"' '1e1000000' '"1e1000000"' '"0.00000000000000000000000000001"' "\"$OVER_SCALE_ONE_ZEROS\"" "\"$OVER_SCALE_ZERO_ZEROS\"" "\"$LONG_ZEROS\"" '"170141183460469231731687303715884105728.0"' '"-170141183460469231731687303715884105729.0"'; do
+# Reject leading-zero decimals ("00", "01", "-01", "00.5", "01.5"), negative zero ("-0", "-0.0", "-0.00", -0.0, -0.00, -0, -0e0), quoted scientific notation "1.5e1", pathological exponents, canonical fractional scale > 28, i128::MAX+1, and i128::MIN-1
+for bad_amt in '"-0"' '"00"' '"01"' '"-01"' '"00.5"' '"-00.5"' '"01.5"' '"-0.0"' '"-0.00"' '-0.0' '-0.00' '-0' '-0e0' '"1.5e1"' '1e1000000' '"1e1000000"' '"0.00000000000000000000000000001"' "\"$OVER_SCALE_SIG_ONE\"" '"170141183460469231731687303715884105728"' '"-170141183460469231731687303715884105729"' '"170141183460469231731687303715884105728.0"' '"-170141183460469231731687303715884105729.0"'; do
   HOOK_RC=0
   HANDFEST_POLICY_MAP="$PAY_MAP" HANDFEST_LEDGER="$PAY_LEDGER" HANDFEST_CHAIN="$PAY_SIGNED" \
     "$HOOK" <<<"{\"tool_name\":\"charge_card\",\"tool_input\":{\"currency\":\"USD\",\"approved\":true,\"scheduled_at\":\"2026-11-24T18:30:00Z\",\"amount\":$bad_amt}}" \
@@ -653,6 +671,38 @@ for bad_amt in '"1"' '"-1"' '"0"' '"00.5"' '"-00.5"' '"01.5"' '"-0.0"' '"-0.00"'
   assert_eq "bad decimal $bad_amt rc" "$HOOK_RC" "2"
   assert_json "bad decimal $bad_amt stderr" "$(cat "$TMP_DIR/stderr.txt")" "d['verdict'] == 'deny' and d['code'] == 'invalid_argument'"
 done
+
+# Parity with handfest-mcp and handfest-cli (handfest_core::json_num::parse_decimal_str):
+# static_facts decimal strings without '.' ("1", "0", "-1") are accepted and canonically normalized.
+STATIC_DEC_MAP="$TMP_DIR/static-int-decimal-map.json"
+cat <<'STATIC_DEC_MAP_EOF' >"$STATIC_DEC_MAP"
+{
+  "tools": {
+    "charge_card": {
+      "action": "billing.charge",
+      "resource_kind": "account",
+      "static_resource_id": "acct-prod",
+      "static_facts": {
+        "resource.currency": { "str": "USD" },
+        "resource.approved": { "bool": true },
+        "resource.scheduled_at": { "timestamp": "2026-11-24T18:30:00Z" },
+        "resource.amount": { "decimal": "1" },
+        "resource.zero": { "decimal": "0" },
+        "resource.offset": { "decimal": "-1" }
+      }
+    }
+  }
+}
+STATIC_DEC_MAP_EOF
+STATIC_DEC_LEDGER="$TMP_DIR/static-int-decimal-ledger.sqlite"
+HOOK_RC=0
+rm -f "$CAPTURED_FACTS"
+HANDFEST_ALLOW_CREATE_LEDGER=1 HANDFEST_BIN="$CAPTURE_SHIM" HANDFEST_POLICY_MAP="$STATIC_DEC_MAP" HANDFEST_LEDGER="$STATIC_DEC_LEDGER" HANDFEST_CHAIN="$PAY_SIGNED" \
+  "$HOOK" <<<'{"tool_name":"charge_card","tool_input":{}}' \
+  >"$TMP_DIR/stdout.txt" 2>"$TMP_DIR/stderr.txt" || HOOK_RC=$?
+assert_eq "static_facts integer-like decimal strings permit rc" "$HOOK_RC" "0"
+assert_json "static_facts integer-like decimal strings stdout" "$(cat "$TMP_DIR/stdout.txt")" "d['verdict'] == 'permit'"
+assert_json "static_facts integer-like decimal strings formatted" "$(cat "$CAPTURED_FACTS")" "d['resource.amount'] == {'decimal': '1.0'} and d['resource.zero'] == {'decimal': '0.0'} and d['resource.offset'] == {'decimal': '-1.0'}"
 
 # Reject negative zero in static_facts {"decimal": "-0.0"} and integer tool argument -0
 NEG_ZERO_MAP="$TMP_DIR/neg-zero-map.json"
@@ -1066,16 +1116,35 @@ if [[ -e "$TOCTOU_LEDGER" ]]; then
   exit 1
 fi
 # (f) 2-symlink cycle (ELOOP) must fall through to `handfest check --require-existing-ledger`
-#     and fail closed with gate_error (NOT missing_ledger).
+#     and fail closed with gate_error (NOT missing_ledger). Record argv to prove CLI delegation.
 LOOP_A="$TMP_DIR/loop_a.sqlite"
 LOOP_B="$TMP_DIR/loop_b.sqlite"
 ln -s "$LOOP_B" "$LOOP_A"
 ln -s "$LOOP_A" "$LOOP_B"
+ELOOP_ARGV_FILE="$TMP_DIR/eloop-handfest-argv.txt"
+ELOOP_WRAPPER="$TMP_DIR/eloop-record-handfest.sh"
+cat <<ELOOP_EOF >"$ELOOP_WRAPPER"
+#!/usr/bin/env bash
+set -euo pipefail
+printf '%s\n' "\$@" >"$ELOOP_ARGV_FILE"
+exec "$HANDFEST_BIN" "\$@"
+ELOOP_EOF
+chmod +x "$ELOOP_WRAPPER"
+rm -f "$ELOOP_ARGV_FILE"
 HOOK_RC=0
-HANDFEST_LEDGER="$LOOP_A" "$HOOK" <<<"$VALID_PAYLOAD" >"$TMP_DIR/stdout.txt" 2>"$TMP_DIR/stderr.txt" || HOOK_RC=$?
+HANDFEST_BIN="$ELOOP_WRAPPER" HANDFEST_LEDGER="$LOOP_A" "$HOOK" <<<"$VALID_PAYLOAD" >"$TMP_DIR/stdout.txt" 2>"$TMP_DIR/stderr.txt" || HOOK_RC=$?
 assert_eq "symlink cycle ledger rc" "$HOOK_RC" "2"
 assert_eq "symlink cycle ledger stdout empty" "$(cat "$TMP_DIR/stdout.txt")" ""
 assert_strict_rfc8259_json_line "symlink cycle ledger stderr" "$TMP_DIR/stderr.txt" "d['verdict'] == 'deny' and d['code'] == 'gate_error'"
+python3 -I - "$ELOOP_ARGV_FILE" "$LOOP_A" <<'PY_ELOOP_ARGV'
+import pathlib, sys
+argv_path, loop_ledger = pathlib.Path(sys.argv[1]), sys.argv[2]
+assert argv_path.is_file(), "expected pre-tool-use.sh to delegate ELOOP ledger to handfest check"
+argv = argv_path.read_text(encoding="utf-8").splitlines()
+assert argv[:1] == ["check"], f"expected handfest subcommand 'check', got {argv!r}"
+assert "--require-existing-ledger" in argv, f"expected --require-existing-ledger in {argv!r}"
+assert f"--ledger={loop_ledger}" in argv, f"expected --ledger={loop_ledger} in {argv!r}"
+PY_ELOOP_ARGV
 pass "Missing, 0-byte truncated, empty-schema SQLite, deleted, hook-to-CLI TOCTOU, and symlink-cycle HANDFEST_LEDGER all failed closed (exit 2) and blocked quota reset"
 
 # Test 29: Closed stderr pipe (EPIPE), closed fd 2>&-, stdout >/dev/full, and python3-only PATH (no cat)
