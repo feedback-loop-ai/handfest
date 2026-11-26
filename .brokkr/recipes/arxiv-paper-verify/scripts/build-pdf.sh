@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Single-responsibility deterministic gate 4: build-pdf
 # Compiles docs/paper/handfest-ricardian-mandates.tex with tectonic and fails
-# on any TeX error, undefined reference/citation (??), or severe Overfull \hbox (>10pt).
+# on any TeX error, undefined reference/citation (??), or severe Overfull \hbox (>0.5pt).
 set -euo pipefail
 export PATH="$HOME/.local/bin:$HOME/.cargo/bin:$PATH"
 
@@ -63,6 +63,6 @@ report_path.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
 if errors:
     out = {"result": "fail", "notes": "build-pdf failed:\n" + "\n".join(f"- {e}" for e in errors)}
 else:
-    out = {"result": "pass", "notes": f"build-pdf passed: {report['pdf_bytes']} bytes, 0 undefined refs/cites, 0 severe overfull hboxes (>10pt)"}
+    out = {"result": "pass", "notes": f"build-pdf passed: {report['pdf_bytes']} bytes, 0 undefined refs/cites, 0 severe overfull hboxes (>0.5pt)"}
 result_path.write_text(json.dumps(out) + "\n", encoding="utf-8")
 PY

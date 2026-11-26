@@ -52,6 +52,10 @@ for key, info in sorted(entries.items()):
     doi = f.get("doi", "").strip()
     eprint = f.get("eprint", "").strip()
     url = f.get("url", "").strip()
+    if not url:
+        m_url = re.search(r"https?://[^\s},\"]+", f.get("note", "") + " " + f.get("howpublished", ""))
+        if m_url:
+            url = m_url.group(0).rstrip(".,;")
 
     if doi:
         api = f"https://api.crossref.org/works/{urllib.parse.quote(doi, safe='')}"

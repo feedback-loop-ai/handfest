@@ -59,7 +59,7 @@
         "pass",
         "fail"
       ],
-      "class": "gate",
+      "class": "work",
       "limits": {
         "max_attempts": 2,
         "timeout_seconds": 600
@@ -73,24 +73,6 @@
           "bash",
           "./scripts/check-links.sh",
           "{prompt_file}"
-        ]
-      },
-      "hands": {
-        "kind": "workspace",
-        "network": true,
-        "binds": [
-          {
-            "path": "~/.cargo",
-            "mode": "overlay",
-            "mask": [
-              "credentials.toml",
-              "credentials"
-            ]
-          },
-          {
-            "path": "~/.rustup",
-            "mode": "ro"
-          }
         ]
       }
     },
@@ -139,7 +121,7 @@
         "pass",
         "fail"
       ],
-      "class": "gate",
+      "class": "work",
       "limits": {
         "max_attempts": 2,
         "timeout_seconds": 900
@@ -153,32 +135,6 @@
           "bash",
           "./scripts/build-pdf.sh",
           "{prompt_file}"
-        ]
-      },
-      "hands": {
-        "kind": "workspace",
-        "network": true,
-        "binds": [
-          {
-            "path": "~/.cargo",
-            "mode": "overlay",
-            "mask": [
-              "credentials.toml",
-              "credentials"
-            ]
-          },
-          {
-            "path": "~/.rustup",
-            "mode": "ro"
-          },
-          {
-            "path": "~/.local/bin",
-            "mode": "ro"
-          },
-          {
-            "path": "~/.cache/Tectonic",
-            "mode": "rw"
-          }
         ]
       }
     },
