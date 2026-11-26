@@ -502,17 +502,7 @@ fn tools_call_deny_without_forwarding_lossless_decimal_and_quotas() {
     assert_eq!(responses.len(), 6);
 
     for denied_idx in [0usize, 1, 2, 5] {
-        let resp = &responses[denied_idx];
-        assert_eq!(resp["error"]["code"], json!(HANDFEST_DENIED_ERROR_CODE));
-        assert!(resp["error"]["message"]
-            .as_str()
-            .unwrap()
-            .starts_with("handfest denied: "));
-        let receipt_hash = resp["error"]["data"]["receipt_hash"]
-            .as_str()
-            .expect("denied response includes receipt_hash");
-        assert!(receipt_hash.starts_with("sha256:"));
-        assert!(resp["error"]["data"]["reason"].as_str().is_some());
+        assert_denied_with_receipt(&responses[denied_idx]);
     }
     assert_eq!(
         responses[1]["error"]["data"]["reason"],
@@ -839,26 +829,7 @@ fn subprocess_binary_smoke_test() {
         .spawn()
         .expect("spawn handfest-mcp binary");
 
-    {
-        let mut stdin = child.stdin.take().unwrap();
-        writeln!(
-            stdin,
-            r#"{{"jsonrpc":"2.0","id":1,"method":"initialize","params":{{}}}}"#
-        )
-        .unwrap();
-        writeln!(
-            stdin,
-            r#"{{"jsonrpc":"2.0","method":"notifications/initialized"}}"#
-        )
-        .unwrap();
-        writeln!(
-            stdin,
-            r#"{{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{{}}}}"#
-        )
-        .unwrap();
-        writeln!(stdin, r#"{{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{{"name":"merge_pr","arguments":{{"repo":"org/app"}}}}}}"#).unwrap();
-        writeln!(stdin, r#"{{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{{"name":"delete_repo","arguments":{{"repo":"org/app"}}}}}}"#).unwrap();
-    }
+    write_smoke_session_frames(child.stdin.take().unwrap());
 
     let output = child.wait_with_output().expect("wait handfest-mcp");
     assert!(
@@ -1993,4 +1964,29 @@ fn custom_receipt_ledger_and_anchor_verifier_work_without_sqlite_or_ed25519() {
         mapping_receipt.prev_receipt_hash,
         Some(proxy.ledger().receipts[1].receipt_hash)
     );
+}
+
+fn assert_denied_with_receipt(resp: &Value) {
+    assert_eq!(resp["error"]["code"], json!(HANDFEST_DENIED_ERROR_CODE));
+    assert!(resp["error"]["message"]
+        .as_str()
+        .unwrap()
+        .starts_with("handfest denied: "));
+    let receipt_hash = resp["error"]["data"]["receipt_hash"]
+        .as_str()
+        .expect("denied response includes receipt_hash");
+    assert!(receipt_hash.starts_with("sha256:"));
+    assert!(resp["error"]["data"]["reason"].as_str().is_some());
+}
+
+fn write_smoke_session_frames(mut stdin: std::process::ChildStdin) {
+    for line in [
+        r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#,
+        r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#,
+        r#"{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}"#,
+        r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"merge_pr","arguments":{"repo":"org/app"}}}"#,
+        r#"{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"delete_repo","arguments":{"repo":"org/app"}}}"#,
+    ] {
+        writeln!(stdin, "{line}").unwrap();
+    }
 }

@@ -13,7 +13,9 @@ fn parses_and_serializes_full_rfc8259_values_and_escapes() {
     let obj = parsed.as_object().unwrap();
     assert_eq!(
         obj.get("a"),
-        Some(&ExactJson::Number("100.000000000000001".to_string()))
+        Some(&ExactJson::Number(
+            JsonNumber::parse("100.000000000000001").unwrap()
+        ))
     );
     assert_eq!(
         obj.get("c").and_then(ExactJson::as_str),
@@ -35,13 +37,13 @@ fn parses_and_serializes_full_rfc8259_values_and_escapes() {
         .unwrap()
         .as_array_mut()
         .unwrap()
-        .push(ExactJson::Number("3".to_string()));
+        .push(ExactJson::Number(JsonNumber::parse("3").unwrap()));
     assert_eq!(
         mutable.as_object().unwrap().get("arr"),
         Some(&ExactJson::Array(vec![
-            ExactJson::Number("1".to_string()),
-            ExactJson::Number("2".to_string()),
-            ExactJson::Number("3".to_string()),
+            ExactJson::Number(JsonNumber::parse("1").unwrap()),
+            ExactJson::Number(JsonNumber::parse("2").unwrap()),
+            ExactJson::Number(JsonNumber::parse("3").unwrap()),
         ]))
     );
     assert!(ExactJson::Null.as_object().is_none());
@@ -182,5 +184,69 @@ fn rejects_string_escape_and_surrogate_errors() {
         JsonError::InvalidNumber(NumberError::LeadingZero),
     ] {
         assert!(!err.to_string().is_empty());
+    }
+}
+
+#[test]
+fn json_number_validates_tokens_and_serializes_single_line() {
+    let valid = JsonNumber::parse("-123.45e+6").unwrap();
+    assert_eq!(valid.as_str(), "-123.45e+6");
+    assert_eq!(valid.to_string(), "-123.45e+6");
+    assert_eq!(ExactJson::Number(valid).to_json_string(), "-123.45e+6");
+
+    let from_i32 = JsonNumber::from(-32603);
+    assert_eq!(from_i32.as_str(), "-32603");
+    assert_eq!(ExactJson::Number(from_i32).to_json_string(), "-32603");
+
+    for invalid in [
+        "",
+        " 1",
+        "1 ",
+        "1\n2",
+        "1\r2",
+        "1,{\"injected\":true}",
+        "01",
+        "-",
+        "1.",
+        "1e+",
+        "abc",
+    ] {
+        let err = JsonNumber::parse(invalid).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                NumberError::InvalidSyntax(_) | NumberError::LeadingZero
+            ),
+            "expected syntax/leading-zero error for {invalid:?}, got {err:?}"
+        );
+    }
+}
+
+#[test]
+fn enforces_max_depth_on_empty_containers_at_entry() {
+    assert_eq!(
+        parse_exact_json_with_max_depth("1", 0),
+        Ok(ExactJson::Number(JsonNumber::parse("1").unwrap()))
+    );
+    assert_eq!(
+        parse_exact_json_with_max_depth("[]", 0),
+        Err(JsonError::MaxDepthExceeded)
+    );
+    assert_eq!(
+        parse_exact_json_with_max_depth("{}", 0),
+        Err(JsonError::MaxDepthExceeded)
+    );
+
+    assert!(parse_exact_json_with_max_depth("[]", 1).is_ok());
+    assert!(parse_exact_json_with_max_depth("{}", 1).is_ok());
+    assert!(parse_exact_json_with_max_depth("[1]", 1).is_ok());
+    assert!(parse_exact_json_with_max_depth(r#"{"a":1}"#, 1).is_ok());
+
+    for too_deep in ["[[]]", "[{}]", r#"{"a":[]}"#, r#"{"a":{}}"#, "[[1]]"] {
+        assert_eq!(
+            parse_exact_json_with_max_depth(too_deep, 1),
+            Err(JsonError::MaxDepthExceeded),
+            "expected MaxDepthExceeded for {too_deep} with max_depth=1"
+        );
     }
 }

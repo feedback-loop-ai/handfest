@@ -613,8 +613,8 @@ fn parse_arg_scalar(
         }
         (FactType::Bool, ExactJson::Bool(b)) => Scalar::Bool(*b),
         (FactType::Int, ExactJson::Number(raw)) => {
-            let parsed = parse_canonical_json_int(raw).ok_or_else(|| {
-                let detail = if is_canonical_json_int_syntax(raw) {
+            let parsed = parse_canonical_json_int(raw.as_str()).ok_or_else(|| {
+                let detail = if is_canonical_json_int_syntax(raw.as_str()) {
                     "integer outside 64-bit range"
                 } else {
                     "expected 64-bit signed integer"
@@ -624,7 +624,7 @@ fn parse_arg_scalar(
             Scalar::Int(parsed)
         }
         (FactType::Decimal, ExactJson::Number(raw)) => {
-            let dec = parse_json_decimal(raw).map_err(|err| {
+            let dec = parse_json_decimal(raw.as_str()).map_err(|err| {
                 invalid_arg(tool_name, arg_key, &format!("invalid decimal: {err}"))
             })?;
             Scalar::Decimal(dec)

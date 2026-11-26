@@ -617,6 +617,15 @@ fn merge_pr_missing_repo_records_exact_receipt_in_sqlite_and_custom_ledger_witho
         rows[0]["receipt_hash"],
         json!(expected_receipt.receipt_hash.to_string())
     );
+}
+
+#[test]
+fn merge_pr_missing_repo_records_exact_receipt_in_custom_ledger_without_upstream() {
+    let now = parse_rfc3339_utc("2026-06-01T00:00:00Z").unwrap();
+    let (verified, agent_kp) = single_hop_chain("git.*", "repo", "*", "");
+    let chain_ids = vec![verified[0].ast.try_mandate_id().unwrap()];
+    let call = b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"merge_pr\",\"arguments\":{}}}\n";
+    let expected_reason = "tool 'merge_pr': missing required resource_id argument 'repo'";
 
     let mut custom_proxy = McpProxy::new(
         verified,
@@ -744,17 +753,13 @@ fn mapping_denials_chain_with_permits_preserve_quotas_and_exact_reasons() {
     assert_eq!(responses[4]["result"]["ok"], json!(5));
 
     let actor_key = agent_kp.key_id();
-    let r1 = DecisionReceipt {
-        chain_ids: chain_ids.clone(),
-        actor_key: actor_key.clone(),
-        action: "finance.transfer".to_string(),
-        resource: "account \"acct-1\"".to_string(),
-        timestamp: now,
-        verdict: Verdict::Permit,
-        receipt_hash: MandateId([0u8; 32]),
-        prev_receipt_hash: None,
-    }
-    .compute_hash();
+    let r1 = expected_permit_hash(
+        &chain_ids,
+        &actor_key,
+        "finance.transfer",
+        "account \"acct-1\"",
+        now,
+    );
 
     let r2 = assert_chained_denial(
         &responses[1],
@@ -804,6 +809,26 @@ fn mapping_denials_chain_with_permits_preserve_quotas_and_exact_reasons() {
     assert_eq!(tr.denies, 3);
 
     assert_mixed_session_sqlite_rows(&db_path, r2, r3, r4, wrong_type_reason);
+}
+
+fn expected_permit_hash(
+    chain_ids: &[MandateId],
+    actor_key: &KeyId,
+    action: &str,
+    resource: &str,
+    timestamp: i64,
+) -> MandateId {
+    DecisionReceipt {
+        chain_ids: chain_ids.to_vec(),
+        actor_key: actor_key.clone(),
+        action: action.to_string(),
+        resource: resource.to_string(),
+        timestamp,
+        verdict: Verdict::Permit,
+        receipt_hash: MandateId([0u8; 32]),
+        prev_receipt_hash: None,
+    }
+    .compute_hash()
 }
 
 fn assert_mixed_session_sqlite_rows(

@@ -654,6 +654,38 @@ fn round8_notifications_cancelled_drops_exponent_and_decimal_request_ids() {
     proxy_thread.join().unwrap();
 }
 
+struct OneNotifReader {
+    release_rx: Option<mpsc::Receiver<()>>,
+    hold_rx: Option<mpsc::Receiver<()>>,
+    emitted: usize,
+    buf: Vec<u8>,
+    pos: usize,
+}
+
+impl Read for OneNotifReader {
+    fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
+        if self.pos >= self.buf.len() {
+            if let Some(rx) = self.release_rx.take() {
+                let _ = rx.recv();
+            }
+            self.emitted += 1;
+            if self.emitted == 1 {
+                self.buf = b"{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"pong\":1}}\n".to_vec();
+            } else if self.emitted == 2 {
+                self.buf = b"{\"jsonrpc\":\"2.0\",\"method\":\"notifications/progress\",\"params\":{\"n\":1}}\n".to_vec();
+            } else {
+                let _ = self.hold_rx.take().map(|rx| rx.recv());
+                return Ok(0);
+            }
+            self.pos = 0;
+        }
+        let n = (self.buf.len() - self.pos).min(out.len());
+        out[..n].copy_from_slice(&self.buf[self.pos..self.pos + n]);
+        self.pos += n;
+        Ok(n)
+    }
+}
+
 #[test]
 fn round8_writer_error_with_unsaturated_channel_preserves_io_error_over_upstream_eof() {
     const RAW_OS_CODE: i32 = 32;
@@ -664,38 +696,6 @@ fn round8_writer_error_with_unsaturated_channel_preserves_io_error_over_upstream
     let (release_tx, release_rx) = mpsc::sync_channel(1);
     let (_hold_tx, hold_rx) = mpsc::sync_channel(1);
     let (done_tx, done_rx) = mpsc::sync_channel(1);
-
-    struct OneNotifReader {
-        release_rx: Option<mpsc::Receiver<()>>,
-        hold_rx: Option<mpsc::Receiver<()>>,
-        emitted: usize,
-        buf: Vec<u8>,
-        pos: usize,
-    }
-
-    impl Read for OneNotifReader {
-        fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
-            if self.pos >= self.buf.len() {
-                if let Some(rx) = self.release_rx.take() {
-                    let _ = rx.recv();
-                }
-                self.emitted += 1;
-                if self.emitted == 1 {
-                    self.buf = b"{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"pong\":1}}\n".to_vec();
-                } else if self.emitted == 2 {
-                    self.buf = b"{\"jsonrpc\":\"2.0\",\"method\":\"notifications/progress\",\"params\":{\"n\":1}}\n".to_vec();
-                } else {
-                    let _ = self.hold_rx.take().map(|rx| rx.recv());
-                    return Ok(0);
-                }
-                self.pos = 0;
-            }
-            let n = (self.buf.len() - self.pos).min(out.len());
-            out[..n].copy_from_slice(&self.buf[self.pos..self.pos + n]);
-            self.pos += n;
-            Ok(n)
-        }
-    }
 
     let up_out_r = BufReader::new(OneNotifReader {
         release_rx: Some(release_rx),

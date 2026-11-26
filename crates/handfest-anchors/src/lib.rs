@@ -4,11 +4,11 @@ use std::collections::BTreeMap;
 use std::fmt;
 
 use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
-use handfest_core::ast::{
-    is_valid_quoted_str, is_valid_timestamp, KeyId, MAX_RFC3339_TIMESTAMP, MIN_RFC3339_TIMESTAMP,
-};
+use handfest_core::ast::{KeyId, MAX_RFC3339_TIMESTAMP, MIN_RFC3339_TIMESTAMP};
 use handfest_core::cnl::{parse_canonical, try_render_canonical, ParseError};
-use handfest_core::gate::{VerifiedAnchorProof, VerifiedMandate};
+use handfest_core::gate::{
+    validate_proof_shape, ProofShapeError, VerifiedAnchorProof, VerifiedMandate,
+};
 use handfest_core::ActorKind;
 use rand_core::OsRng;
 use serde::{Deserialize, Serialize};
@@ -231,8 +231,7 @@ impl Ed25519Keypair {
     ) -> Result<SignedMandate, AnchorError> {
         let ast = parse_canonical(canonical_words).map_err(AnchorError::NonCanonicalMandate)?;
         let anchor_id = anchor_id.into();
-        validate_anchor_id(&anchor_id)?;
-        validate_validity_window(valid_from, valid_until)?;
+        validate_proof_shape(&anchor_id, valid_from, valid_until).map_err(map_proof_shape_error)?;
 
         let my_key_id = self.key_id();
         if ast.from().key() != &my_key_id {
@@ -384,7 +383,12 @@ fn enforce_proof_identity_postconditions(
             actual: vm.proof.assurance,
         });
     }
-    validate_anchor_id(&vm.proof.anchor_id)?;
+    validate_proof_shape(
+        &vm.proof.anchor_id,
+        vm.proof.valid_from,
+        vm.proof.valid_until,
+    )
+    .map_err(map_proof_shape_error)?;
     if vm.proof.anchor_id != signed.anchor_id {
         return Err(AnchorError::InvalidAnchorId(format!(
             "proof anchor_id '{}' does not match envelope '{}'",
@@ -398,7 +402,6 @@ fn enforce_proof_window_and_ast_postconditions(
     signed: &SignedMandate,
     vm: &VerifiedMandate,
 ) -> Result<(), AnchorError> {
-    validate_validity_window(vm.proof.valid_from, vm.proof.valid_until)?;
     if vm.proof.valid_from != signed.valid_from || vm.proof.valid_until != signed.valid_until {
         return Err(AnchorError::InvalidValidityWindow {
             valid_from: vm.proof.valid_from,
@@ -418,8 +421,8 @@ fn enforce_proof_window_and_ast_postconditions(
 /// Verifies a single Ed25519 [`SignedMandate`] envelope and returns a [`VerifiedMandate`].
 pub fn verify_ed25519(signed: &SignedMandate) -> Result<VerifiedMandate, AnchorError> {
     let ast = parse_canonical(&signed.canonical_words).map_err(AnchorError::NonCanonicalMandate)?;
-    validate_anchor_id(&signed.anchor_id)?;
-    validate_validity_window(signed.valid_from, signed.valid_until)?;
+    validate_proof_shape(&signed.anchor_id, signed.valid_from, signed.valid_until)
+        .map_err(map_proof_shape_error)?;
 
     let actor_kind = parse_actor_kind(&signed.actor_kind)?;
     if actor_kind != ast.from().kind() {
@@ -566,34 +569,23 @@ pub const fn format_assurance(level: AssuranceLevel) -> &'static str {
     }
 }
 
-fn validate_anchor_id(anchor_id: &str) -> Result<(), AnchorError> {
-    if anchor_id.is_empty() {
-        return Err(AnchorError::InvalidAnchorId(
-            "anchor_id must not be empty".to_string(),
-        ));
-    }
-    if !is_valid_quoted_str(anchor_id) {
-        return Err(AnchorError::InvalidAnchorId(
+fn map_proof_shape_error(err: ProofShapeError) -> AnchorError {
+    match err {
+        ProofShapeError::EmptyAnchorId => {
+            AnchorError::InvalidAnchorId("anchor_id must not be empty".to_string())
+        }
+        ProofShapeError::InvalidAnchorIdChars => AnchorError::InvalidAnchorId(
             "anchor_id must not contain control characters".to_string(),
-        ));
-    }
-    Ok(())
-}
-
-fn validate_validity_window(valid_from: i64, valid_until: i64) -> Result<(), AnchorError> {
-    if !is_valid_timestamp(valid_from) {
-        return Err(AnchorError::InvalidTimestamp(valid_from));
-    }
-    if !is_valid_timestamp(valid_until) {
-        return Err(AnchorError::InvalidTimestamp(valid_until));
-    }
-    if valid_from > valid_until {
-        return Err(AnchorError::InvalidValidityWindow {
+        ),
+        ProofShapeError::TimestampOutOfRange(ts) => AnchorError::InvalidTimestamp(ts),
+        ProofShapeError::InvertedValidityWindow {
             valid_from,
             valid_until,
-        });
+        } => AnchorError::InvalidValidityWindow {
+            valid_from,
+            valid_until,
+        },
     }
-    Ok(())
 }
 
 fn parse_ed25519_key_id(raw: &str) -> Result<KeyId, AnchorError> {

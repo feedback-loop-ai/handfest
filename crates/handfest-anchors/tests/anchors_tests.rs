@@ -649,8 +649,7 @@ mod registry_tests {
         }
     }
 
-    #[test]
-    fn anchor_registry_enforces_verifier_liskov_postconditions() {
+    fn base_passkey_signed() -> (SignedMandate, i64, i64) {
         let from = parse_rfc3339_utc("2026-01-01T00:00:00Z").unwrap();
         let until = parse_rfc3339_utc("2027-01-01T00:00:00Z").unwrap();
         let ast = parse_mandate(
@@ -662,7 +661,7 @@ mod registry_tests {
              ON repo \"org/*\"\n",
         )
         .unwrap();
-        let base_signed = SignedMandate {
+        let signed = SignedMandate {
             canonical_words: try_render_canonical(&ast).unwrap(),
             anchor_id: "passkey-1".to_string(),
             assurance: "passkey".to_string(),
@@ -672,14 +671,27 @@ mod registry_tests {
             valid_until: until,
             signature_hex: "00".repeat(64),
         };
+        (signed, from, until)
+    }
+
+    fn verify_with_stub(
+        signed: &SignedMandate,
+        v: MutatingStubVerifier,
+    ) -> Result<VerifiedMandate, AnchorError> {
+        let mut reg = AnchorRegistry::new();
+        reg.register("passkey", v);
+        reg.verify(signed)
+    }
+
+    #[test]
+    fn anchor_registry_enforces_identity_and_assurance_postconditions() {
+        let (base_signed, _, _) = base_passkey_signed();
 
         // 1. Spoofed assurance (verifier upgrades passkey -> qualified_qes)
-        let mut reg = AnchorRegistry::new();
         let mut v = MutatingStubVerifier::clean();
         v.override_assurance = Some(AssuranceLevel::QualifiedQes);
-        reg.register("passkey", v);
         assert_eq!(
-            reg.verify(&base_signed),
+            verify_with_stub(&base_signed, v),
             Err(AnchorError::UnsupportedAssurance {
                 expected: AssuranceLevel::Passkey,
                 actual: AssuranceLevel::QualifiedQes,
@@ -690,63 +702,56 @@ mod registry_tests {
         for bad_anchor in ["", "bad\nid"] {
             let mut bad_signed = base_signed.clone();
             bad_signed.anchor_id = bad_anchor.to_string();
-            let mut reg = AnchorRegistry::new();
-            reg.register("passkey", MutatingStubVerifier::clean());
             assert!(
                 matches!(
-                    reg.verify(&bad_signed),
+                    verify_with_stub(&bad_signed, MutatingStubVerifier::clean()),
                     Err(AnchorError::InvalidAnchorId(ref msg)) if !msg.contains("does not match")
                 ),
                 "isolated invalid anchor_id {bad_anchor:?} must fail anchor_id validation"
             );
         }
         // 2b. Valid but mismatched anchor_id isolated from invalid syntax
-        let mut reg = AnchorRegistry::new();
         let mut v = MutatingStubVerifier::clean();
         v.override_anchor_id = Some("other-anchor".to_string());
-        reg.register("passkey", v);
         assert!(matches!(
-            reg.verify(&base_signed),
+            verify_with_stub(&base_signed, v),
             Err(AnchorError::InvalidAnchorId(ref msg)) if msg.contains("does not match")
         ));
 
         // 3. Mismatched signer_key (proof != envelope) and (proof != ast.from)
-        let mut reg = AnchorRegistry::new();
         let mut v = MutatingStubVerifier::clean();
         v.override_signer_key = Some(KeyId::parse("passkey:other").unwrap());
-        reg.register("passkey", v);
         assert!(matches!(
-            reg.verify(&base_signed),
+            verify_with_stub(&base_signed, v),
             Err(AnchorError::SignerMismatch { .. })
         ));
         let mut mismatched_env = base_signed.clone();
         mismatched_env.signer_key = "passkey:other".to_string();
-        let mut clean_reg = AnchorRegistry::new();
-        clean_reg.register("passkey", MutatingStubVerifier::clean());
         assert!(matches!(
-            clean_reg.verify(&mismatched_env),
+            verify_with_stub(&mismatched_env, MutatingStubVerifier::clean()),
             Err(AnchorError::SignerMismatch { .. })
         ));
 
         // 4. Mismatched actor_kind (proof != envelope) and (proof != ast.from)
-        let mut reg = AnchorRegistry::new();
         let mut v = MutatingStubVerifier::clean();
         v.override_actor_kind = Some(ActorKind::Agent);
-        reg.register("passkey", v);
         assert!(matches!(
-            reg.verify(&base_signed),
+            verify_with_stub(&base_signed, v),
             Err(AnchorError::ActorKindMismatch { .. })
         ));
         let mut wrong_kind_env = base_signed.clone();
         wrong_kind_env.actor_kind = "agent".to_string();
-        let mut reg = AnchorRegistry::new();
         let mut v = MutatingStubVerifier::clean();
         v.override_actor_kind = Some(ActorKind::Agent);
-        reg.register("passkey", v);
         assert!(matches!(
-            reg.verify(&wrong_kind_env),
+            verify_with_stub(&wrong_kind_env, v),
             Err(AnchorError::ActorKindMismatch { .. })
         ));
+    }
+
+    #[test]
+    fn anchor_registry_enforces_window_and_ast_postconditions() {
+        let (base_signed, from, until) = base_passkey_signed();
 
         // 5a. Out-of-range valid_from / valid_until isolated (envelope window matches proof)
         for (wf, wu) in [
@@ -756,10 +761,8 @@ mod registry_tests {
             let mut bad_signed = base_signed.clone();
             bad_signed.valid_from = wf;
             bad_signed.valid_until = wu;
-            let mut reg = AnchorRegistry::new();
-            reg.register("passkey", MutatingStubVerifier::clean());
             assert!(matches!(
-                reg.verify(&bad_signed),
+                verify_with_stub(&bad_signed, MutatingStubVerifier::clean()),
                 Err(AnchorError::InvalidTimestamp(_))
             ));
         }
@@ -767,10 +770,8 @@ mod registry_tests {
         let mut inverted_signed = base_signed.clone();
         inverted_signed.valid_from = until;
         inverted_signed.valid_until = from;
-        let mut reg = AnchorRegistry::new();
-        reg.register("passkey", MutatingStubVerifier::clean());
         assert_eq!(
-            reg.verify(&inverted_signed),
+            verify_with_stub(&inverted_signed, MutatingStubVerifier::clean()),
             Err(AnchorError::InvalidValidityWindow {
                 valid_from: until,
                 valid_until: from,
@@ -778,12 +779,10 @@ mod registry_tests {
         );
         // 5c. Mismatched window isolated (proof window itself is valid_from <= valid_until)
         for (wf, wu) in [(from + 1, until), (from, until + 1)] {
-            let mut reg = AnchorRegistry::new();
             let mut v = MutatingStubVerifier::clean();
             v.override_window = Some((wf, wu));
-            reg.register("passkey", v);
             assert_eq!(
-                reg.verify(&base_signed),
+                verify_with_stub(&base_signed, v),
                 Err(AnchorError::InvalidValidityWindow {
                     valid_from: wf,
                     valid_until: wu,
@@ -801,12 +800,10 @@ mod registry_tests {
              ON repo \"org/*\"\n",
         )
         .unwrap();
-        let mut reg = AnchorRegistry::new();
         let mut v = MutatingStubVerifier::clean();
         v.override_ast = Some(widened_ast);
-        reg.register("passkey", v);
         assert!(matches!(
-            reg.verify(&base_signed),
+            verify_with_stub(&base_signed, v),
             Err(AnchorError::NonCanonicalMandate(
                 ParseError::NonCanonical { .. }
             ))

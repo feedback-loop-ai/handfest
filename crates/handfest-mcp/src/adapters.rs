@@ -278,4 +278,16 @@ mod tests {
         );
         assert!(err.source().is_some());
     }
+
+    #[test]
+    fn verify_mandate_chain_rejects_empty_signed_chain() {
+        assert!(matches!(
+            verify_mandate_chain(&[]),
+            Err(ProxyError::Anchor(AnchorError::EmptyChain))
+        ));
+        assert!(matches!(
+            verify_mandate_chain_with(&AnchorRegistry::default_registry(), &[]),
+            Err(ProxyError::Anchor(AnchorError::EmptyChain))
+        ));
+    }
 }

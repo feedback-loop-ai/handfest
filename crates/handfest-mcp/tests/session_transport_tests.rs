@@ -385,62 +385,7 @@ fn upstream_eof_before_tools_call_returns_32603_without_consuming_quota() {
     let tr = proxy.ledger().track_record(&agent_kp.key_id()).unwrap();
     assert_eq!(tr.total_decisions, 0);
 
-    // Prove the same SQLite ledger still has 0/1 calls used: the next permitted call succeeds
-    // (1/1), and a second call is denied by the 1-call quota.
-    let second_session_in = concat!(
-        "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\",\"params\":{\"name\":\"merge_pr\",\"arguments\":{\"repo\":\"org/app\"}}}\n",
-        "{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"tools/call\",\"params\":{\"name\":\"merge_pr\",\"arguments\":{\"repo\":\"org/app\"}}}\n"
-    );
-    let (up_in_w2, mut up_in_r2) = mem_pipe();
-    let (mut up_out_w2, up_out_r2) = mem_pipe();
-    let upstream_responder = thread::spawn(move || {
-        let mut req = String::new();
-        up_in_r2.read_line(&mut req).unwrap();
-        assert!(req.contains("\"id\":2"));
-        writeln!(
-            up_out_w2,
-            r#"{{"jsonrpc":"2.0","id":2,"result":{{"merged":true}}}}"#
-        )
-        .unwrap();
-        // Hold upstream stdout open until the proxy closes upstream stdin at session end so
-        // request id: 3 is deterministically evaluated against the 1-call quota without racing EOF.
-        let mut extra = String::new();
-        assert_eq!(
-            up_in_r2.read_line(&mut extra).unwrap(),
-            0,
-            "quota-denied request id: 3 must never be forwarded upstream"
-        );
-        drop(up_out_w2);
-    });
-    let mut second_client_out = Vec::new();
-    proxy
-        .run(
-            BufReader::new(Cursor::new(second_session_in.as_bytes().to_vec())),
-            &mut second_client_out,
-            up_in_w2,
-            up_out_r2,
-        )
-        .expect("second session with live upstream succeeded");
-    upstream_responder.join().unwrap();
-
-    let responses: Vec<Value> = String::from_utf8(second_client_out)
-        .unwrap()
-        .lines()
-        .map(|l| serde_json::from_str(l).unwrap())
-        .collect();
-    assert_eq!(responses.len(), 2);
-    assert_eq!(responses[0]["id"], json!(2));
-    assert_eq!(responses[0]["result"]["merged"], json!(true));
-    assert_eq!(responses[1]["id"], json!(3));
-    assert_eq!(
-        responses[1]["error"]["code"],
-        json!(HANDFEST_DENIED_ERROR_CODE)
-    );
-
-    assert_eq!(proxy.ledger().verify_integrity().unwrap(), 2);
-    let tr_after = proxy.ledger().track_record(&agent_kp.key_id()).unwrap();
-    assert_eq!(tr_after.permits, 1);
-    assert_eq!(tr_after.denies, 1);
+    assert_fresh_single_call_quota_still_available(&mut proxy, &agent_kp.key_id());
 }
 
 #[test]
@@ -1262,24 +1207,7 @@ fn queued_cancellation_trapped_behind_request_under_backpressure_delivers_when_w
     )
     .unwrap();
 
-    // Activate id: 1, fill the writer queue so `has_pending_upstream() == true`, then queue
-    // `ping (id: 2)` followed by `notifications/cancelled (requestId: 1)` behind it.
-    let mut prefix = Vec::new();
-    prefix.extend_from_slice(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"ping\"}\n");
-    for _ in 0..1026 {
-        prefix
-            .extend_from_slice(b"{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}\n");
-    }
-    prefix.extend_from_slice(b"{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"ping\"}\n");
-    prefix.extend_from_slice(
-        b"{\"jsonrpc\":\"2.0\",\"method\":\"notifications/cancelled\",\"params\":{\"requestId\":1}}\n",
-    );
-    // Append > EVENT_CHANNEL_BOUND (64) trailing notifications so `drained_rx` cannot fire until
-    // the proxy loop has already moved `id: 2` and `cancel(1)` into `state.queued_client`.
-    for _ in 0..70 {
-        prefix
-            .extend_from_slice(b"{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}\n");
-    }
+    let prefix = build_backpressure_cancel_prefix();
 
     let (drained_tx, drained_rx) = mpsc::sync_channel(1);
     let (close_tx, close_rx) = mpsc::sync_channel(1);
@@ -1486,31 +1414,31 @@ fn shutdown_deadline_fires_even_while_chatty_upstream_continuously_emits_notific
     );
 }
 
+struct GatedRespNotifEofReader {
+    release_rx: Option<mpsc::Receiver<()>>,
+    payload: Cursor<Vec<u8>>,
+    dropped_tx: Option<mpsc::SyncSender<()>>,
+}
+
+impl Read for GatedRespNotifEofReader {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        if let Some(rx) = self.release_rx.take() {
+            let _ = rx.recv();
+        }
+        self.payload.read(buf)
+    }
+}
+
+impl Drop for GatedRespNotifEofReader {
+    fn drop(&mut self) {
+        if let Some(tx) = self.dropped_tx.take() {
+            let _ = tx.send(());
+        }
+    }
+}
+
 #[test]
 fn round6_poll_upstream_eof_detects_eof_behind_buffered_notification_without_burning_quota() {
-    struct GatedRespNotifEofReader {
-        release_rx: Option<mpsc::Receiver<()>>,
-        payload: Cursor<Vec<u8>>,
-        dropped_tx: Option<mpsc::SyncSender<()>>,
-    }
-
-    impl Read for GatedRespNotifEofReader {
-        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-            if let Some(rx) = self.release_rx.take() {
-                let _ = rx.recv();
-            }
-            self.payload.read(buf)
-        }
-    }
-
-    impl Drop for GatedRespNotifEofReader {
-        fn drop(&mut self) {
-            if let Some(tx) = self.dropped_tx.take() {
-                let _ = tx.send(());
-            }
-        }
-    }
-
     let now = parse_rfc3339_utc("2026-06-01T00:00:00Z").unwrap();
     let (verified, agent_kp) = single_hop_chain("LIMIT 1 calls\n");
     let mut proxy = McpProxy::new(
@@ -1868,4 +1796,79 @@ fn round6_stalled_writer_with_no_queued_ids_and_upstream_eof_aborts_immediately(
         matches!(res, Err(ProxyError::UpstreamEof)),
         "expected ProxyError::UpstreamEof, got {res:?}"
     );
+}
+
+fn assert_fresh_single_call_quota_still_available(
+    proxy: &mut McpProxy<FixedClock, SqliteLedger>,
+    actor_key: &handfest_core::ast::KeyId,
+) {
+    let second_session_in = concat!(
+        "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\",\"params\":{\"name\":\"merge_pr\",\"arguments\":{\"repo\":\"org/app\"}}}\n",
+        "{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"tools/call\",\"params\":{\"name\":\"merge_pr\",\"arguments\":{\"repo\":\"org/app\"}}}\n"
+    );
+    let (up_in_w2, mut up_in_r2) = mem_pipe();
+    let (mut up_out_w2, up_out_r2) = mem_pipe();
+    let upstream_responder = thread::spawn(move || {
+        let mut req = String::new();
+        up_in_r2.read_line(&mut req).unwrap();
+        assert!(req.contains("\"id\":2"));
+        writeln!(
+            up_out_w2,
+            r#"{{"jsonrpc":"2.0","id":2,"result":{{"merged":true}}}}"#
+        )
+        .unwrap();
+        let mut extra = String::new();
+        assert_eq!(
+            up_in_r2.read_line(&mut extra).unwrap(),
+            0,
+            "quota-denied request id: 3 must never be forwarded upstream"
+        );
+        drop(up_out_w2);
+    });
+    let mut second_client_out = Vec::new();
+    proxy
+        .run(
+            BufReader::new(Cursor::new(second_session_in.as_bytes().to_vec())),
+            &mut second_client_out,
+            up_in_w2,
+            up_out_r2,
+        )
+        .expect("second session with live upstream succeeded");
+    upstream_responder.join().unwrap();
+
+    let responses: Vec<Value> = String::from_utf8(second_client_out)
+        .unwrap()
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    assert_eq!(responses.len(), 2);
+    assert_eq!(responses[0]["id"], json!(2));
+    assert_eq!(responses[0]["result"]["merged"], json!(true));
+    assert_eq!(responses[1]["id"], json!(3));
+    assert_eq!(
+        responses[1]["error"]["code"],
+        json!(HANDFEST_DENIED_ERROR_CODE)
+    );
+    assert_eq!(proxy.ledger().verify_integrity().unwrap(), 2);
+    let tr_after = proxy.ledger().track_record(actor_key).unwrap();
+    assert_eq!(tr_after.permits, 1);
+    assert_eq!(tr_after.denies, 1);
+}
+
+fn build_backpressure_cancel_prefix() -> Vec<u8> {
+    let mut prefix = Vec::new();
+    prefix.extend_from_slice(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"ping\"}\n");
+    for _ in 0..1026 {
+        prefix
+            .extend_from_slice(b"{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}\n");
+    }
+    prefix.extend_from_slice(b"{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"ping\"}\n");
+    prefix.extend_from_slice(
+        b"{\"jsonrpc\":\"2.0\",\"method\":\"notifications/cancelled\",\"params\":{\"requestId\":1}}\n",
+    );
+    for _ in 0..70 {
+        prefix
+            .extend_from_slice(b"{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}\n");
+    }
+    prefix
 }

@@ -12,7 +12,7 @@ use crate::ast::{
     is_valid_ident, is_valid_quoted_str, is_valid_timestamp, try_format_rfc3339_utc, AstError,
     Decimal, HandfestAst, KeyId, MandateId, Predicate, PredicateOp, Quota, Scalar,
 };
-pub use crate::gate_errors::{ChainStructureError, RuntimeChainError};
+pub use crate::gate_errors::{ChainStructureError, ProofShapeError, RuntimeChainError};
 use crate::lattice::{scalar_satisfies, subsumes_with_parent_id, NarrowError};
 use crate::{ActorKind, AssuranceLevel, Verdict};
 
@@ -470,11 +470,61 @@ fn evaluate_chain(
     Ok(())
 }
 
+/// Validates shared anchor proof shape invariants: non-empty control-free `anchor_id`,
+/// RFC 3339 4-digit-year bounds for `valid_from`/`valid_until`, and `valid_from <= valid_until`.
+pub fn validate_proof_shape(
+    anchor_id: &str,
+    valid_from: i64,
+    valid_until: i64,
+) -> Result<(), ProofShapeError> {
+    if anchor_id.is_empty() {
+        return Err(ProofShapeError::EmptyAnchorId);
+    }
+    if !is_valid_quoted_str(anchor_id) {
+        return Err(ProofShapeError::InvalidAnchorIdChars);
+    }
+    if !is_valid_timestamp(valid_from) {
+        return Err(ProofShapeError::TimestampOutOfRange(valid_from));
+    }
+    if !is_valid_timestamp(valid_until) {
+        return Err(ProofShapeError::TimestampOutOfRange(valid_until));
+    }
+    if valid_from > valid_until {
+        return Err(ProofShapeError::InvertedValidityWindow {
+            valid_from,
+            valid_until,
+        });
+    }
+    Ok(())
+}
+
 fn verify_proofs(chain: &[VerifiedMandate], now: i64) -> Result<(), RuntimeChainError> {
     for (i, vm) in chain.iter().enumerate() {
-        if vm.proof.anchor_id.is_empty() || !is_valid_quoted_str(&vm.proof.anchor_id) {
-            return Err(RuntimeChainError::InvalidAnchorId { hop: i });
-        }
+        validate_proof_shape(
+            &vm.proof.anchor_id,
+            vm.proof.valid_from,
+            vm.proof.valid_until,
+        )
+        .map_err(|err| match err {
+            ProofShapeError::EmptyAnchorId | ProofShapeError::InvalidAnchorIdChars => {
+                RuntimeChainError::InvalidAnchorId { hop: i }
+            }
+            ProofShapeError::TimestampOutOfRange(_) => {
+                RuntimeChainError::ProofTimestampOutOfRange {
+                    hop: i,
+                    valid_from: vm.proof.valid_from,
+                    valid_until: vm.proof.valid_until,
+                }
+            }
+            ProofShapeError::InvertedValidityWindow {
+                valid_from,
+                valid_until,
+            } => RuntimeChainError::InvalidProofValidityWindow {
+                hop: i,
+                valid_from,
+                valid_until,
+            },
+        })?;
         if &vm.proof.signer_key != vm.ast.from().key() {
             return Err(RuntimeChainError::ProofSignerMismatch {
                 hop: i,
@@ -487,20 +537,6 @@ fn verify_proofs(chain: &[VerifiedMandate], now: i64) -> Result<(), RuntimeChain
                 hop: i,
                 proof_kind: vm.proof.actor_kind,
                 mandate_kind: vm.ast.from().kind(),
-            });
-        }
-        if !is_valid_timestamp(vm.proof.valid_from) || !is_valid_timestamp(vm.proof.valid_until) {
-            return Err(RuntimeChainError::ProofTimestampOutOfRange {
-                hop: i,
-                valid_from: vm.proof.valid_from,
-                valid_until: vm.proof.valid_until,
-            });
-        }
-        if vm.proof.valid_from > vm.proof.valid_until {
-            return Err(RuntimeChainError::InvalidProofValidityWindow {
-                hop: i,
-                valid_from: vm.proof.valid_from,
-                valid_until: vm.proof.valid_until,
             });
         }
         if now < vm.proof.valid_from || now >= vm.proof.valid_until {

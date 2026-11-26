@@ -182,3 +182,36 @@ impl From<ChainStructureError> for RuntimeChainError {
         Self::Structure(err)
     }
 }
+
+/// Structured error returned when an anchor proof's syntax or validity window shape is invalid.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProofShapeError {
+    EmptyAnchorId,
+    InvalidAnchorIdChars,
+    TimestampOutOfRange(i64),
+    InvertedValidityWindow { valid_from: i64, valid_until: i64 },
+}
+
+impl fmt::Display for ProofShapeError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::EmptyAnchorId => f.write_str("anchor_id must not be empty"),
+            Self::InvalidAnchorIdChars => {
+                f.write_str("anchor_id must not contain control characters")
+            }
+            Self::TimestampOutOfRange(ts) => write!(
+                f,
+                "timestamp {ts} outside 0000-01-01T00:00:00Z..=9999-12-31T23:59:59Z"
+            ),
+            Self::InvertedValidityWindow {
+                valid_from,
+                valid_until,
+            } => write!(
+                f,
+                "invalid validity window [{valid_from}..{valid_until}): valid_from must be <= valid_until"
+            ),
+        }
+    }
+}
+
+impl core::error::Error for ProofShapeError {}

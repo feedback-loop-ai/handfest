@@ -1,7 +1,7 @@
 //! Re-exports of `handfest_core`'s lossless RFC 8259 JSON parser and exact base-10 numeric
 //! helpers for `handfest-mcp`.
 
-pub(crate) use handfest_core::exact_json::{write_json_string, ExactJson};
+pub(crate) use handfest_core::exact_json::{write_json_string, ExactJson, JsonNumber};
 pub(crate) use handfest_core::json_num::{
     canonicalize_json_number, is_canonical_json_int_syntax, parse_canonical_json_int,
     parse_decimal_str, parse_json_decimal, CanonicalJsonNumber, NumberError,

@@ -774,18 +774,17 @@ fn gate_rejects_action_control_characters_and_escapes_receipts() {
     assert!(r_lit.verify_hash());
 }
 
-#[test]
-fn gate_fails_closed_on_out_of_range_timestamps() {
-    let root = parse_mandate(concat!(
-        "HANDFEST v1\n",
-        "FROM human \"valentin\" (key: ed25519:9b1e44a0)\n",
-        "TO agent \"brokkr:seat:settle\" (key: ed25519:7f01aa99)\n",
-        "DELEGATION max 0 hops\n",
-        "ALLOW billing.settle\n",
-        "ON account \"acct-1\"\n",
-        "WHERE tx.settled_at >= 2026-01-01T00:00:00Z\n",
-    ))
-    .unwrap();
+fn settle_timestamp_fixture(op: &str) -> (Vec<VerifiedMandate>, ActionRequest) {
+    let text = format!(
+        "HANDFEST v1\n\
+         FROM human \"valentin\" (key: ed25519:9b1e44a0)\n\
+         TO agent \"brokkr:seat:settle\" (key: ed25519:7f01aa99)\n\
+         DELEGATION max 0 hops\n\
+         ALLOW billing.settle\n\
+         ON account \"acct-1\"\n\
+         WHERE tx.settled_at {op} 2026-01-01T00:00:00Z\n"
+    );
+    let root = parse_mandate(&text).unwrap();
     let proof_wide = VerifiedAnchorProof {
         anchor_id: "test-anchor".to_string(),
         assurance: AssuranceLevel::QualifiedQes,
@@ -794,19 +793,26 @@ fn gate_fails_closed_on_out_of_range_timestamps() {
         valid_from: MIN_RFC3339_TIMESTAMP,
         valid_until: MAX_RFC3339_TIMESTAMP,
     };
-    let chain = vec![VerifiedMandate {
-        ast: root,
-        proof: proof_wide,
-    }];
     let req = ActionRequest {
         actor_key: k("ed25519:7f01aa99"),
         action: "billing.settle".into(),
         resource_kind: "account".into(),
         resource_id: "acct-1".into(),
     };
+    (
+        vec![VerifiedMandate {
+            ast: root,
+            proof: proof_wide,
+        }],
+        req,
+    )
+}
+
+#[test]
+fn gate_fails_closed_on_out_of_range_fact_timestamps() {
+    let (chain, req) = settle_timestamp_fixture(">=");
     let now = ts("2026-11-24T18:00:00Z");
 
-    // Fact timestamp above 9999-12-31T23:59:59Z (253_402_300_800) must fail closed
     let bad_hi_fact =
         VerifiedFacts::new().with("tx.settled_at", Scalar::Timestamp(253_402_300_800));
     let (v_hi, r_hi) = authorize(&chain, &req, &bad_hi_fact, &QuotaSnapshot::new(), now, None);
@@ -816,21 +822,7 @@ fn gate_fails_closed_on_out_of_range_timestamps() {
     ));
     assert!(r_hi.verify_hash());
 
-    // Fact timestamp below 0000-01-01T00:00:00Z must also fail closed even when predicate is <=
-    let root_lte = parse_mandate(concat!(
-        "HANDFEST v1\n",
-        "FROM human \"valentin\" (key: ed25519:9b1e44a0)\n",
-        "TO agent \"brokkr:seat:settle\" (key: ed25519:7f01aa99)\n",
-        "DELEGATION max 0 hops\n",
-        "ALLOW billing.settle\n",
-        "ON account \"acct-1\"\n",
-        "WHERE tx.settled_at <= 2026-01-01T00:00:00Z\n",
-    ))
-    .unwrap();
-    let chain_lte = vec![VerifiedMandate {
-        proof: chain[0].proof.clone(),
-        ast: root_lte,
-    }];
+    let (chain_lte, _) = settle_timestamp_fixture("<=");
     let bad_lo_fact = VerifiedFacts::new().with(
         "tx.settled_at",
         Scalar::Timestamp(MIN_RFC3339_TIMESTAMP - 1),
@@ -845,10 +837,14 @@ fn gate_fails_closed_on_out_of_range_timestamps() {
     );
     assert!(matches!(v_lo, Verdict::Deny { .. }));
     assert!(r_lo.verify_hash());
+}
 
-    // Out-of-range `now` fails closed even when the anchor proof covers i64::MIN..i64::MAX
+#[test]
+fn gate_fails_closed_on_out_of_range_now_timestamps() {
+    let (chain, req) = settle_timestamp_fixture(">=");
     let ok_fact =
         VerifiedFacts::new().with("tx.settled_at", Scalar::Timestamp(MAX_RFC3339_TIMESTAMP));
+
     let (v_now_hi, r_now_hi) = authorize(
         &chain,
         &req,
@@ -874,7 +870,6 @@ fn gate_fails_closed_on_out_of_range_timestamps() {
     assert!(matches!(v_now_lo, Verdict::Deny { .. }));
     assert!(r_now_lo.verify_hash());
 
-    // In-range 4-digit-year boundary timestamp succeeds (`[valid_from..valid_until)` half-open)
     let (v_ok, r_ok) = authorize(
         &chain,
         &req,
@@ -1122,18 +1117,27 @@ fn build_denial_receipt_enforces_rfc3339_timestamp_bounds() {
     ));
 }
 
-#[test]
-fn verify_chain_runtime_and_structure_typed_errors_and_precedence() {
-    use handfest_core::gate::{
-        evaluate_predicate_if_known, verify_chain_runtime, verify_chain_structure,
-        ChainStructureError, RuntimeChainError,
-    };
-    use handfest_core::lattice::NarrowError;
-    use handfest_core::ActorKind;
-    use sha2::{Digest, Sha256};
-    use std::error::Error as _;
+const GOLDEN_ROOT_MANDATE_TEXT: &str = "HANDFEST v1\n\
+FROM human \"Root\" (key: ed25519:aaaa)\n\
+TO agent \"Leaf\" (key: ed25519:bbbb)\n\
+DELEGATION max 1 hop\n\
+ALLOW git.pr.*\n\
+ON repo \"org/*\"\n";
 
-    let make_vm = |text: &str, signer: &str, kind: ActorKind, win: (i64, i64)| VerifiedMandate {
+const GOLDEN_ROOT_ID: &str =
+    "sha256:65f25f96e47bfd30a5ed6eb54560b60bd3b3c5a5a7990b3ca718f3312c656174";
+const GOLDEN_WIDENED_CHILD_ID: &str =
+    "sha256:ef1d0ea18bacf462a0edbfc9a141f29706e09ca6bd3f39af10b57ba84ec9c5ab";
+const GOLDEN_EXPIRED_DENIAL_RECEIPT_HASH: &str =
+    "sha256:bba3a44ea6d3981a1194362d55a66ec0d2a8bba9bc2e4b7f4c2b205c3fc9356d";
+
+fn make_runtime_vm(
+    text: &str,
+    signer: &str,
+    kind: handfest_core::ActorKind,
+    win: (i64, i64),
+) -> VerifiedMandate {
+    VerifiedMandate {
         ast: parse_mandate(text).unwrap(),
         proof: VerifiedAnchorProof {
             anchor_id: "test-anchor".into(),
@@ -1143,15 +1147,73 @@ fn verify_chain_runtime_and_structure_typed_errors_and_precedence() {
             valid_from: win.0,
             valid_until: win.1,
         },
-    };
+    }
+}
 
-    let root_text = "HANDFEST v1\n\
-         FROM human \"Root\" (key: ed25519:aaaa)\n\
-         TO agent \"Leaf\" (key: ed25519:bbbb)\n\
-         DELEGATION max 1 hops\n\
-         ALLOW git.pr.*\n\
-         ON repo \"org/*\"\n";
-    let vm = make_vm(root_text, "aaaa", ActorKind::Human, (100, 200));
+fn make_child_vm(parent_id: &str, allow: &str, max_hops: u32) -> VerifiedMandate {
+    let text = format!(
+        "HANDFEST v1\nPARENT {parent_id}\nFROM agent \"Leaf\" (key: ed25519:bbbb)\n\
+         TO agent \"Sub\" (key: ed25519:cccc)\nDELEGATION max {max_hops} hops\n\
+         ALLOW {allow}\nON repo \"org/app\"\n"
+    );
+    make_runtime_vm(&text, "bbbb", handfest_core::ActorKind::Agent, (100, 200))
+}
+
+#[test]
+fn validate_proof_shape_checks_anchor_id_timestamps_and_ordering() {
+    use handfest_core::gate::{validate_proof_shape, ProofShapeError};
+
+    assert_eq!(validate_proof_shape("anchor-1", 100, 200), Ok(()));
+    assert_eq!(validate_proof_shape("anchor-1", 200, 200), Ok(()));
+
+    let empty = validate_proof_shape("", 100, 200).unwrap_err();
+    assert_eq!(empty, ProofShapeError::EmptyAnchorId);
+    assert!(empty.to_string().contains("must not be empty"));
+
+    let ctrl = validate_proof_shape("bad\nid", 100, 200).unwrap_err();
+    assert_eq!(ctrl, ProofShapeError::InvalidAnchorIdChars);
+    assert!(ctrl.to_string().contains("control characters"));
+
+    let low = validate_proof_shape("anchor-1", MIN_RFC3339_TIMESTAMP - 1, 200).unwrap_err();
+    assert_eq!(
+        low,
+        ProofShapeError::TimestampOutOfRange(MIN_RFC3339_TIMESTAMP - 1)
+    );
+    assert!(low
+        .to_string()
+        .contains("outside 0000-01-01T00:00:00Z..=9999-12-31T23:59:59Z"));
+
+    let high = validate_proof_shape("anchor-1", 100, MAX_RFC3339_TIMESTAMP + 1).unwrap_err();
+    assert_eq!(
+        high,
+        ProofShapeError::TimestampOutOfRange(MAX_RFC3339_TIMESTAMP + 1)
+    );
+
+    let inv = validate_proof_shape("anchor-1", 201, 200).unwrap_err();
+    assert_eq!(
+        inv,
+        ProofShapeError::InvertedValidityWindow {
+            valid_from: 201,
+            valid_until: 200,
+        }
+    );
+    assert!(inv
+        .to_string()
+        .contains("valid_from must be <= valid_until"));
+}
+
+#[test]
+fn verify_chain_runtime_checks_basic_chain_timestamp_and_identity_guards() {
+    use handfest_core::gate::{verify_chain_runtime, ChainStructureError, RuntimeChainError};
+    use handfest_core::ActorKind;
+    use std::error::Error as _;
+
+    let vm = make_runtime_vm(
+        GOLDEN_ROOT_MANDATE_TEXT,
+        "aaaa",
+        ActorKind::Human,
+        (100, 200),
+    );
     let single = std::slice::from_ref(&vm);
     let leaf = k("ed25519:bbbb");
     let sub = k("ed25519:cccc");
@@ -1164,6 +1226,7 @@ fn verify_chain_runtime_and_structure_typed_errors_and_precedence() {
     );
     assert!(empty_rt.source().is_some());
     assert_eq!(empty_rt.to_string(), "empty mandate chain");
+
     for bad_ts in [MIN_RFC3339_TIMESTAMP - 1, MAX_RFC3339_TIMESTAMP + 1] {
         let err = verify_chain_runtime(single, &leaf, bad_ts).unwrap_err();
         assert_eq!(
@@ -1175,11 +1238,12 @@ fn verify_chain_runtime_and_structure_typed_errors_and_precedence() {
             .to_string()
             .contains("outside 0000-01-01T00:00:00Z..=9999-12-31T23:59:59Z"));
     }
+
     assert_eq!(
         verify_chain_runtime(single, &sub, 150),
         Err(RuntimeChainError::ActorKeyMismatch {
             expected: leaf.clone(),
-            actual: sub.clone(),
+            actual: sub,
         })
     );
     assert_eq!(
@@ -1192,7 +1256,88 @@ fn verify_chain_runtime_and_structure_typed_errors_and_precedence() {
         })
     );
 
-    // Empty or control-character proof anchor_id must be rejected on every hop.
+    let bad_signer = make_runtime_vm(
+        GOLDEN_ROOT_MANDATE_TEXT,
+        "dddd",
+        ActorKind::Human,
+        (100, 200),
+    );
+    assert_eq!(
+        verify_chain_runtime(&[bad_signer], &leaf, 150),
+        Err(RuntimeChainError::ProofSignerMismatch {
+            hop: 0,
+            proof_key: k("ed25519:dddd"),
+            mandate_key: k("ed25519:aaaa"),
+        })
+    );
+    let bad_kind = make_runtime_vm(
+        GOLDEN_ROOT_MANDATE_TEXT,
+        "aaaa",
+        ActorKind::Agent,
+        (100, 200),
+    );
+    assert_eq!(
+        verify_chain_runtime(&[bad_kind], &leaf, 150),
+        Err(RuntimeChainError::ProofActorKindMismatch {
+            hop: 0,
+            proof_kind: ActorKind::Agent,
+            mandate_kind: ActorKind::Human,
+        })
+    );
+}
+
+#[test]
+fn verify_chain_runtime_rejects_single_hop_root_with_parent() {
+    use handfest_core::gate::{verify_chain_runtime, ChainStructureError, RuntimeChainError};
+
+    let sub = k("ed25519:cccc");
+    let child_as_root = make_child_vm(GOLDEN_ROOT_ID, "git.pr.merge", 0);
+    assert_eq!(
+        verify_chain_runtime(std::slice::from_ref(&child_as_root), &sub, 150),
+        Err(RuntimeChainError::Structure(
+            ChainStructureError::RootHasParent
+        ))
+    );
+    let (verdict, _) = authorize(
+        std::slice::from_ref(&child_as_root),
+        &ActionRequest {
+            actor_key: sub,
+            action: "git.pr.merge".into(),
+            resource_kind: "repo".into(),
+            resource_id: "org/app".into(),
+        },
+        &VerifiedFacts::new(),
+        &QuotaSnapshot::new(),
+        150,
+        None,
+    );
+    assert_eq!(
+        verdict,
+        Verdict::Deny {
+            reason: "root mandate must not declare a PARENT digest".into(),
+        }
+    );
+}
+
+#[test]
+fn verify_chain_runtime_rejects_bad_anchor_id_and_validity_windows() {
+    use handfest_core::gate::{verify_chain_runtime, RuntimeChainError};
+    use handfest_core::ActorKind;
+
+    let vm = make_runtime_vm(
+        GOLDEN_ROOT_MANDATE_TEXT,
+        "aaaa",
+        ActorKind::Human,
+        (100, 200),
+    );
+    let leaf = k("ed25519:bbbb");
+    let req = ActionRequest {
+        actor_key: leaf.clone(),
+        action: "git.pr.merge".into(),
+        resource_kind: "repo".into(),
+        resource_id: "org/app".into(),
+    };
+
     for bad_anchor in ["", "bad\nid", "bad\0id"] {
         let mut bad_vm = vm.clone();
         bad_vm.proof.anchor_id = bad_anchor.to_string();
@@ -1201,12 +1346,7 @@ fn verify_chain_runtime_and_structure_typed_errors_and_precedence() {
         assert!(err.to_string().contains("invalid anchor proof anchor_id"));
         let (verdict, _) = authorize(
             &[bad_vm],
-            &ActionRequest {
-                actor_key: leaf.clone(),
-                action: "git.pr.merge".into(),
-                resource_kind: "repo".into(),
-                resource_id: "org/app".into(),
-            },
+            &req,
             &VerifiedFacts::new(),
             &QuotaSnapshot::new(),
             150,
@@ -1218,25 +1358,12 @@ fn verify_chain_runtime_and_structure_typed_errors_and_precedence() {
         ));
     }
 
-    let bad_signer = make_vm(root_text, "dddd", ActorKind::Human, (100, 200));
-    assert_eq!(
-        verify_chain_runtime(&[bad_signer], &leaf, 150),
-        Err(RuntimeChainError::ProofSignerMismatch {
-            hop: 0,
-            proof_key: k("ed25519:dddd"),
-            mandate_key: k("ed25519:aaaa"),
-        })
+    let inverted_window = make_runtime_vm(
+        GOLDEN_ROOT_MANDATE_TEXT,
+        "aaaa",
+        ActorKind::Human,
+        (201, 200),
     );
-    let bad_kind = make_vm(root_text, "aaaa", ActorKind::Agent, (100, 200));
-    assert_eq!(
-        verify_chain_runtime(&[bad_kind], &leaf, 150),
-        Err(RuntimeChainError::ProofActorKindMismatch {
-            hop: 0,
-            proof_kind: ActorKind::Agent,
-            mandate_kind: ActorKind::Human,
-        })
-    );
-    let inverted_window = make_vm(root_text, "aaaa", ActorKind::Human, (201, 200));
     assert_eq!(
         verify_chain_runtime(&[inverted_window], &leaf, 200),
         Err(RuntimeChainError::InvalidProofValidityWindow {
@@ -1245,7 +1372,13 @@ fn verify_chain_runtime_and_structure_typed_errors_and_precedence() {
             valid_until: 200,
         })
     );
-    let empty_window = make_vm(root_text, "aaaa", ActorKind::Human, (200, 200));
+
+    let empty_window = make_runtime_vm(
+        GOLDEN_ROOT_MANDATE_TEXT,
+        "aaaa",
+        ActorKind::Human,
+        (200, 200),
+    );
     for eval_now in [199, 200, 201] {
         assert_eq!(
             verify_chain_runtime(std::slice::from_ref(&empty_window), &leaf, eval_now),
@@ -1257,14 +1390,31 @@ fn verify_chain_runtime_and_structure_typed_errors_and_precedence() {
             })
         );
     }
+}
 
-    // Out-of-range proof validity bounds must be rejected by gate::verify_proofs even when `now` is valid.
+#[test]
+fn verify_chain_runtime_rejects_out_of_range_proof_window_bounds() {
+    use handfest_core::gate::{verify_chain_runtime, RuntimeChainError};
+    use handfest_core::ActorKind;
+
+    let leaf = k("ed25519:bbbb");
+    let req = ActionRequest {
+        actor_key: leaf.clone(),
+        action: "git.pr.merge".into(),
+        resource_kind: "repo".into(),
+        resource_id: "org/app".into(),
+    };
     for out_of_range_win in [
         (MIN_RFC3339_TIMESTAMP - 1, 200),
         (100, MAX_RFC3339_TIMESTAMP + 1),
         (i64::MIN, i64::MAX),
     ] {
-        let bad_bounds = make_vm(root_text, "aaaa", ActorKind::Human, out_of_range_win);
+        let bad_bounds = make_runtime_vm(
+            GOLDEN_ROOT_MANDATE_TEXT,
+            "aaaa",
+            ActorKind::Human,
+            out_of_range_win,
+        );
         let err = verify_chain_runtime(std::slice::from_ref(&bad_bounds), &leaf, 150).unwrap_err();
         assert_eq!(
             err,
@@ -1274,19 +1424,12 @@ fn verify_chain_runtime_and_structure_typed_errors_and_precedence() {
                 valid_until: out_of_range_win.1,
             }
         );
-        assert!(
-            err.to_string()
-                .contains("outside 0000-01-01T00:00:00Z..=9999-12-31T23:59:59Z"),
-            "unexpected error: {err}"
-        );
+        assert!(err
+            .to_string()
+            .contains("outside 0000-01-01T00:00:00Z..=9999-12-31T23:59:59Z"));
         let (verdict, _) = authorize(
             &[bad_bounds],
-            &ActionRequest {
-                actor_key: leaf.clone(),
-                action: "git.pr.merge".into(),
-                resource_kind: "repo".into(),
-                resource_id: "org/app".into(),
-            },
+            &req,
             &VerifiedFacts::new(),
             &QuotaSnapshot::new(),
             150,
@@ -1297,21 +1440,28 @@ fn verify_chain_runtime_and_structure_typed_errors_and_precedence() {
             Verdict::Deny { ref reason } if reason.contains("outside 0000-01-01T00:00:00Z..=9999-12-31T23:59:59Z")
         ));
     }
+}
 
-    let pid = vm.ast.mandate_id();
-    let child_vm = |allow: &str, max_hops: u32| {
-        let text = format!(
-            "HANDFEST v1\nPARENT {pid}\nFROM agent \"Leaf\" (key: ed25519:bbbb)\n\
-             TO agent \"Sub\" (key: ed25519:cccc)\nDELEGATION max {max_hops} hops\n\
-             ALLOW {allow}\nON repo \"org/app\"\n"
-        );
-        make_vm(&text, "bbbb", ActorKind::Agent, (100, 200))
+#[test]
+fn verify_chain_structure_and_multi_hop_runtime_typed_errors() {
+    use handfest_core::gate::{
+        verify_chain_runtime, verify_chain_structure, ChainStructureError, RuntimeChainError,
     };
-    let valid_child = child_vm("git.pr.merge", 0);
-    let widened_child = child_vm("git.*", 0);
-    let hop_overflow_child = child_vm("git.pr.merge", 1);
+    use handfest_core::lattice::NarrowError;
+    use handfest_core::ActorKind;
+    use std::error::Error as _;
 
-    // Typed ChainStructureError checks
+    let vm = make_runtime_vm(
+        GOLDEN_ROOT_MANDATE_TEXT,
+        "aaaa",
+        ActorKind::Human,
+        (100, 200),
+    );
+    let sub = k("ed25519:cccc");
+    let valid_child = make_child_vm(GOLDEN_ROOT_ID, "git.pr.merge", 0);
+    let widened_child = make_child_vm(GOLDEN_ROOT_ID, "git.*", 0);
+    let hop_overflow_child = make_child_vm(GOLDEN_ROOT_ID, "git.pr.merge", 1);
+
     assert_eq!(
         verify_chain_structure(&[]),
         Err(ChainStructureError::EmptyChain)
@@ -1322,8 +1472,12 @@ fn verify_chain_runtime_and_structure_typed_errors_and_precedence() {
     );
     assert_eq!(
         verify_chain_structure(&[vm.clone(), valid_child.clone()]),
-        Ok(vec![pid, valid_child.ast.mandate_id()])
+        Ok(vec![
+            GOLDEN_ROOT_ID.parse().unwrap(),
+            valid_child.ast.mandate_id(),
+        ])
     );
+
     let wide_err = verify_chain_structure(&[vm.clone(), widened_child.clone()]).unwrap_err();
     assert!(matches!(
         wide_err,
@@ -1347,7 +1501,6 @@ fn verify_chain_runtime_and_structure_typed_errors_and_precedence() {
     assert!(hop_err.source().is_none());
     assert!(hop_err.to_string().contains("delegation hop overflow"));
 
-    // Hop-1 empty anchor_id rejected cleanly.
     let mut bad_hop1_anchor = valid_child.clone();
     bad_hop1_anchor.proof.anchor_id.clear();
     assert_eq!(
@@ -1359,18 +1512,33 @@ fn verify_chain_runtime_and_structure_typed_errors_and_precedence() {
         verify_chain_runtime(&[vm.clone(), valid_child], &sub, 150),
         Ok(())
     );
-    let wide_rt =
-        verify_chain_runtime(&[vm.clone(), widened_child.clone()], &sub, 150).unwrap_err();
+    let wide_rt = verify_chain_runtime(&[vm, widened_child], &sub, 150).unwrap_err();
     assert!(matches!(
         wide_rt,
         RuntimeChainError::Structure(ChainStructureError::AttenuationFailed { hop: 0, .. })
     ));
     assert!(wide_rt.to_string().contains("attenuation check failed"));
+}
 
-    // Precedence regression: expired hop-0 proof [100, 200) at now = 200 AND widened hop-1 `ALLOW git.*`
-    // MUST deny with the expired-proof reason (matching pre-round-9 60f105e/a2e28b9 precedence).
-    let expected_chain_ids = vec![pid, widened_child.ast.mandate_id()];
+#[test]
+fn expired_proof_precedence_pins_independent_golden_chain_ids_and_receipt_hash() {
+    use handfest_core::gate::{verify_chain_runtime, RuntimeChainError};
+    use handfest_core::ActorKind;
+
+    let vm = make_runtime_vm(
+        GOLDEN_ROOT_MANDATE_TEXT,
+        "aaaa",
+        ActorKind::Human,
+        (100, 200),
+    );
+    let widened_child = make_child_vm(GOLDEN_ROOT_ID, "git.*", 0);
+    let sub = k("ed25519:cccc");
+
+    let expected_root_id: MandateId = GOLDEN_ROOT_ID.parse().unwrap();
+    let expected_child_id: MandateId = GOLDEN_WIDENED_CHILD_ID.parse().unwrap();
+    let expected_receipt_hash: MandateId = GOLDEN_EXPIRED_DENIAL_RECEIPT_HASH.parse().unwrap();
     let expected_reason = "hop 0: timestamp 200 outside anchor proof validity window [100..200)";
+
     let chain = [vm, widened_child];
     let runtime_err = verify_chain_runtime(&chain, &sub, 200).unwrap_err();
     assert_eq!(
@@ -1402,42 +1570,21 @@ fn verify_chain_runtime_and_structure_typed_errors_and_precedence() {
         reason: expected_reason.into(),
     };
     assert_eq!(verdict, expected_verdict);
-    assert_eq!(receipt.chain_ids, expected_chain_ids);
+    assert_eq!(receipt.chain_ids, vec![expected_root_id, expected_child_id]);
     assert_eq!(receipt.prev_receipt_hash, Some(prev_hash));
     assert_eq!(receipt.verdict, expected_verdict);
     assert_eq!(receipt.actor_key, sub);
     assert_eq!(receipt.action, "git.pr.merge");
     assert_eq!(receipt.resource, "repo \"org/app\"");
     assert_eq!(receipt.timestamp, 200);
-
-    // Independently compute the canonical SHA-256 receipt hash from raw protocol inputs.
-    let mut hasher = Sha256::new();
-    hasher.update(b"HANDFEST-RECEIPT-v1\0");
-    hasher.update([1u8]);
-    hasher.update(prev_hash.as_bytes());
-    hasher.update((expected_chain_ids.len() as u64).to_be_bytes());
-    for id in &expected_chain_ids {
-        hasher.update(id.as_bytes());
-    }
-    for s in [
-        sub.scheme(),
-        sub.value(),
-        "git.pr.merge",
-        "repo \"org/app\"",
-    ] {
-        hasher.update((s.len() as u64).to_be_bytes());
-        hasher.update(s.as_bytes());
-    }
-    hasher.update(200i64.to_be_bytes());
-    hasher.update([1u8]);
-    hasher.update((expected_reason.len() as u64).to_be_bytes());
-    hasher.update(expected_reason.as_bytes());
-    let mut golden = [0u8; 32];
-    golden.copy_from_slice(&hasher.finalize());
-    assert_eq!(receipt.receipt_hash, MandateId(golden));
+    assert_eq!(receipt.receipt_hash, expected_receipt_hash);
     assert!(receipt.verify_hash());
+}
 
-    // evaluate_predicate_if_known covers context.time, known static facts, and unknown facts.
+#[test]
+fn evaluate_predicate_if_known_covers_context_time_known_and_unknown_facts() {
+    use handfest_core::gate::evaluate_predicate_if_known;
+
     let pred_ast = parse_mandate(
         "HANDFEST v1\n\
          FROM human \"Root\" (key: ed25519:aaaa)\n\

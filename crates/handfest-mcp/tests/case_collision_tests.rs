@@ -794,7 +794,10 @@ fn round6_tools_list_rejects_smuggled_result_and_tool_keys_with_32603() {
         assert_eq!(parsed["id"], json!(1));
         assert_eq!(parsed["error"]["code"], json!(-32603));
     }
+}
 
+#[test]
+fn round6_tools_list_accepts_valid_next_cursor_and_meta() {
     let (mut proxy, _agent_kp) = make_proxy();
     let client_in =
         r#"{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}"#.to_string() + "\n";

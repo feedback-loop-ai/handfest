@@ -43,7 +43,7 @@ impl core::error::Error for NumberError {}
 /// offset of the scanned token on success.
 ///
 /// Enforces RFC 8259 leading-zero, fractional-digit, and exponent-digit syntax rules.
-pub fn scan_json_number_token(bytes: &[u8], start: usize) -> Result<usize, NumberError> {
+pub(crate) fn scan_json_number_token(bytes: &[u8], start: usize) -> Result<usize, NumberError> {
     let mut pos = start;
     if bytes.get(pos) == Some(&b'-') {
         pos += 1;

@@ -4,6 +4,10 @@ use crate::exact_json::parse_exact_json;
 
 use super::*;
 
+fn num(raw: &str) -> ExactJson {
+    ExactJson::Number(JsonNumber::parse(raw).unwrap())
+}
+
 #[test]
 fn read_bounded_line_rejects_bare_cr_and_accepts_clean_crlf() {
     let mut crlf = Cursor::new(b"{\"a\":1}\r\n".as_slice());
@@ -100,22 +104,21 @@ fn write_raw_line_refuses_embedded_cr_or_lf() {
 
 #[test]
 fn jsonrpc_id_restricts_numbers_to_plain_ieee754_safe_integers() {
-    let id_1 = extract_id_value(&ExactJson::Number("1".to_string())).unwrap();
+    let id_1 = extract_id_value(&num("1")).unwrap();
     let id_str = JsonRpcId::Str("1".to_string());
     assert_ne!(id_1, id_str);
 
-    let zero = extract_id_value(&ExactJson::Number("0".to_string())).unwrap();
+    let zero = extract_id_value(&num("0")).unwrap();
     assert_ne!(zero, id_1);
 
-    let max_safe = extract_id_value(&ExactJson::Number("9007199254740991".to_string())).unwrap();
-    let max_safe_minus_one =
-        extract_id_value(&ExactJson::Number("9007199254740990".to_string())).unwrap();
+    let max_safe = extract_id_value(&num("9007199254740991")).unwrap();
+    let max_safe_minus_one = extract_id_value(&num("9007199254740990")).unwrap();
     assert_ne!(max_safe, max_safe_minus_one);
 
-    let min_safe = extract_id_value(&ExactJson::Number("-9007199254740991".to_string())).unwrap();
+    let min_safe = extract_id_value(&num("-9007199254740991")).unwrap();
     assert_ne!(min_safe, max_safe);
 
-    let hundred_plain = extract_id_value(&ExactJson::Number("100".to_string())).unwrap();
+    let hundred_plain = extract_id_value(&num("100")).unwrap();
     assert_ne!(hundred_plain, id_1);
 
     for non_plain in [
@@ -135,16 +138,20 @@ fn jsonrpc_id_restricts_numbers_to_plain_ieee754_safe_integers() {
         "9007199254740991.5",
         "1e16",
         "1e100000000000000000000",
-        "00",
-        "-01",
-        "+1",
-        "",
-        "-",
     ] {
-        let err = extract_id_value(&ExactJson::Number(non_plain.to_string())).unwrap_err();
+        let err = extract_id_value(&num(non_plain)).unwrap_err();
         assert_eq!(
             err, "JSON-RPC numeric id must be a plain integer without decimal point or exponent",
             "non-plain id {non_plain} must fail"
+        );
+    }
+    for invalid_token in ["00", "-01", "+1", "", "-"] {
+        assert!(
+            matches!(
+                JsonNumber::parse(invalid_token),
+                Err(NumberError::LeadingZero | NumberError::InvalidSyntax(_))
+            ),
+            "invalid JSON number token {invalid_token:?} must be rejected at construction"
         );
     }
 
@@ -157,7 +164,7 @@ fn jsonrpc_id_restricts_numbers_to_plain_ieee754_safe_integers() {
         "18446744073709551617",
         "-18446744073709551617",
     ] {
-        let err = extract_id_value(&ExactJson::Number(out_of_range.to_string())).unwrap_err();
+        let err = extract_id_value(&num(out_of_range)).unwrap_err();
         assert_eq!(
             err, "JSON-RPC numeric id outside IEEE-754 safe integer range",
             "out-of-range id {out_of_range} must fail"
@@ -304,36 +311,33 @@ fn closed_envelope_keys_reject_case_colliding_and_unknown_top_level_fields() {
 
 #[test]
 fn upstream_response_id_matches_exact_safe_integers_and_rejects_negative_zero_or_fractional() {
-    let client_one = extract_id_value(&ExactJson::Number("1".to_string())).unwrap();
-    let client_zero = extract_id_value(&ExactJson::Number("0".to_string())).unwrap();
-    let client_max = extract_id_value(&ExactJson::Number("9007199254740991".to_string())).unwrap();
-    let client_min = extract_id_value(&ExactJson::Number("-9007199254740991".to_string())).unwrap();
+    let client_one = extract_id_value(&num("1")).unwrap();
+    let client_zero = extract_id_value(&num("0")).unwrap();
+    let client_max = extract_id_value(&num("9007199254740991")).unwrap();
+    let client_min = extract_id_value(&num("-9007199254740991")).unwrap();
 
     assert_eq!(
-        extract_upstream_response_id_value(&ExactJson::Number("1.0".to_string())).unwrap(),
+        extract_upstream_response_id_value(&num("1.0")).unwrap(),
         client_one
     );
     assert_eq!(
-        extract_upstream_response_id_value(&ExactJson::Number("1e0".to_string())).unwrap(),
+        extract_upstream_response_id_value(&num("1e0")).unwrap(),
         client_one
     );
     assert_eq!(
-        extract_upstream_response_id_value(&ExactJson::Number("0.0".to_string())).unwrap(),
+        extract_upstream_response_id_value(&num("0.0")).unwrap(),
         client_zero
     );
     assert_eq!(
-        extract_upstream_response_id_value(&ExactJson::Number("9007199254740991.0".to_string()))
-            .unwrap(),
+        extract_upstream_response_id_value(&num("9007199254740991.0")).unwrap(),
         client_max
     );
     assert_eq!(
-        extract_upstream_response_id_value(&ExactJson::Number("90071992547409910e-1".to_string()))
-            .unwrap(),
+        extract_upstream_response_id_value(&num("90071992547409910e-1")).unwrap(),
         client_max
     );
     assert_eq!(
-        extract_upstream_response_id_value(&ExactJson::Number("-9.007199254740991e15".to_string()))
-            .unwrap(),
+        extract_upstream_response_id_value(&num("-9.007199254740991e15")).unwrap(),
         client_min
     );
     assert_eq!(
@@ -347,8 +351,7 @@ fn upstream_response_id_matches_exact_safe_integers_and_rejects_negative_zero_or
 
     for neg_zero in ["-0", "-0.0", "-0e5"] {
         assert_eq!(
-            extract_upstream_response_id_value(&ExactJson::Number(neg_zero.to_string()))
-                .unwrap_err(),
+            extract_upstream_response_id_value(&num(neg_zero)).unwrap_err(),
             "JSON-RPC numeric id must not be negative zero",
             "upstream response id {neg_zero} must be rejected"
         );
@@ -362,8 +365,7 @@ fn upstream_response_id_matches_exact_safe_integers_and_rejects_negative_zero_or
         "9007199254740991.5",
     ] {
         assert_eq!(
-            extract_upstream_response_id_value(&ExactJson::Number(fractional.to_string()))
-                .unwrap_err(),
+            extract_upstream_response_id_value(&num(fractional)).unwrap_err(),
             "JSON-RPC numeric id must be an exact integer without fractional part",
             "fractional upstream response id {fractional} must fail"
         );
@@ -381,13 +383,16 @@ fn upstream_response_id_matches_exact_safe_integers_and_rejects_negative_zero_or
         "18446744073709551617",
     ] {
         assert_eq!(
-            extract_upstream_response_id_value(&ExactJson::Number(out_of_range.to_string()))
-                .unwrap_err(),
+            extract_upstream_response_id_value(&num(out_of_range)).unwrap_err(),
             "JSON-RPC numeric id outside IEEE-754 safe integer range",
             "out-of-range upstream response id {out_of_range} must fail"
         );
     }
+}
 
+#[test]
+fn jsonrpc_id_spelling_and_exact_json_roundtrip() {
+    let client_one = extract_id_value(&num("1")).unwrap();
     let resp_obj = parse_exact_json(r#"{"jsonrpc":"2.0","id":1.0,"result":{}}"#).unwrap();
     let frame = classify_upstream_frame(resp_obj.as_object().unwrap()).unwrap();
     let UpstreamFrame::Response { id: float_one } = frame else {
@@ -400,20 +405,16 @@ fn upstream_response_id_matches_exact_safe_integers_and_rejects_negative_zero_or
     assert!(str_id.has_same_spelling(&JsonRpcId::Str("1".to_string())));
     assert!(!str_id.has_same_spelling(&client_one));
     assert!(!client_one.has_same_spelling(&str_id));
-    assert_eq!(
-        client_one.to_exact_json(),
-        ExactJson::Number("1".to_string())
-    );
+    assert_eq!(client_one.to_exact_json(), num("1"));
     assert_eq!(str_id.to_exact_json(), ExactJson::Str("1".to_string()));
 }
 
 #[test]
 fn upstream_response_id_scales_positive_exponents_and_checks_safe_range() {
-    let client_ten = extract_id_value(&ExactJson::Number("10".to_string())).unwrap();
-    let client_hundred = extract_id_value(&ExactJson::Number("100".to_string())).unwrap();
-    let client_neg_hundred = extract_id_value(&ExactJson::Number("-100".to_string())).unwrap();
-    let client_scaled_max =
-        extract_id_value(&ExactJson::Number("9007199254740990".to_string())).unwrap();
+    let client_ten = extract_id_value(&num("10")).unwrap();
+    let client_hundred = extract_id_value(&num("100")).unwrap();
+    let client_neg_hundred = extract_id_value(&num("-100")).unwrap();
+    let client_scaled_max = extract_id_value(&num("9007199254740990")).unwrap();
 
     for (raw, expected) in [
         ("10.0", &client_ten),
@@ -423,7 +424,7 @@ fn upstream_response_id_scales_positive_exponents_and_checks_safe_range() {
         ("9.00719925474099e15", &client_scaled_max),
     ] {
         assert_eq!(
-            extract_upstream_response_id_value(&ExactJson::Number(raw.to_string())).unwrap(),
+            extract_upstream_response_id_value(&num(raw)).unwrap(),
             *expected,
             "positive-exponent upstream response id {raw} must correlate"
         );
@@ -431,8 +432,7 @@ fn upstream_response_id_scales_positive_exponents_and_checks_safe_range() {
 
     for out_of_range in ["9.1e15", "-9.1e15"] {
         assert_eq!(
-            extract_upstream_response_id_value(&ExactJson::Number(out_of_range.to_string()))
-                .unwrap_err(),
+            extract_upstream_response_id_value(&num(out_of_range)).unwrap_err(),
             "JSON-RPC numeric id outside IEEE-754 safe integer range",
             "positive-exponent overflow {out_of_range} must be rejected"
         );
@@ -506,55 +506,66 @@ fn read_bounded_line_retries_eintr_mid_frame() {
     ));
 }
 
+#[derive(Default)]
+struct InterruptingWriter {
+    out: Vec<u8>,
+    write_step: usize,
+    flush_calls: usize,
+    flush_interrupts_left: usize,
+    fail_write_zero: bool,
+    fail_write_broken_after_prefix: bool,
+    fail_flush_broken: bool,
+}
+
+impl Write for InterruptingWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        if self.fail_write_zero {
+            return Ok(0);
+        }
+        self.write_step += 1;
+        match self.write_step {
+            1 => {
+                let n = buf.len().min(6);
+                self.out.extend_from_slice(&buf[..n]);
+                Ok(n)
+            }
+            2 if self.fail_write_broken_after_prefix => Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "write broken",
+            )),
+            2 => Err(std::io::Error::new(
+                std::io::ErrorKind::Interrupted,
+                "write EINTR",
+            )),
+            _ => {
+                self.out.extend_from_slice(buf);
+                Ok(buf.len())
+            }
+        }
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.flush_calls += 1;
+        if self.fail_flush_broken {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "flush broken",
+            ));
+        }
+        if self.flush_interrupts_left > 0 {
+            self.flush_interrupts_left -= 1;
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Interrupted,
+                "flush EINTR",
+            ));
+        }
+        Ok(())
+    }
+}
+
 #[test]
 fn write_raw_line_retries_eintr_on_write_and_flush() {
     use std::io;
-
-    struct InterruptingWriter {
-        out: Vec<u8>,
-        write_step: usize,
-        flush_calls: usize,
-        flush_interrupts_left: usize,
-        fail_write_zero: bool,
-        fail_write_broken_after_prefix: bool,
-        fail_flush_broken: bool,
-    }
-
-    impl Write for InterruptingWriter {
-        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-            if self.fail_write_zero {
-                return Ok(0);
-            }
-            self.write_step += 1;
-            match self.write_step {
-                1 => {
-                    let n = buf.len().min(6);
-                    self.out.extend_from_slice(&buf[..n]);
-                    Ok(n)
-                }
-                2 if self.fail_write_broken_after_prefix => {
-                    Err(io::Error::new(io::ErrorKind::BrokenPipe, "write broken"))
-                }
-                2 => Err(io::Error::new(io::ErrorKind::Interrupted, "write EINTR")),
-                _ => {
-                    self.out.extend_from_slice(buf);
-                    Ok(buf.len())
-                }
-            }
-        }
-
-        fn flush(&mut self) -> io::Result<()> {
-            self.flush_calls += 1;
-            if self.fail_flush_broken {
-                return Err(io::Error::new(io::ErrorKind::BrokenPipe, "flush broken"));
-            }
-            if self.flush_interrupts_left > 0 {
-                self.flush_interrupts_left -= 1;
-                return Err(io::Error::new(io::ErrorKind::Interrupted, "flush EINTR"));
-            }
-            Ok(())
-        }
-    }
 
     let line = r#"{"jsonrpc":"2.0","id":1,"result":{"ok":true}}"#;
     let mut writer = InterruptingWriter {
@@ -633,7 +644,7 @@ fn read_bounded_line_rejects_invalid_utf8_with_newline_and_at_eof() {
 #[test]
 fn fail_upstream_line_read_handles_all_error_variants() {
     let req_id = JsonRpcId::Number {
-        raw: "7".to_string(),
+        raw: JsonNumber::parse("7").unwrap(),
         value: 7,
     };
 
@@ -649,7 +660,7 @@ fn fail_upstream_line_read_handles_all_error_variants() {
     let long_err = parsed_long.as_object().unwrap()["error"]
         .as_object()
         .unwrap();
-    assert_eq!(long_err["code"], ExactJson::Number("-32603".to_string()));
+    assert_eq!(long_err["code"], num("-32603"));
     assert!(long_err["message"]
         .as_str()
         .unwrap()
@@ -664,7 +675,7 @@ fn fail_upstream_line_read_handles_all_error_variants() {
     let parsed_cr = parse_exact_json(std::str::from_utf8(&out_cr).unwrap().trim()).unwrap();
     assert_eq!(
         parsed_cr.as_object().unwrap()["error"].as_object().unwrap()["code"],
-        ExactJson::Number("-32700".to_string())
+        num("-32700")
     );
 
     let mut out_utf8 = Vec::new();
@@ -677,7 +688,7 @@ fn fail_upstream_line_read_handles_all_error_variants() {
         parsed_utf8.as_object().unwrap()["error"]
             .as_object()
             .unwrap()["code"],
-        ExactJson::Number("-32603".to_string())
+        num("-32603")
     );
 
     let mut out_io = Vec::new();

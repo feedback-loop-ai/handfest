@@ -50,7 +50,7 @@ pub(crate) fn parse_facts_arg(raw: &str) -> Result<VerifiedFacts, String> {
 fn json_value_to_scalar(field: &str, value: &ExactJson) -> Result<Scalar, String> {
     match value {
         ExactJson::Bool(b) => Ok(Scalar::Bool(*b)),
-        ExactJson::Number(raw) => parse_exact_json_number(field, raw),
+        ExactJson::Number(raw) => parse_exact_json_number(field, raw.as_str()),
         ExactJson::Str(s) => {
             if let Ok(ts) = parse_rfc3339_utc(s) {
                 Ok(Scalar::Timestamp(ts))
@@ -74,12 +74,8 @@ fn parse_typed_scalar_object(
     field: &str,
     entries: &BTreeMap<String, ExactJson>,
 ) -> Result<Scalar, String> {
-    if entries.len() != 1 {
-        return Err(format!(
-            "fact '{field}': typed scalar object must contain exactly one type key"
-        ));
-    }
-    let Some((tag, inner)) = entries.iter().next() else {
+    let mut iter = entries.iter();
+    let (Some((tag, inner)), None) = (iter.next(), iter.next()) else {
         return Err(format!(
             "fact '{field}': typed scalar object must contain exactly one type key"
         ));
@@ -103,7 +99,7 @@ fn parse_typed_scalar_object(
                 .map_err(|err| format!("fact '{field}': invalid decimal: {err}"))?;
             Ok(Scalar::Decimal(dec))
         }
-        ("int", ExactJson::Number(raw)) => parse_canonical_json_int(raw)
+        ("int", ExactJson::Number(raw)) => parse_canonical_json_int(raw.as_str())
             .map(Scalar::Int)
             .ok_or_else(|| format!("fact '{field}': expected 64-bit signed integer")),
         ("bool", ExactJson::Bool(b)) => Ok(Scalar::Bool(*b)),

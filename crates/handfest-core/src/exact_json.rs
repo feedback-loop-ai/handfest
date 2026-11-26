@@ -15,12 +15,50 @@ use crate::json_num::{scan_json_number_token, NumberError};
 /// Default maximum JSON container nesting depth enforced by [`parse_exact_json`].
 pub const DEFAULT_MAX_JSON_DEPTH: usize = 128;
 
+/// Validated RFC 8259 JSON numeric token guaranteed to serialize as single-line JSON.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JsonNumber(String);
+
+impl JsonNumber {
+    /// Validates that `raw` is a single complete RFC 8259 JSON number token with no surrounding
+    /// whitespace or trailing characters.
+    pub fn parse(raw: impl Into<String>) -> Result<Self, NumberError> {
+        let raw = raw.into();
+        let bytes = raw.as_bytes();
+        let end = scan_json_number_token(bytes, 0)?;
+        if end != bytes.len() {
+            return Err(NumberError::InvalidSyntax(format!(
+                "trailing characters in JSON number at offset {end}"
+            )));
+        }
+        Ok(Self(raw))
+    }
+
+    /// Borrows the exact validated RFC 8259 numeric token spelling.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        self.0.as_str()
+    }
+}
+
+impl From<i32> for JsonNumber {
+    fn from(value: i32) -> Self {
+        Self(value.to_string())
+    }
+}
+
+impl fmt::Display for JsonNumber {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
 /// Lossless JSON AST preserving exact numeric token spellings and rejecting duplicate keys.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ExactJson {
     Null,
     Bool(bool),
-    Number(String),
+    Number(JsonNumber),
     Str(String),
     Array(Vec<ExactJson>),
     Object(BTreeMap<String, ExactJson>),
@@ -157,7 +195,7 @@ fn write_exact_json(val: &ExactJson, out: &mut String) {
         ExactJson::Null => out.push_str("null"),
         ExactJson::Bool(true) => out.push_str("true"),
         ExactJson::Bool(false) => out.push_str("false"),
-        ExactJson::Number(raw) => out.push_str(raw),
+        ExactJson::Number(raw) => out.push_str(raw.as_str()),
         ExactJson::Str(s) => write_json_string(s, out),
         ExactJson::Array(items) => {
             out.push('[');
@@ -229,13 +267,16 @@ impl<'a> JsonParser<'a> {
     }
 
     fn parse_value(&mut self, depth: usize) -> Result<ExactJson, JsonError> {
-        if depth > self.max_depth {
-            return Err(JsonError::MaxDepthExceeded);
-        }
         self.skip_ws();
         match self.peek() {
-            Some(b'{') => self.parse_object(depth + 1),
-            Some(b'[') => self.parse_array(depth + 1),
+            Some(b'{') => {
+                let next_depth = self.enter_container(depth)?;
+                self.parse_object(next_depth)
+            }
+            Some(b'[') => {
+                let next_depth = self.enter_container(depth)?;
+                self.parse_array(next_depth)
+            }
             Some(b'"') => self.parse_string().map(ExactJson::Str),
             Some(b't') => self.expect_literal(b"true", ExactJson::Bool(true)),
             Some(b'f') => self.expect_literal(b"false", ExactJson::Bool(false)),
@@ -247,6 +288,13 @@ impl<'a> JsonParser<'a> {
             }),
             None => Err(JsonError::UnexpectedEof),
         }
+    }
+
+    fn enter_container(&self, depth: usize) -> Result<usize, JsonError> {
+        if depth >= self.max_depth {
+            return Err(JsonError::MaxDepthExceeded);
+        }
+        Ok(depth + 1)
     }
 
     fn expect_literal(&mut self, lit: &[u8], value: ExactJson) -> Result<ExactJson, JsonError> {
@@ -405,17 +453,19 @@ impl<'a> JsonParser<'a> {
                 ));
             }
             let combined = 0x10000 + ((u32::from(code) - 0xD800) << 10) + (u32::from(low) - 0xDC00);
-            char::from_u32(combined).ok_or_else(|| {
-                JsonError::InvalidString("invalid Unicode scalar from surrogate pair".to_string())
-            })
+            // Unreachable None: validated high (0xD800..=0xDBFF) and low (0xDC00..=0xDFFF)
+            // UTF-16 surrogates map bijectively onto valid scalar range U+10000..=U+10FFFF.
+            Ok(char::from_u32(combined)
+                .expect("validated surrogate pair is a valid Unicode scalar"))
         } else if (0xDC00..=0xDFFF).contains(&code) {
             Err(JsonError::InvalidString(
                 "lone low surrogate in JSON string".to_string(),
             ))
         } else {
-            char::from_u32(u32::from(code)).ok_or_else(|| {
-                JsonError::InvalidString("invalid Unicode escape in JSON string".to_string())
-            })
+            // Unreachable None: `code` is a u16 outside the surrogate block 0xD800..=0xDFFF,
+            // so every remaining value is a valid BMP Unicode scalar.
+            Ok(char::from_u32(u32::from(code))
+                .expect("non-surrogate u16 BMP code unit is a valid Unicode scalar"))
         }
     }
 
@@ -441,11 +491,11 @@ impl<'a> JsonParser<'a> {
         Ok(acc)
     }
 
-    fn parse_number(&mut self) -> Result<String, JsonError> {
+    fn parse_number(&mut self) -> Result<JsonNumber, JsonError> {
         let start = self.pos;
         let end = scan_json_number_token(self.bytes, start).map_err(JsonError::InvalidNumber)?;
         self.pos = end;
-        Ok(self.src[start..end].to_string())
+        Ok(JsonNumber(self.src[start..end].to_string()))
     }
 }
 

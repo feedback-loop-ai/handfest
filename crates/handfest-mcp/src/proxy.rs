@@ -113,12 +113,6 @@ impl<C: Clock, L: ReceiptLedger> McpProxy<C, L> {
         &self.ledger
     }
 
-    /// Mutably borrows the underlying [`ReceiptLedger`].
-    #[must_use]
-    pub fn ledger_mut(&mut self) -> &mut L {
-        &mut self.ledger
-    }
-
     /// Consumes the proxy and returns its underlying [`ReceiptLedger`].
     #[must_use]
     pub fn into_ledger(self) -> L {

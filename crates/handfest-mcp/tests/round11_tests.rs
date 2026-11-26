@@ -658,33 +658,8 @@ fn round11_tools_call_rejects_malformed_meta_without_consuming_quota_or_forwardi
         .collect();
     client_script.push_str(&format!("{valid_call}\n{over_quota}\n"));
 
-    let (up_in_w, mut up_in_r) = mem_pipe();
-    let (mut up_out_w, up_out_r) = mem_pipe();
-    let upstream = thread::spawn(move || {
-        let mut forwarded = Vec::new();
-        let mut line = String::new();
-        while up_in_r.read_line(&mut line).unwrap() > 0 {
-            forwarded.push(line.trim_end().to_string());
-            writeln!(
-                up_out_w,
-                r#"{{"jsonrpc":"2.0","id":6,"result":{{"ok":true}}}}"#
-            )
-            .unwrap();
-            line.clear();
-        }
-        forwarded
-    });
-
-    let mut client_out = Vec::new();
-    proxy
-        .run(
-            BufReader::new(Cursor::new(client_script.into_bytes())),
-            &mut client_out,
-            up_in_w,
-            up_out_r,
-        )
-        .expect("session must stay healthy across malformed _meta denials");
-    assert_eq!(upstream.join().unwrap(), vec![valid_call]);
+    let (client_out, forwarded) = run_echo_ok_upstream(&mut proxy, client_script, 6);
+    assert_eq!(forwarded, vec![valid_call]);
 
     let responses: Vec<Value> = String::from_utf8(client_out)
         .unwrap()
@@ -1012,4 +987,37 @@ fn round11_tools_list_and_call_use_precompiled_static_decimal_and_timestamp_fact
         resp,
         json!({"jsonrpc":"2.0","id":2,"result":{"quoted":true}})
     );
+}
+
+fn run_echo_ok_upstream(
+    proxy: &mut McpProxy<FixedClock, SqliteLedger>,
+    client_script: String,
+    ok_id: u64,
+) -> (Vec<u8>, Vec<String>) {
+    let (up_in_w, mut up_in_r) = mem_pipe();
+    let (mut up_out_w, up_out_r) = mem_pipe();
+    let upstream = thread::spawn(move || {
+        let mut forwarded = Vec::new();
+        let mut line = String::new();
+        while up_in_r.read_line(&mut line).unwrap() > 0 {
+            forwarded.push(line.trim_end().to_string());
+            writeln!(
+                up_out_w,
+                r#"{{"jsonrpc":"2.0","id":{ok_id},"result":{{"ok":true}}}}"#
+            )
+            .unwrap();
+            line.clear();
+        }
+        forwarded
+    });
+    let mut client_out = Vec::new();
+    proxy
+        .run(
+            BufReader::new(Cursor::new(client_script.into_bytes())),
+            &mut client_out,
+            up_in_w,
+            up_out_r,
+        )
+        .expect("session must stay healthy across malformed _meta denials");
+    (client_out, upstream.join().unwrap())
 }

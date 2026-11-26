@@ -98,9 +98,12 @@ impl SessionState {
         Some(self.cancelled_requests.remove(pos))
     }
 
-    fn is_in_flight(&self, id: &JsonRpcId) -> bool {
+    fn has_outstanding_id(&self, id: &JsonRpcId) -> bool {
         self.active_request.as_ref().is_some_and(|r| &r.id == id)
             || self.cancelled_requests.iter().any(|r| &r.id == id)
+            || self.queued_client.iter().any(|item| {
+                matches!(item, QueuedClientItem::Request { id: queued_id, .. } if queued_id == id)
+            })
     }
 
     fn push_queued_client(&mut self, item: QueuedClientItem) {
@@ -314,6 +317,17 @@ impl<C: Clock, L: ReceiptLedger> McpProxy<C, L> {
         transport: &mut DuplexTransport,
         client_out: &mut CW,
     ) -> Result<(), ProxyError> {
+        if let QueuedClientItem::Request { ref id, .. } = item {
+            if state.has_outstanding_id(id) {
+                return write_jsonrpc_error(
+                    client_out,
+                    Some(id),
+                    JSONRPC_INVALID_REQUEST,
+                    "duplicate in-flight JSON-RPC request id",
+                    None,
+                );
+            }
+        }
         if !transport.has_pending_upstream()
             && state.queued_client.is_empty()
             && (state.active_request.is_none()
@@ -322,16 +336,7 @@ impl<C: Clock, L: ReceiptLedger> McpProxy<C, L> {
             return self.process_client_item(item, state, transport, client_out);
         }
         if state.queued_client.len() >= MAX_QUEUED_CLIENT_FRAMES {
-            let _ = write_jsonrpc_error(
-                client_out,
-                None,
-                JSONRPC_INVALID_REQUEST,
-                "client exceeded maximum queued JSON-RPC frames",
-                None,
-            );
-            return Err(ProxyError::UpstreamProtocol(
-                "client exceeded maximum queued JSON-RPC frames".to_string(),
-            ));
+            return fail_client_limit(client_out, "client exceeded maximum queued JSON-RPC frames");
         }
         state.push_queued_client(item);
         Ok(())
@@ -417,15 +422,6 @@ impl<C: Clock, L: ReceiptLedger> McpProxy<C, L> {
                 obj,
                 raw_frame,
             } => {
-                if state.is_in_flight(&id) {
-                    return write_jsonrpc_error(
-                        client_out,
-                        Some(&id),
-                        JSONRPC_INVALID_REQUEST,
-                        "duplicate in-flight JSON-RPC request id",
-                        None,
-                    );
-                }
                 let mut ctx = DispatchCtx {
                     state,
                     transport,
@@ -714,16 +710,10 @@ fn cancel_active_request<CW: Write>(
     client_out: &mut CW,
 ) -> Result<(), ProxyError> {
     if state.cancelled_requests.len() >= MAX_CANCELLED_IN_FLIGHT {
-        let _ = write_jsonrpc_error(
+        return fail_client_limit(
             client_out,
-            None,
-            JSONRPC_INVALID_REQUEST,
             "client exceeded maximum in-flight cancelled JSON-RPC requests",
-            None,
         );
-        return Err(ProxyError::UpstreamProtocol(
-            "client exceeded maximum in-flight cancelled JSON-RPC requests".to_string(),
-        ));
     }
     transport.send_upstream(raw_line.to_string())?;
     if let Some(cancelled) = state.active_request.take() {
@@ -788,11 +778,13 @@ fn handle_notification<CW: Write>(
     Ok(())
 }
 
+fn fail_client_limit<CW: Write>(client_out: &mut CW, message: &str) -> Result<(), ProxyError> {
+    let _ = write_jsonrpc_error(client_out, None, JSONRPC_INVALID_REQUEST, message, None);
+    Err(ProxyError::UpstreamProtocol(message.to_string()))
+}
+
 fn handle_post_eof_timeout(transport: &DuplexTransport) -> Result<(), ProxyError> {
-    if let Some(err) = transport.poll_writer_error() {
-        return Err(err);
-    }
-    Ok(())
+    transport.poll_writer_error().map_or(Ok(()), Err)
 }
 
 #[cfg(test)]

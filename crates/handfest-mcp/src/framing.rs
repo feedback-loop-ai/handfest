@@ -5,7 +5,8 @@ use std::io::{BufRead, Write};
 
 use crate::exact_json::{
     canonicalize_json_number, is_canonical_json_int_syntax, is_valid_json_int,
-    parse_canonical_json_int, write_json_string, CanonicalJsonNumber, ExactJson, NumberError,
+    parse_canonical_json_int, write_json_string, CanonicalJsonNumber, ExactJson, JsonNumber,
+    NumberError,
 };
 use crate::proxy::{ProxyError, HANDFEST_DENIED_ERROR_CODE};
 
@@ -19,7 +20,7 @@ const MAX_SAFE_JSONRPC_ID: i64 = (1_i64 << 53) - 1;
 #[derive(Debug, Clone)]
 pub(crate) enum JsonRpcId {
     Str(String),
-    Number { raw: String, value: i64 },
+    Number { raw: JsonNumber, value: i64 },
 }
 
 impl PartialEq for JsonRpcId {
@@ -57,7 +58,7 @@ impl JsonRpcId {
                 write_json_string(s, &mut out);
                 out
             }
-            Self::Number { raw, .. } => raw.clone(),
+            Self::Number { raw, .. } => raw.as_str().to_string(),
         }
     }
 }
@@ -92,7 +93,7 @@ pub(crate) fn extract_id_value(val: &ExactJson) -> Result<JsonRpcId, String> {
     match val {
         ExactJson::Str(s) => Ok(JsonRpcId::Str(s.clone())),
         ExactJson::Number(raw) => {
-            let value = parse_safe_jsonrpc_id_int(raw)?;
+            let value = parse_safe_jsonrpc_id_int(raw.as_str())?;
             Ok(JsonRpcId::Number {
                 raw: raw.clone(),
                 value,
@@ -131,7 +132,7 @@ pub(crate) fn extract_upstream_response_id_value(val: &ExactJson) -> Result<Json
     match val {
         ExactJson::Str(s) => Ok(JsonRpcId::Str(s.clone())),
         ExactJson::Number(raw) => {
-            let value = parse_upstream_response_id_int(raw)?;
+            let value = parse_upstream_response_id_int(raw.as_str())?;
             Ok(JsonRpcId::Number {
                 raw: raw.clone(),
                 value,
@@ -441,7 +442,7 @@ fn is_valid_jsonrpc_error_object(val: &ExactJson) -> bool {
     }
     let valid_code = matches!(
         err_obj.get("code"),
-        Some(ExactJson::Number(raw)) if is_valid_json_int(raw)
+        Some(ExactJson::Number(raw)) if is_valid_json_int(raw.as_str())
     );
     let valid_message = err_obj.get("message").and_then(ExactJson::as_str).is_some();
     valid_code && valid_message
@@ -494,7 +495,10 @@ pub(crate) fn format_jsonrpc_error_line(
 ) -> String {
     let id_json = id.map_or_else(|| "null".to_string(), JsonRpcId::to_json_literal);
     let mut err_fields = BTreeMap::new();
-    err_fields.insert("code".to_string(), ExactJson::Number(code.to_string()));
+    err_fields.insert(
+        "code".to_string(),
+        ExactJson::Number(JsonNumber::from(code)),
+    );
     err_fields.insert("message".to_string(), ExactJson::Str(message.to_string()));
     if let Some(d) = data {
         err_fields.insert("data".to_string(), d.clone());
