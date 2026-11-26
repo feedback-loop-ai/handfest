@@ -944,8 +944,73 @@ fn round9_rejects_negative_zero_ids_and_matches_upstream_float_int() {
     )
     .unwrap();
     let r1 = client_out_r.read_line_timeout(Duration::from_secs(2), "resp 1 via 1.0");
-    let r1_val: Value = serde_json::from_str(r1.trim_end()).unwrap();
+    let r1_val = assert_wire_int_id(&r1, 1);
     assert_eq!(r1_val["result"]["pong"], json!(1));
+
+    drop(client_in_w);
+    drop(up_out_w);
+    done_rx
+        .recv_timeout(Duration::from_secs(2))
+        .expect("proxy exit timed out")
+        .unwrap();
+    proxy_thread.join().unwrap();
+}
+
+fn assert_wire_int_id(raw_line: &str, expected: i64) -> Value {
+    let val: Value = serde_json::from_str(raw_line.trim_end()).unwrap();
+    assert_eq!(val["id"].as_i64(), Some(expected), "wire line: {raw_line}");
+    assert!(
+        !val["id"].is_f64(),
+        "reply must emit plain integer id {expected}, got {raw_line}"
+    );
+    assert_eq!(
+        serde_json::from_value::<i64>(val["id"].clone()).unwrap(),
+        expected
+    );
+    val
+}
+
+#[test]
+fn round9_emits_client_integer_id_for_tools_list_result_and_error() {
+    let mut proxy = make_proxy("");
+    let (client_in_w, client_in_r) = step_pipe();
+    let (mut client_out_w, mut client_out_r) = mem_pipe_timeout();
+    let (up_in_tx, up_in_rx) = mpsc::channel::<Vec<u8>>();
+    let (mut up_out_w, up_out_r) = mem_pipe();
+    let (done_tx, done_rx) = mpsc::sync_channel(1);
+    let proxy_thread = thread::spawn(move || {
+        let res = proxy.run(
+            client_in_r,
+            &mut client_out_w,
+            PipeWriter { tx: up_in_tx },
+            up_out_r,
+        );
+        let _ = done_tx.send(res);
+    });
+
+    client_in_w.send_bytes(b"{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"tools/list\"}\n");
+    let f3 = String::from_utf8(up_in_rx.recv_timeout(Duration::from_secs(2)).unwrap()).unwrap();
+    let _ = assert_wire_int_id(&f3, 3);
+    writeln!(
+        up_out_w,
+        r#"{{"jsonrpc":"2.0","id":3.0,"result":{{"tools":[{{"name":"merge_pr"}},{{"name":"blocked_tool"}}]}}}}"#
+    )
+    .unwrap();
+    let r3 = client_out_r.read_line_timeout(Duration::from_secs(2), "tools/list result via 3.0");
+    let r3_val = assert_wire_int_id(&r3, 3);
+    assert_eq!(r3_val["result"]["tools"], json!([{"name": "merge_pr"}]));
+
+    client_in_w.send_bytes(b"{\"jsonrpc\":\"2.0\",\"id\":4,\"method\":\"tools/list\"}\n");
+    let f4 = String::from_utf8(up_in_rx.recv_timeout(Duration::from_secs(2)).unwrap()).unwrap();
+    let _ = assert_wire_int_id(&f4, 4);
+    writeln!(
+        up_out_w,
+        r#"{{"jsonrpc":"2.0","id":4.0,"error":{{"code":-32000,"message":"upstream list error"}}}}"#
+    )
+    .unwrap();
+    let r4 = client_out_r.read_line_timeout(Duration::from_secs(2), "tools/list error via 4.0");
+    let r4_val = assert_wire_int_id(&r4, 4);
+    assert_eq!(r4_val["error"]["code"], json!(-32000));
 
     drop(client_in_w);
     drop(up_out_w);
@@ -1037,7 +1102,7 @@ fn round9_denies_negative_zero_int_argument_fact_with_receipt() {
     )
     .unwrap();
     let ok_line = client_out_r.read_line_timeout(Duration::from_secs(2), "mode 0 reply");
-    let ok_val: Value = serde_json::from_str(ok_line.trim_end()).unwrap();
+    let ok_val = assert_wire_int_id(&ok_line, 2);
     assert_eq!(ok_val["result"]["ok"], json!(true));
 
     drop(client_in_w);

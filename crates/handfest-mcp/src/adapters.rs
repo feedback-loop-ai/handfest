@@ -5,8 +5,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use handfest_anchors::{AnchorError, AnchorRegistry, AnchorVerifier, SignedMandate};
 use handfest_core::ast::MandateId;
-use handfest_core::gate::VerifiedMandate;
-use handfest_core::lattice::subsumes;
+use handfest_core::gate::{verify_chain_structure, VerifiedMandate};
 use handfest_ledger::LedgerError;
 
 use crate::mapping::MappingError;
@@ -161,30 +160,5 @@ pub fn verify_mandate_chain(signed: &[SignedMandate]) -> Result<Vec<VerifiedMand
 pub(crate) fn validate_verified_chain(
     verified: &[VerifiedMandate],
 ) -> Result<Vec<MandateId>, ProxyError> {
-    if verified.is_empty() {
-        return Err(ProxyError::InvalidChain(
-            "mandate chain must contain at least one mandate".to_string(),
-        ));
-    }
-    if verified[0].ast.parent().is_some() {
-        return Err(ProxyError::InvalidChain(
-            "root mandate must not declare a PARENT digest".to_string(),
-        ));
-    }
-    let mut chain_ids = Vec::with_capacity(verified.len());
-    for (hop, vm) in verified.iter().enumerate() {
-        let mid = vm.ast.try_mandate_id().map_err(|err| {
-            ProxyError::InvalidChain(format!("hop {hop}: invalid mandate AST: {err}"))
-        })?;
-        chain_ids.push(mid);
-    }
-    for (hop, pair) in verified.windows(2).enumerate() {
-        subsumes(&pair[0].ast, &pair[1].ast).map_err(|err| {
-            ProxyError::InvalidChain(format!(
-                "attenuation check failed at hop {hop} -> {}: {err}",
-                hop + 1
-            ))
-        })?;
-    }
-    Ok(chain_ids)
+    verify_chain_structure(verified).map_err(ProxyError::InvalidChain)
 }

@@ -373,7 +373,11 @@ fn upstream_response_id_matches_exact_safe_integers_and_rejects_negative_zero_or
     for out_of_range in [
         "9007199254740992",
         "-9007199254740992",
+        "9007199254740992.0",
+        "-9007199254740992.0",
+        "9007199254740992e0",
         "1e16",
+        "1e18446744073709551616",
         "1e100000000000000000000",
         "18446744073709551617",
     ] {
@@ -387,7 +391,21 @@ fn upstream_response_id_matches_exact_safe_integers_and_rejects_negative_zero_or
 
     let resp_obj = parse_exact_json(r#"{"jsonrpc":"2.0","id":1.0,"result":{}}"#).unwrap();
     let frame = classify_upstream_frame(resp_obj.as_object().unwrap()).unwrap();
-    assert!(matches!(frame, UpstreamFrame::Response { id } if id == client_one));
+    let UpstreamFrame::Response { id: float_one } = frame else {
+        panic!("expected upstream response frame");
+    };
+    assert_eq!(float_one, client_one);
+    assert!(!client_one.has_same_spelling(&float_one));
+    assert!(client_one.has_same_spelling(&client_one));
+    let str_id = JsonRpcId::Str("1".to_string());
+    assert!(str_id.has_same_spelling(&JsonRpcId::Str("1".to_string())));
+    assert!(!str_id.has_same_spelling(&client_one));
+    assert!(!client_one.has_same_spelling(&str_id));
+    assert_eq!(
+        client_one.to_exact_json(),
+        ExactJson::Number("1".to_string())
+    );
+    assert_eq!(str_id.to_exact_json(), ExactJson::Str("1".to_string()));
 }
 
 #[test]
@@ -464,8 +482,10 @@ fn write_raw_line_retries_eintr_on_write_and_flush() {
     struct InterruptingWriter {
         out: Vec<u8>,
         write_step: usize,
+        flush_calls: usize,
         flush_interrupts_left: usize,
         fail_write_zero: bool,
+        fail_write_broken_after_prefix: bool,
         fail_flush_broken: bool,
     }
 
@@ -481,6 +501,9 @@ fn write_raw_line_retries_eintr_on_write_and_flush() {
                     self.out.extend_from_slice(&buf[..n]);
                     Ok(n)
                 }
+                2 if self.fail_write_broken_after_prefix => {
+                    Err(io::Error::new(io::ErrorKind::BrokenPipe, "write broken"))
+                }
                 2 => Err(io::Error::new(io::ErrorKind::Interrupted, "write EINTR")),
                 _ => {
                     self.out.extend_from_slice(buf);
@@ -490,6 +513,7 @@ fn write_raw_line_retries_eintr_on_write_and_flush() {
         }
 
         fn flush(&mut self) -> io::Result<()> {
+            self.flush_calls += 1;
             if self.fail_flush_broken {
                 return Err(io::Error::new(io::ErrorKind::BrokenPipe, "flush broken"));
             }
@@ -505,8 +529,10 @@ fn write_raw_line_retries_eintr_on_write_and_flush() {
     let mut writer = InterruptingWriter {
         out: Vec::new(),
         write_step: 0,
+        flush_calls: 0,
         flush_interrupts_left: 2,
         fail_write_zero: false,
+        fail_write_broken_after_prefix: false,
         fail_flush_broken: false,
     };
     write_raw_line(&mut writer, line).expect("write_raw_line must retry EINTR on write and flush");
@@ -516,8 +542,10 @@ fn write_raw_line_retries_eintr_on_write_and_flush() {
     let mut zero_writer = InterruptingWriter {
         out: Vec::new(),
         write_step: 0,
+        flush_calls: 0,
         flush_interrupts_left: 0,
         fail_write_zero: true,
+        fail_write_broken_after_prefix: false,
         fail_flush_broken: false,
     };
     assert!(matches!(
@@ -525,11 +553,29 @@ fn write_raw_line_retries_eintr_on_write_and_flush() {
         Err(ProxyError::Io(err)) if err.kind() == io::ErrorKind::WriteZero
     ));
 
+    let mut partial_broken_writer = InterruptingWriter {
+        out: Vec::new(),
+        write_step: 0,
+        flush_calls: 0,
+        flush_interrupts_left: 0,
+        fail_write_zero: false,
+        fail_write_broken_after_prefix: true,
+        fail_flush_broken: false,
+    };
+    assert!(matches!(
+        write_raw_line(&mut partial_broken_writer, line),
+        Err(ProxyError::Io(err)) if err.kind() == io::ErrorKind::BrokenPipe
+    ));
+    assert_eq!(partial_broken_writer.out, &line.as_bytes()[..6]);
+    assert_eq!(partial_broken_writer.flush_calls, 0);
+
     let mut broken_flush = InterruptingWriter {
         out: Vec::new(),
         write_step: 3,
+        flush_calls: 0,
         flush_interrupts_left: 0,
         fail_write_zero: false,
+        fail_write_broken_after_prefix: false,
         fail_flush_broken: true,
     };
     assert!(matches!(

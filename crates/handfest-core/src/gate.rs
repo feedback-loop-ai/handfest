@@ -365,28 +365,44 @@ fn build_receipt(
     receipt
 }
 
-/// Verifies runtime chain validity at `now` for `actor_key`: non-empty chain, valid RFC 3339
-/// timestamp bounds, root absence of `PARENT`, per-hop anchor proof bindings and validity
-/// windows, monotonic lattice attenuation across hops, and leaf `TO` key match.
+/// Verifies static structural invariants of a mandate chain: non-empty chain, root absence of
+/// `PARENT`, valid canonical ASTs (returning per-hop [`MandateId`]s), and monotonic lattice
+/// attenuation (`subsumes`) across every adjacent hop.
+pub fn verify_chain_structure(chain: &[VerifiedMandate]) -> Result<Vec<MandateId>, String> {
+    if chain.is_empty() {
+        return Err("empty mandate chain".into());
+    }
+    if chain[0].ast.parent().is_some() {
+        return Err("root mandate must not declare a PARENT digest".into());
+    }
+    let mut chain_ids = Vec::with_capacity(chain.len());
+    for (hop, vm) in chain.iter().enumerate() {
+        let mid = vm
+            .ast
+            .try_mandate_id()
+            .map_err(|err| format!("hop {hop}: invalid mandate AST: {err}"))?;
+        chain_ids.push(mid);
+    }
+    verify_attenuation(chain)?;
+    Ok(chain_ids)
+}
+
+/// Verifies runtime chain validity at `now` for `actor_key`: structural invariants via
+/// [`verify_chain_structure`], valid RFC 3339 timestamp bounds, per-hop anchor proof bindings and
+/// validity windows, and leaf `TO` key match.
 pub fn verify_chain_runtime(
     chain: &[VerifiedMandate],
     actor_key: &KeyId,
     now: i64,
 ) -> Result<(), String> {
-    if chain.is_empty() {
-        return Err("empty mandate chain".into());
-    }
+    let _ = verify_chain_structure(chain)?;
     if !is_valid_timestamp(now) {
         return Err(format!(
             "timestamp {now} outside 0000-01-01T00:00:00Z..=9999-12-31T23:59:59Z"
         ));
     }
-    if chain[0].ast.parent().is_some() {
-        return Err("root mandate must not declare a PARENT digest".into());
-    }
 
     verify_proofs(chain, now)?;
-    verify_attenuation(chain)?;
 
     let leaf = &chain[chain.len() - 1];
     if leaf.ast.to().key() != actor_key {
@@ -749,6 +765,21 @@ mod tests {
             verify_chain_runtime(core::slice::from_ref(&valid_child), &sub, 150),
             Err("root mandate must not declare a PARENT digest".into())
         );
+        assert_eq!(
+            verify_chain_structure(&[]),
+            Err("empty mandate chain".into())
+        );
+        assert_eq!(
+            verify_chain_structure(core::slice::from_ref(&valid_child)),
+            Err("root mandate must not declare a PARENT digest".into())
+        );
+        assert_eq!(
+            verify_chain_structure(&[vm.clone(), valid_child.clone()]),
+            Ok(alloc::vec![pid, valid_child.ast.mandate_id()])
+        );
+        assert!(verify_chain_structure(&[vm.clone(), child_vm("git.*")])
+            .unwrap_err()
+            .contains("attenuation check failed"));
         assert_eq!(
             verify_chain_runtime(&[vm.clone(), valid_child], &sub, 150),
             Ok(())

@@ -505,7 +505,7 @@ impl<C: Clock, L: ReceiptLedger> McpProxy<C, L> {
     fn handle_upstream_response<CW: Write>(
         &self,
         resp_id: JsonRpcId,
-        obj: BTreeMap<String, ExactJson>,
+        mut obj: BTreeMap<String, ExactJson>,
         raw_line: &str,
         state: &mut SessionState,
         client_out: &mut CW,
@@ -537,11 +537,25 @@ impl<C: Clock, L: ReceiptLedger> McpProxy<C, L> {
         let Some(pending) = pending else {
             return Ok(());
         };
+        let id_spelling_matches = pending.id.has_same_spelling(&resp_id);
+        if !id_spelling_matches {
+            obj.insert("id".to_string(), pending.id.to_exact_json());
+        }
         match pending.kind {
-            PendingKind::Normal => write_raw_line(client_out, raw_line),
-            PendingKind::ToolsList { evaluated_at } => {
-                self.relay_filtered_tools_list(&pending.id, evaluated_at, obj, raw_line, client_out)
+            PendingKind::Normal => {
+                if id_spelling_matches {
+                    write_raw_line(client_out, raw_line)
+                } else {
+                    write_raw_line(client_out, &ExactJson::Object(obj).to_json_string())
+                }
             }
+            PendingKind::ToolsList { evaluated_at } => self.relay_filtered_tools_list(
+                &pending.id,
+                evaluated_at,
+                obj,
+                id_spelling_matches.then_some(raw_line),
+                client_out,
+            ),
         }
     }
     pub(crate) fn ensure_upstream_alive<CW: Write>(

@@ -35,6 +35,21 @@ impl PartialEq for JsonRpcId {
 impl Eq for JsonRpcId {}
 
 impl JsonRpcId {
+    pub(crate) fn has_same_spelling(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Str(a), Self::Str(b)) => a == b,
+            (Self::Number { raw: a, .. }, Self::Number { raw: b, .. }) => a == b,
+            (Self::Str(_), Self::Number { .. }) | (Self::Number { .. }, Self::Str(_)) => false,
+        }
+    }
+
+    pub(crate) fn to_exact_json(&self) -> ExactJson {
+        match self {
+            Self::Str(s) => ExactJson::Str(s.clone()),
+            Self::Number { raw, .. } => ExactJson::Number(raw.clone()),
+        }
+    }
+
     pub(crate) fn to_json_literal(&self) -> String {
         match self {
             Self::Str(s) => {
@@ -443,25 +458,8 @@ pub(crate) fn write_raw_line<W: Write>(out: &mut W, line: &str) -> Result<(), Pr
     let mut framed = Vec::with_capacity(line.len() + 1);
     framed.extend_from_slice(line.as_bytes());
     framed.push(b'\n');
-    write_all_retry_eintr(out, &framed)?;
+    out.write_all(&framed)?;
     flush_retry_eintr(out)?;
-    Ok(())
-}
-
-fn write_all_retry_eintr<W: Write>(out: &mut W, mut buf: &[u8]) -> std::io::Result<()> {
-    while !buf.is_empty() {
-        match out.write(buf) {
-            Ok(0) => {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::WriteZero,
-                    "failed to write whole JSON-RPC frame",
-                ));
-            }
-            Ok(n) => buf = &buf[n..],
-            Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
-            Err(err) => return Err(err),
-        }
-    }
     Ok(())
 }
 

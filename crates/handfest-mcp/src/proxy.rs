@@ -206,12 +206,15 @@ impl<C: Clock, L: ReceiptLedger> McpProxy<C, L> {
         req_id: &JsonRpcId,
         evaluated_at: i64,
         mut resp_obj: BTreeMap<String, ExactJson>,
-        raw_line: &str,
+        raw_line: Option<&str>,
         client_out: &mut CW,
     ) -> Result<(), ProxyError> {
         // `classify_upstream_frame` already proved `result` XOR valid `error` object.
         if resp_obj.contains_key("error") {
-            return write_raw_line(client_out, raw_line);
+            return match raw_line {
+                Some(raw) => write_raw_line(client_out, raw),
+                None => write_raw_line(client_out, &ExactJson::Object(resp_obj).to_json_string()),
+            };
         }
 
         let Some(result_obj) = resp_obj
