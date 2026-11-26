@@ -473,7 +473,7 @@ fn handfest_mcp_emits_chain_invalid_for_broken_attenuation() {
 }
 
 #[test]
-fn tool_policy_map_from_file_public_api_loads_valid_and_rejects_missing_file() {
+fn load_policy_map_file_public_api_loads_valid_and_rejects_missing_file() {
     let dir = tempfile::TempDir::new().unwrap();
     let policy_path = dir.path().join("policy.json");
     std::fs::write(
@@ -490,14 +490,14 @@ fn tool_policy_map_from_file_public_api_loads_valid_and_rejects_missing_file() {
     )
     .unwrap();
 
-    let loaded = handfest_mcp::ToolPolicyMap::from_file(&policy_path).unwrap();
+    let loaded = handfest_mcp::mapping::load_policy_map_file(&policy_path).unwrap();
     assert_eq!(loaded.tools.len(), 1);
     let compiled: handfest_mcp::CompiledPolicyMap = loaded.compile().unwrap();
     assert!(compiled.policy_map().get("merge_pr").is_some());
 
     let missing_path = dir.path().join("missing.json");
     assert!(matches!(
-        handfest_mcp::ToolPolicyMap::from_file(&missing_path),
+        handfest_mcp::mapping::load_policy_map_file(&missing_path),
         Err(handfest_mcp::MappingError::Io(ref msg)) if msg.contains("failed to read")
     ));
 }

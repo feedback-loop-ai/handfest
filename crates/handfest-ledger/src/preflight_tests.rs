@@ -1011,6 +1011,15 @@ fn assert_deferred_fd_cap_err<T>(res: Result<T, LedgerError>) {
 }
 
 #[cfg(unix)]
+fn assert_cached_header_probe_at_cap(state: &mut ActiveHandleRegistry, db_path: &Path) {
+    let calls_before = raw_open_calls();
+    let id = inspect_sqlite_header_locked(state, db_path).unwrap();
+    assert_eq!(id, FileIdentity::from_path(db_path).unwrap());
+    assert_eq!(raw_open_calls(), calls_before);
+    assert_eq!(state.total_deferred_fds(), MAX_DEFERRED_FDS + 1);
+}
+
+#[cfg(unix)]
 #[test]
 fn inode_change_before_open_cannot_exceed_deferred_fd_cap() {
     static REG: OnceLock<Mutex<ActiveHandleRegistry>> = OnceLock::new();
@@ -1068,6 +1077,8 @@ fn inode_change_before_open_cannot_exceed_deferred_fd_cap() {
         });
         assert_deferred_fd_cap_err(res);
         assert_eq!(state.total_deferred_fds(), MAX_DEFERRED_FDS + 1);
+        // Probing the retained cached header for db_a at 65 succeeds with no raw open.
+        assert_cached_header_probe_at_cap(&mut state, &db_a);
     }
 
     // Second raced probe at 65: hard ceiling refuses ALL uncached raw opens BEFORE calling open
@@ -1173,10 +1184,7 @@ fn inode_swap_at_deferred_fd_cap_retains_fd_and_preserves_posix_lock() {
         assert_deferred_fd_cap_err(res);
     }
     assert_preflight_exclusive_lock(&db_a, true);
-    assert_eq!(
-        reg.lock().unwrap().total_deferred_fds(),
-        MAX_DEFERRED_FDS + 1
-    );
+    assert_cached_header_probe_at_cap(&mut reg.lock().unwrap(), &db_a);
 
     let calls_before = raw_open_calls();
     let mut j_opened = false;
@@ -1211,12 +1219,9 @@ fn inode_swap_at_deferred_fd_cap_retains_fd_and_preserves_posix_lock() {
     });
     assert_deferred_fd_cap_err(j_res);
     assert_preflight_exclusive_lock(&db_a, true);
-    assert_eq!(
-        reg.lock().unwrap().total_deferred_fds(),
-        MAX_DEFERRED_FDS + 1
-    );
     {
         let mut state = reg.lock().unwrap();
+        assert_cached_header_probe_at_cap(&mut state, &db_a);
         let calls_before = raw_open_calls();
         assert_deferred_fd_cap_err(inspect_sqlite_header_locked(&mut state, &db_new2));
         assert_eq!(raw_open_calls(), calls_before);

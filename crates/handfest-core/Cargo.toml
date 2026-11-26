@@ -7,10 +7,6 @@ license.workspace = true
 repository.workspace = true
 description = "Pure, no_std-capable Ricardian mandate AST, Controlled-English codec, lattice attenuation, and gate evaluator"
 
-[features]
-default = []
-std = []
-
 [dependencies]
 sha2.workspace = true
 serde.workspace = true # no_std+alloc typed config serialization/deserialization for ToolPolicyMap (prototyping debt)

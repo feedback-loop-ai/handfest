@@ -1214,6 +1214,35 @@ fn check_policy_map_mode_shares_mcp_codec_and_emits_typed_mapping_errors() {
 }
 
 #[test]
+fn check_missing_policy_map_file_emits_invalid_policy_map() {
+    let dir = TempDir::new().unwrap();
+    let (signed_path, agent_key) = setup_merge_mandate_fixture(dir.path());
+    let ledger = dir.path().join("missing_policy.sqlite");
+    let missing_policy = dir.path().join("does_not_exist.json");
+
+    let out = run_policy_map_check(
+        &ledger,
+        &signed_path,
+        &agent_key,
+        &missing_policy,
+        "merge_pull_request",
+        "{}",
+        None,
+    );
+    assert!(!out.status.success());
+    let err_json: serde_json::Value = serde_json::from_slice(&out.stderr).unwrap();
+    assert_eq!(err_json["error"], "policy_mapping_failed");
+    assert_eq!(err_json["code"], "invalid_policy_map");
+    assert!(
+        err_json["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("failed to read"),
+        "expected I/O read failure detail, got: {err_json}"
+    );
+}
+
+#[test]
 fn check_rejects_conflicting_policy_map_and_facts_flags() {
     let dir = TempDir::new().unwrap();
     let (signed_path, agent_key) = setup_merge_mandate_fixture(dir.path());
