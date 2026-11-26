@@ -67,7 +67,7 @@ impl SqliteLedger {
         validate_file_path(path, "SqliteLedger::open_existing")?;
         let (conn, handle_guard) = open_writable_guarded(path, || {
             Connection::open_with_flags(path, EXISTING_LEDGER_OPEN_FLAGS)
-                .map_err(|err| map_open_existing_error(path, err))
+                .map_err(map_open_existing_error)
         })?;
         Self::init(conn, Some(handle_guard), "delete", false)
     }
@@ -137,6 +137,13 @@ impl SqliteLedger {
         ledger
             .conn
             .busy_timeout(Duration::from_millis(BUSY_TIMEOUT_MS))?;
+        if expected_journal_mode == "delete"
+            && ledger.conn.is_readonly(rusqlite::DatabaseName::Main)?
+        {
+            return Err(LedgerError::Storage(
+                "ledger database opened read-only; writable access required".to_string(),
+            ));
+        }
         if !allow_create_schema {
             verify_existing_schema(&mut ledger.conn)?;
         }
@@ -303,7 +310,7 @@ fn load_latest_receipt_hash(tx: &Transaction<'_>) -> Result<Option<MandateId>, L
     }
 }
 
-fn map_open_existing_error(path: &Path, err: rusqlite::Error) -> LedgerError {
+fn map_open_existing_error(err: rusqlite::Error) -> LedgerError {
     if matches!(
         err,
         rusqlite::Error::SqliteFailure(
@@ -314,13 +321,7 @@ fn map_open_existing_error(path: &Path, err: rusqlite::Error) -> LedgerError {
             _,
         )
     ) {
-        if matches!(
-            fs::metadata(path),
-            Err(io_err) if io_err.kind() == std::io::ErrorKind::NotFound
-        ) {
-            return LedgerError::NotFound(err.to_string());
-        }
-        return LedgerError::Storage(err.to_string());
+        return LedgerError::NotFound(err.to_string());
     }
     LedgerError::from(err)
 }

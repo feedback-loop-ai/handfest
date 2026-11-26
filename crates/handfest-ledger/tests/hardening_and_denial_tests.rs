@@ -1052,7 +1052,7 @@ fn open_existing_rejects_missing_truncated_non_sqlite_and_empty_schema() {
     assert_eq!(fs::read(&non_sqlite).unwrap(), garbage);
     assert!(matches!(
         SqliteLedger::open_existing(dir.path()),
-        Err(LedgerError::Storage(_))
+        Err(LedgerError::NotFound(_))
     ));
 
     // 5. Empty-schema SQLite DB (valid header, 0 rows in sqlite_master) fails without DDL.

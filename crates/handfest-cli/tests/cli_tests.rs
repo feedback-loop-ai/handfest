@@ -921,9 +921,10 @@ fn check_require_existing_ledger_rejects_missing_zero_byte_and_empty_schema() {
     assert_existing_ledger_open_error(&out, "invalid_ledger", "corrupt non-SQLite ledger");
     assert_eq!(fs::read(&corrupt).unwrap(), garbage);
 
-    // 5. Existing non-openable directory path fails closed with `storage_error`.
+    // 5. Existing non-openable directory path fails closed with `missing_ledger`
+    //    (SQLite `CannotOpen` mapped directly without a post-hoc stat race).
     let out = run_check_on_ledger(&signed_path, &agent_key, dir.path(), true);
-    assert_existing_ledger_open_error(&out, "storage_error", "directory path as ledger");
+    assert_existing_ledger_open_error(&out, "missing_ledger", "directory path as ledger");
 
     // 6. `:memory:` with `--require-existing-ledger` fails closed with `storage_error` (NOT `missing_ledger`).
     let out = run_check_on_ledger(&signed_path, &agent_key, Path::new(":memory:"), true);
@@ -992,4 +993,34 @@ fn check_require_existing_ledger_accepts_initialized_ledger_and_prevents_quota_r
     let deleted_out = run_check_on_ledger(&signed_path, &agent_key, &ledger, true);
     assert_existing_ledger_open_error(&deleted_out, "missing_ledger", "deleted exhausted ledger");
     assert!(!ledger.exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn check_require_existing_ledger_rejects_readonly_0444_ledger_with_storage_error() {
+    use std::os::unix::fs::PermissionsExt;
+
+    struct RestoreMode(std::path::PathBuf);
+    impl Drop for RestoreMode {
+        fn drop(&mut self) {
+            let _ = fs::set_permissions(&self.0, fs::Permissions::from_mode(0o644));
+        }
+    }
+
+    let dir = TempDir::new().unwrap();
+    let (signed_path, agent_key) = setup_merge_mandate_fixture(dir.path());
+    let ledger = dir.path().join("readonly_ledger.sqlite");
+
+    // Initialize a valid ledger cleanly first.
+    let init_out = run_check_on_ledger(&signed_path, &agent_key, &ledger, false);
+    assert!(init_out.status.success(), "initial check must succeed");
+
+    // Make the ledger read-only (0444): SQLite silently falls back to read-only open unless
+    // rejected via `is_readonly`, so `check --require-existing-ledger` must fail closed at open
+    // time with exit 1 and `"code": "storage_error"`.
+    let _restore = RestoreMode(ledger.clone());
+    fs::set_permissions(&ledger, fs::Permissions::from_mode(0o444)).unwrap();
+
+    let out = run_check_on_ledger(&signed_path, &agent_key, &ledger, true);
+    assert_existing_ledger_open_error(&out, "storage_error", "read-only 0444 ledger");
 }
