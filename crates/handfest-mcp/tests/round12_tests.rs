@@ -4,7 +4,9 @@ use std::collections::BTreeSet;
 use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, ExitStatus, Stdio};
+use std::thread;
+use std::time::{Duration, Instant};
 
 use handfest_anchors::{Ed25519Keypair, SignedMandate};
 use handfest_core::ast::parse_rfc3339_utc;
@@ -91,6 +93,52 @@ fn run_expect_failure(args: &[&str]) -> (String, String) {
         .expect("run handfest-mcp");
     assert!(!out.status.success(), "expected non-zero exit for {args:?}");
     parse_startup_error_json(&out.stderr)
+}
+
+fn wait_for_child_with_timeout(
+    mut child: Child,
+    timeout: Duration,
+) -> (ExitStatus, Vec<u8>, Vec<u8>) {
+    let mut stdout_pipe = child.stdout.take().expect("child stdout must be piped");
+    let mut stderr_pipe = child.stderr.take().expect("child stderr must be piped");
+    let stdout_thread = thread::spawn(move || {
+        let mut buf = Vec::new();
+        stdout_pipe
+            .read_to_end(&mut buf)
+            .expect("read child stdout");
+        buf
+    });
+    let stderr_thread = thread::spawn(move || {
+        let mut buf = Vec::new();
+        stderr_pipe
+            .read_to_end(&mut buf)
+            .expect("read child stderr");
+        buf
+    });
+
+    let deadline = Instant::now() + timeout;
+    let status = loop {
+        if let Some(status) = child.try_wait().expect("poll child exit status") {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            drop(child.stdin.take());
+            let _ = stdout_thread.join();
+            let _ = stderr_thread.join();
+            panic!(
+                "handfest-mcp did not exit within {}s on malformed upstream output",
+                timeout.as_secs()
+            );
+        }
+        thread::sleep(Duration::from_millis(20));
+    };
+
+    drop(child.stdin.take());
+    let stdout_bytes = stdout_thread.join().expect("join stdout reader thread");
+    let stderr_bytes = stderr_thread.join().expect("join stderr reader thread");
+    (status, stdout_bytes, stderr_bytes)
 }
 
 #[test]
@@ -266,7 +314,7 @@ fn handfest_mcp_emits_structured_json_for_ledger_spawn_and_runtime_errors() {
     codes.insert(code);
 
     // Malformed upstream response during active session -> "runtime_error".
-    let mut child = Command::new(env!("CARGO_BIN_EXE_handfest-mcp"))
+    let child = Command::new(env!("CARGO_BIN_EXE_handfest-mcp"))
         .args([
             "--chain",
             chain,
@@ -287,15 +335,10 @@ fn handfest_mcp_emits_structured_json_for_ledger_spawn_and_runtime_errors() {
         .unwrap();
     // Keep child stdin open without writing so the test neither races with BrokenPipe
     // after the proxy exits on malformed upstream output nor triggers clean client EOF.
-    let _stdin = child.stdin.take().unwrap();
-    let mut stderr_pipe = child.stderr.take().unwrap();
-    let mut stdout_pipe = child.stdout.take().unwrap();
-    let mut stderr_bytes = Vec::new();
-    stderr_pipe.read_to_end(&mut stderr_bytes).unwrap();
-    let mut stdout_bytes = Vec::new();
-    stdout_pipe.read_to_end(&mut stdout_bytes).unwrap();
-    let status = child.wait().unwrap();
-    drop(_stdin);
+    // Bound the wait so a regression that discards malformed upstream lines fails fast
+    // and reaps the child instead of hanging indefinitely.
+    let (status, _stdout_bytes, stderr_bytes) =
+        wait_for_child_with_timeout(child, Duration::from_secs(5));
     assert!(!status.success());
     let (code, msg) = parse_startup_error_json(&stderr_bytes);
     assert_eq!(code, "runtime_error");
@@ -422,8 +465,9 @@ fn handfest_mcp_emits_chain_invalid_for_broken_attenuation() {
         "true",
     ]);
     assert_eq!(code, "chain_invalid");
-    assert!(
-        msg.contains("startup mandate chain verification failed"),
-        "expected attenuation failure detail, got: {msg}"
+    assert_eq!(
+        msg,
+        "startup mandate chain verification failed: invalid mandate chain: hop 0 -> 1: attenuation check failed: action 'ops.*' is not subsumed by parent ALLOW list",
+        "expected hop 0 -> 1 action-widening detail for ops.*, got: {msg}"
     );
 }
