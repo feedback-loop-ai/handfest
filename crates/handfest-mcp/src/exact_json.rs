@@ -6,7 +6,10 @@
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
 
-use handfest_core::ast::{Decimal, MAX_DECIMAL_SCALE};
+pub(crate) use handfest_core::json_num::{
+    canonicalize_json_number, is_canonical_json_int_syntax, parse_canonical_json_int,
+    parse_decimal_str, parse_json_decimal, CanonicalJsonNumber, NumberError,
+};
 
 const MAX_JSON_DEPTH: usize = 128;
 
@@ -55,117 +58,6 @@ impl ExactJson {
         write_exact_json(self, &mut out);
         out
     }
-}
-
-/// Structured errors returned by exact JSON numeric canonicalization.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum NumberError {
-    InvalidSyntax(String),
-    ExponentOutOfRange(String),
-    ExponentOverflow,
-}
-
-impl std::fmt::Display for NumberError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::InvalidSyntax(msg) => f.write_str(msg),
-            Self::ExponentOutOfRange(exp) => write!(f, "JSON number exponent '{exp}' out of range"),
-            Self::ExponentOverflow => f.write_str("JSON number exponent overflow"),
-        }
-    }
-}
-
-impl std::error::Error for NumberError {}
-
-/// Exact canonical base-10 value of an RFC 8259 JSON numeric literal (`(-1)^neg * sig * 10^exp`).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum CanonicalJsonNumber {
-    Zero,
-    NonZero {
-        neg: bool,
-        sig_digits: String,
-        exp: i128,
-    },
-}
-
-/// Normalizes a valid RFC 8259 JSON number token for exact numeric equivalence (no `f64`).
-///
-/// Both upstream JSON-RPC numeric response ID matching and exact `Decimal` fact parsing share this
-/// single normalization path so exponent/significand semantics can never drift.
-pub(crate) fn canonicalize_json_number(raw: &str) -> Result<CanonicalJsonNumber, NumberError> {
-    let (mant_part, exp_str) = split_exponent(raw)?;
-    let (neg, unsigned_mant) = match mant_part.strip_prefix('-') {
-        Some(rest) => (true, rest),
-        None => (false, mant_part),
-    };
-    let (int_digits, frac_digits) = match unsigned_mant.split_once('.') {
-        Some((i, f)) => {
-            if f.is_empty() || !f.bytes().all(|b| b.is_ascii_digit()) {
-                return Err(NumberError::InvalidSyntax(format!(
-                    "invalid fractional digits in '{raw}'"
-                )));
-            }
-            (i, f)
-        }
-        None => (unsigned_mant, ""),
-    };
-    if int_digits.is_empty() || !int_digits.bytes().all(|b| b.is_ascii_digit()) {
-        return Err(NumberError::InvalidSyntax(format!(
-            "invalid integer digits in '{raw}'"
-        )));
-    }
-
-    let mut digits = String::with_capacity(int_digits.len() + frac_digits.len());
-    digits.push_str(int_digits);
-    digits.push_str(frac_digits);
-
-    let trimmed_leading = digits.trim_start_matches('0');
-    if trimmed_leading.is_empty() {
-        return Ok(CanonicalJsonNumber::Zero);
-    }
-
-    let exp: i128 = match exp_str {
-        Some(s) => s
-            .parse()
-            .map_err(|_| NumberError::ExponentOutOfRange(s.to_string()))?,
-        None => 0,
-    };
-    let frac_len = i128::try_from(frac_digits.len()).map_err(|_| NumberError::ExponentOverflow)?;
-    let sig_digits = trimmed_leading.trim_end_matches('0');
-    let trailing_zeros = i128::try_from(trimmed_leading.len() - sig_digits.len())
-        .map_err(|_| NumberError::ExponentOverflow)?;
-    // Combine `trailing_zeros - frac_len` before adding to `exp` so equivalent spellings such as
-    // `1.0e<i128::MIN>` and `1e<i128::MIN>` never suffer spurious intermediate underflow/overflow.
-    let exp_delta = trailing_zeros - frac_len;
-    let net_exp = exp
-        .checked_add(exp_delta)
-        .ok_or(NumberError::ExponentOverflow)?;
-
-    Ok(CanonicalJsonNumber::NonZero {
-        neg,
-        sig_digits: sig_digits.to_string(),
-        exp: net_exp,
-    })
-}
-
-/// Returns `true` when `raw` matches strict canonical base-10 integer grammar `^(0|-?[1-9][0-9]*)$`.
-pub(crate) fn is_canonical_json_int_syntax(raw: &str) -> bool {
-    if raw == "0" {
-        return true;
-    }
-    let digits = raw.strip_prefix('-').unwrap_or(raw);
-    matches!(digits.as_bytes(), [first @ b'1'..=b'9', rest @ ..] if rest.iter().all(u8::is_ascii_digit))
-}
-
-/// Parses a strict canonical base-10 JSON integer (`^(0|-?[1-9][0-9]*)$`) into `i64`.
-///
-/// Rejects `"-0"`, `"+1"`, leading zeros (`"00"`, `"-01"`), fractional parts, exponents, and
-/// values outside `i64::MIN..=i64::MAX`.
-pub(crate) fn parse_canonical_json_int(raw: &str) -> Option<i64> {
-    if !is_canonical_json_int_syntax(raw) {
-        return None;
-    }
-    raw.parse::<i64>().ok()
 }
 
 /// Returns `true` when `raw` is a canonical JSON integer literal representable as a signed 64-bit integer.
@@ -238,104 +130,6 @@ pub(crate) fn parse_exact_json(src: &str) -> Result<ExactJson, String> {
         return Err(format!("trailing characters at byte {}", parser.pos));
     }
     Ok(val)
-}
-
-/// Parses a strict base-10 decimal string (`-?[0-9]+(\.[0-9]+)?`) without `f64` rounding.
-pub(crate) fn parse_decimal_str(raw: &str) -> Result<Decimal, String> {
-    if raw.is_empty() {
-        return Err("empty decimal string".to_string());
-    }
-    let unsigned = raw.strip_prefix('-').unwrap_or(raw);
-    let (int_part, frac_part) = match unsigned.split_once('.') {
-        Some((i, f)) => {
-            if f.is_empty() {
-                return Err(format!("missing fractional digits in '{raw}'"));
-            }
-            (i, Some(f))
-        }
-        None => (unsigned, None),
-    };
-    if int_part.is_empty() || !int_part.bytes().all(|b| b.is_ascii_digit()) {
-        return Err(format!("invalid integer digits in '{raw}'"));
-    }
-    if let Some(f) = frac_part {
-        if !f.bytes().all(|b| b.is_ascii_digit()) {
-            return Err(format!("invalid fractional digits in '{raw}'"));
-        }
-    }
-    parse_json_decimal(raw)
-}
-
-/// Parses a JSON numeric literal (plain or scientific notation) into an exact `Decimal`.
-pub(crate) fn parse_json_decimal(raw: &str) -> Result<Decimal, String> {
-    match canonicalize_json_number(raw).map_err(|err| err.to_string())? {
-        CanonicalJsonNumber::Zero => Ok(Decimal::ZERO),
-        CanonicalJsonNumber::NonZero {
-            neg,
-            sig_digits,
-            exp,
-        } => build_decimal(neg, &sig_digits, exp),
-    }
-}
-
-fn split_exponent(raw: &str) -> Result<(&str, Option<&str>), NumberError> {
-    let Some(exp_pos) = raw.find(['e', 'E']) else {
-        return Ok((raw, None));
-    };
-    let (mant, exp_part) = raw.split_at(exp_pos);
-    let exp_str = &exp_part[1..];
-    let exp_digits = exp_str.strip_prefix(['+', '-']).unwrap_or(exp_str);
-    if exp_digits.is_empty() || !exp_digits.bytes().all(|b| b.is_ascii_digit()) {
-        return Err(NumberError::InvalidSyntax(format!(
-            "invalid exponent '{exp_str}'"
-        )));
-    }
-    Ok((mant, Some(exp_str)))
-}
-
-fn build_decimal(neg: bool, trimmed_digits: &str, net_exp: i128) -> Result<Decimal, String> {
-    let mut acc: u128 = 0;
-    for b in trimmed_digits.bytes() {
-        acc = acc
-            .checked_mul(10)
-            .and_then(|v| v.checked_add(u128::from(b - b'0')))
-            .ok_or_else(|| "decimal overflow".to_string())?;
-    }
-
-    let scale = if net_exp >= 0 {
-        if net_exp > 39 {
-            return Err("decimal overflow".to_string());
-        }
-        for _ in 0..net_exp {
-            acc = acc
-                .checked_mul(10)
-                .ok_or_else(|| "decimal overflow".to_string())?;
-        }
-        0u8
-    } else {
-        let abs_exp = net_exp.unsigned_abs();
-        if abs_exp > u128::from(MAX_DECIMAL_SCALE) {
-            return Err(format!(
-                "scale {abs_exp} exceeds maximum {MAX_DECIMAL_SCALE}"
-            ));
-        }
-        u8::try_from(abs_exp).map_err(|_| "decimal scale overflow".to_string())?
-    };
-
-    let mantissa = signed_from_u128(neg, acc).ok_or_else(|| "decimal overflow".to_string())?;
-    Decimal::new(mantissa, scale)
-        .map(|d| d.canonical())
-        .map_err(|err| err.to_string())
-}
-
-fn signed_from_u128(neg: bool, abs: u128) -> Option<i128> {
-    if !neg {
-        i128::try_from(abs).ok()
-    } else if abs == (i128::MAX as u128) + 1 {
-        Some(i128::MIN)
-    } else {
-        i128::try_from(abs).ok().map(|v| -v)
-    }
 }
 
 struct JsonParser<'a> {
@@ -516,6 +310,7 @@ impl<'a> JsonParser<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use handfest_core::ast::Decimal;
 
     #[test]
     fn canonical_json_number_compares_losslessly() {
@@ -529,8 +324,22 @@ mod tests {
         );
         assert_eq!(
             canonicalize_json_number("0").unwrap(),
-            canonicalize_json_number("-0.0e99").unwrap()
+            canonicalize_json_number("0.0e99").unwrap()
         );
+        for neg_zero in ["-0", "-0.0", "-0.00", "-0e5", "-0.0e99"] {
+            assert_eq!(
+                canonicalize_json_number(neg_zero),
+                Err(NumberError::NegativeZero)
+            );
+            assert_eq!(parse_json_decimal(neg_zero), Err(NumberError::NegativeZero));
+        }
+        for bad_str in ["-0", "-0.0", "-0.00"] {
+            assert_eq!(parse_decimal_str(bad_str), Err(NumberError::NegativeZero));
+        }
+        for leading in ["010", "0100", "-010", "00", "00.5"] {
+            assert_eq!(parse_decimal_str(leading), Err(NumberError::LeadingZero));
+            assert_eq!(parse_json_decimal(leading), Err(NumberError::LeadingZero));
+        }
         assert_eq!(
             canonicalize_json_number("18446744073709551617").unwrap(),
             canonicalize_json_number("1.8446744073709551617e19").unwrap()
@@ -586,10 +395,10 @@ mod tests {
         );
         assert_eq!(
             parse_json_decimal(&min_exp_one_dot_zero),
-            Err(format!(
-                "scale {} exceeds maximum {MAX_DECIMAL_SCALE}",
-                i128::MIN.unsigned_abs()
-            ))
+            Err(NumberError::ScaleOverflow {
+                scale: i128::MIN.unsigned_abs(),
+                max: handfest_core::ast::MAX_DECIMAL_SCALE,
+            })
         );
     }
 

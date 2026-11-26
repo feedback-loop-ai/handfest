@@ -5,7 +5,7 @@ use std::io::{BufRead, Write};
 
 use crate::exact_json::{
     canonicalize_json_number, is_canonical_json_int_syntax, is_valid_json_int,
-    parse_canonical_json_int, write_json_string, CanonicalJsonNumber, ExactJson,
+    parse_canonical_json_int, write_json_string, CanonicalJsonNumber, ExactJson, NumberError,
 };
 use crate::proxy::{ProxyError, HANDFEST_DENIED_ERROR_CODE};
 
@@ -148,13 +148,11 @@ fn parse_upstream_response_id_int(raw: &str) -> Result<i64, String> {
         }
         return Ok(value);
     }
-    match canonicalize_json_number(raw).map_err(|err| err.to_string())? {
-        CanonicalJsonNumber::Zero => {
-            if raw.starts_with('-') {
-                return Err("JSON-RPC numeric id must not be negative zero".to_string());
-            }
-            Ok(0)
-        }
+    match canonicalize_json_number(raw).map_err(|err| match err {
+        NumberError::NegativeZero => "JSON-RPC numeric id must not be negative zero".to_string(),
+        other => other.to_string(),
+    })? {
+        CanonicalJsonNumber::Zero => Ok(0),
         CanonicalJsonNumber::NonZero {
             neg,
             sig_digits,

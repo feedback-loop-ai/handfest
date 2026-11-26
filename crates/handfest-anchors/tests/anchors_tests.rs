@@ -476,3 +476,313 @@ fn envelope_metadata_tampering_invalidates_signature_and_equal_window_is_signabl
     );
     assert!(matches!(verdict, Verdict::Deny { ref reason } if reason.contains("validity window")));
 }
+
+mod registry_tests {
+    use handfest_anchors::{
+        AnchorError, AnchorRegistry, AnchorVerifier, AssuranceLevel, Ed25519Keypair, SignedMandate,
+    };
+    use handfest_core::ast::{
+        parse_rfc3339_utc, KeyId, MAX_RFC3339_TIMESTAMP, MIN_RFC3339_TIMESTAMP,
+    };
+    use handfest_core::cnl::{parse_canonical, parse_mandate, try_render_canonical, ParseError};
+    use handfest_core::gate::{VerifiedAnchorProof, VerifiedMandate};
+    use handfest_core::ActorKind;
+
+    struct StubPasskeyVerifier;
+
+    impl AnchorVerifier for StubPasskeyVerifier {
+        fn verify(&self, signed: &SignedMandate) -> Result<VerifiedMandate, AnchorError> {
+            let ast = parse_canonical(&signed.canonical_words)
+                .map_err(AnchorError::NonCanonicalMandate)?;
+            let signer_key = KeyId::parse(&signed.signer_key)
+                .map_err(|err| AnchorError::InvalidPublicKey(format!("invalid KeyId: {err}")))?;
+            Ok(VerifiedMandate {
+                ast,
+                proof: VerifiedAnchorProof {
+                    anchor_id: signed.anchor_id.clone(),
+                    assurance: AssuranceLevel::Passkey,
+                    signer_key,
+                    actor_kind: ActorKind::Human,
+                    valid_from: signed.valid_from,
+                    valid_until: signed.valid_until,
+                },
+            })
+        }
+    }
+
+    fn sample_signed_ed25519() -> SignedMandate {
+        let root = Ed25519Keypair::generate();
+        let leaf = Ed25519Keypair::generate();
+        let from = parse_rfc3339_utc("2026-01-01T00:00:00Z").unwrap();
+        let until = parse_rfc3339_utc("2027-01-01T00:00:00Z").unwrap();
+        let ast = parse_mandate(&format!(
+            "HANDFEST v1\n\
+             FROM human \"Root\" (key: {root})\n\
+             TO agent \"Leaf\" (key: {leaf})\n\
+             DELEGATION max 0 hops\n\
+             ALLOW git.pr.merge\n\
+             ON repo \"org/*\"\n",
+            root = root.key_id(),
+            leaf = leaf.key_id(),
+        ))
+        .unwrap();
+        let canonical = try_render_canonical(&ast).unwrap();
+        root.sign_mandate(&canonical, "anchor-1", from, until)
+            .unwrap()
+    }
+
+    #[test]
+    fn anchor_registry_dispatches_registered_schemes_and_fails_closed() {
+        let signed = sample_signed_ed25519();
+        let mut registry = AnchorRegistry::default_registry();
+        assert!(format!("{registry:?}").contains("ed25519"));
+
+        let verified = registry
+            .verify(&signed)
+            .expect("default registry verifies ed25519");
+        assert_eq!(verified.proof.assurance, AssuranceLevel::LocalKey);
+
+        let mut tampered = signed.clone();
+        tampered.signature_hex = "00".repeat(64);
+        assert!(matches!(
+            registry.verify(&tampered),
+            Err(AnchorError::InvalidSignature(_))
+        ));
+
+        let empty = AnchorRegistry::new();
+        let err = empty.verify(&signed).unwrap_err();
+        assert_eq!(
+            err,
+            AnchorError::UnsupportedKeyScheme("ed25519".to_string())
+        );
+        assert_eq!(err.to_string(), "unsupported anchor key scheme 'ed25519'");
+
+        let mut bad_key = signed.clone();
+        bad_key.signer_key = "missing-colon".to_string();
+        assert!(matches!(
+            registry.verify(&bad_key),
+            Err(AnchorError::InvalidPublicKey(_))
+        ));
+
+        let passkey_ast = parse_mandate(
+            "HANDFEST v1\n\
+             FROM human \"Root\" (key: passkey:cred1)\n\
+             TO agent \"Leaf\" (key: passkey:agent1)\n\
+             DELEGATION max 0 hops\n\
+             ALLOW git.pr.merge\n\
+             ON repo \"org/*\"\n",
+        )
+        .unwrap();
+        let passkey_signed = SignedMandate {
+            canonical_words: try_render_canonical(&passkey_ast).unwrap(),
+            anchor_id: "passkey-1".to_string(),
+            assurance: "passkey".to_string(),
+            actor_kind: "human".to_string(),
+            signer_key: "passkey:cred1".to_string(),
+            valid_from: signed.valid_from,
+            valid_until: signed.valid_until,
+            signature_hex: "00".repeat(64),
+        };
+        assert_eq!(
+            registry.verify(&passkey_signed),
+            Err(AnchorError::UnsupportedKeyScheme("passkey".to_string()))
+        );
+
+        registry.register("passkey", StubPasskeyVerifier);
+        let verified_pk = registry
+            .verify(&passkey_signed)
+            .expect("registered passkey verifier succeeds");
+        assert_eq!(verified_pk.proof.assurance, AssuranceLevel::Passkey);
+    }
+
+    struct MutatingStubVerifier {
+        override_assurance: Option<AssuranceLevel>,
+        override_anchor_id: Option<String>,
+        override_signer_key: Option<KeyId>,
+        override_actor_kind: Option<ActorKind>,
+        override_window: Option<(i64, i64)>,
+        override_ast: Option<handfest_core::ast::HandfestAst>,
+    }
+
+    impl MutatingStubVerifier {
+        fn clean() -> Self {
+            Self {
+                override_assurance: None,
+                override_anchor_id: None,
+                override_signer_key: None,
+                override_actor_kind: None,
+                override_window: None,
+                override_ast: None,
+            }
+        }
+    }
+
+    impl AnchorVerifier for MutatingStubVerifier {
+        fn verify(&self, signed: &SignedMandate) -> Result<VerifiedMandate, AnchorError> {
+            let ast = match &self.override_ast {
+                Some(a) => a.clone(),
+                None => parse_canonical(&signed.canonical_words)
+                    .map_err(AnchorError::NonCanonicalMandate)?,
+            };
+            let signer_key = match &self.override_signer_key {
+                Some(k) => k.clone(),
+                None => KeyId::parse(&signed.signer_key)
+                    .map_err(|err| AnchorError::InvalidPublicKey(err.to_string()))?,
+            };
+            let (valid_from, valid_until) = self
+                .override_window
+                .unwrap_or((signed.valid_from, signed.valid_until));
+            Ok(VerifiedMandate {
+                ast,
+                proof: VerifiedAnchorProof {
+                    anchor_id: self
+                        .override_anchor_id
+                        .clone()
+                        .unwrap_or_else(|| signed.anchor_id.clone()),
+                    assurance: self.override_assurance.unwrap_or(AssuranceLevel::Passkey),
+                    signer_key,
+                    actor_kind: self.override_actor_kind.unwrap_or(ActorKind::Human),
+                    valid_from,
+                    valid_until,
+                },
+            })
+        }
+    }
+
+    #[test]
+    fn anchor_registry_enforces_verifier_liskov_postconditions() {
+        let from = parse_rfc3339_utc("2026-01-01T00:00:00Z").unwrap();
+        let until = parse_rfc3339_utc("2027-01-01T00:00:00Z").unwrap();
+        let ast = parse_mandate(
+            "HANDFEST v1\n\
+             FROM human \"Root\" (key: passkey:cred1)\n\
+             TO agent \"Leaf\" (key: passkey:agent1)\n\
+             DELEGATION max 0 hops\n\
+             ALLOW git.pr.merge\n\
+             ON repo \"org/*\"\n",
+        )
+        .unwrap();
+        let base_signed = SignedMandate {
+            canonical_words: try_render_canonical(&ast).unwrap(),
+            anchor_id: "passkey-1".to_string(),
+            assurance: "passkey".to_string(),
+            actor_kind: "human".to_string(),
+            signer_key: "passkey:cred1".to_string(),
+            valid_from: from,
+            valid_until: until,
+            signature_hex: "00".repeat(64),
+        };
+
+        // 1. Spoofed assurance (verifier upgrades passkey -> qualified_qes)
+        let mut reg = AnchorRegistry::new();
+        let mut v = MutatingStubVerifier::clean();
+        v.override_assurance = Some(AssuranceLevel::QualifiedQes);
+        reg.register("passkey", v);
+        assert_eq!(
+            reg.verify(&base_signed),
+            Err(AnchorError::UnsupportedAssurance {
+                expected: AssuranceLevel::Passkey,
+                actual: AssuranceLevel::QualifiedQes,
+            })
+        );
+
+        // 2. Empty, control-char, and mismatched anchor_id
+        for bad_anchor in ["", "bad\nid", "other-anchor"] {
+            let mut reg = AnchorRegistry::new();
+            let mut v = MutatingStubVerifier::clean();
+            v.override_anchor_id = Some(bad_anchor.to_string());
+            reg.register("passkey", v);
+            assert!(
+                matches!(
+                    reg.verify(&base_signed),
+                    Err(AnchorError::InvalidAnchorId(_))
+                ),
+                "anchor_id {bad_anchor:?} must be rejected"
+            );
+        }
+
+        // 3. Mismatched signer_key (proof != envelope) and (proof != ast.from)
+        let mut reg = AnchorRegistry::new();
+        let mut v = MutatingStubVerifier::clean();
+        v.override_signer_key = Some(KeyId::parse("passkey:other").unwrap());
+        reg.register("passkey", v);
+        assert!(matches!(
+            reg.verify(&base_signed),
+            Err(AnchorError::SignerMismatch { .. })
+        ));
+        let mut mismatched_env = base_signed.clone();
+        mismatched_env.signer_key = "passkey:other".to_string();
+        let mut clean_reg = AnchorRegistry::new();
+        clean_reg.register("passkey", MutatingStubVerifier::clean());
+        assert!(matches!(
+            clean_reg.verify(&mismatched_env),
+            Err(AnchorError::SignerMismatch { .. })
+        ));
+
+        // 4. Mismatched actor_kind (proof != envelope) and (proof != ast.from)
+        let mut reg = AnchorRegistry::new();
+        let mut v = MutatingStubVerifier::clean();
+        v.override_actor_kind = Some(ActorKind::Agent);
+        reg.register("passkey", v);
+        assert!(matches!(
+            reg.verify(&base_signed),
+            Err(AnchorError::ActorKindMismatch { .. })
+        ));
+        let mut wrong_kind_env = base_signed.clone();
+        wrong_kind_env.actor_kind = "agent".to_string();
+        let mut reg = AnchorRegistry::new();
+        let mut v = MutatingStubVerifier::clean();
+        v.override_actor_kind = Some(ActorKind::Agent);
+        reg.register("passkey", v);
+        assert!(matches!(
+            reg.verify(&wrong_kind_env),
+            Err(AnchorError::ActorKindMismatch { .. })
+        ));
+
+        // 5. Out-of-range valid_from / valid_until, empty window, and mismatched window
+        for (wf, wu) in [
+            (MIN_RFC3339_TIMESTAMP - 1, until),
+            (from, MAX_RFC3339_TIMESTAMP + 1),
+        ] {
+            let mut reg = AnchorRegistry::new();
+            let mut v = MutatingStubVerifier::clean();
+            v.override_window = Some((wf, wu));
+            reg.register("passkey", v);
+            assert!(matches!(
+                reg.verify(&base_signed),
+                Err(AnchorError::InvalidTimestamp(_))
+            ));
+        }
+        for (wf, wu) in [(from, from), (from + 1, until), (from, until + 1)] {
+            let mut reg = AnchorRegistry::new();
+            let mut v = MutatingStubVerifier::clean();
+            v.override_window = Some((wf, wu));
+            reg.register("passkey", v);
+            assert!(matches!(
+                reg.verify(&base_signed),
+                Err(AnchorError::InvalidValidityWindow { .. })
+            ));
+        }
+
+        // 6. AST does not match signed.canonical_words
+        let widened_ast = parse_mandate(
+            "HANDFEST v1\n\
+             FROM human \"Root\" (key: passkey:cred1)\n\
+             TO agent \"Leaf\" (key: passkey:agent1)\n\
+             DELEGATION max 0 hops\n\
+             ALLOW git.*\n\
+             ON repo \"org/*\"\n",
+        )
+        .unwrap();
+        let mut reg = AnchorRegistry::new();
+        let mut v = MutatingStubVerifier::clean();
+        v.override_ast = Some(widened_ast);
+        reg.register("passkey", v);
+        assert!(matches!(
+            reg.verify(&base_signed),
+            Err(AnchorError::NonCanonicalMandate(
+                ParseError::NonCanonical { .. }
+            ))
+        ));
+    }
+}

@@ -7,7 +7,7 @@ use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 use handfest_core::ast::{
     is_valid_quoted_str, is_valid_timestamp, KeyId, MAX_RFC3339_TIMESTAMP, MIN_RFC3339_TIMESTAMP,
 };
-use handfest_core::cnl::{parse_canonical, ParseError};
+use handfest_core::cnl::{parse_canonical, try_render_canonical, ParseError};
 use handfest_core::gate::{VerifiedAnchorProof, VerifiedMandate};
 use handfest_core::ActorKind;
 use rand_core::OsRng;
@@ -326,8 +326,87 @@ impl AnchorVerifier for AnchorRegistry {
             .verifiers
             .get(key_id.scheme())
             .ok_or_else(|| AnchorError::UnsupportedKeyScheme(key_id.scheme().to_string()))?;
-        verifier.verify(signed)
+        let vm = verifier.verify(signed)?;
+        enforce_proof_identity_postconditions(signed, &key_id, &vm)?;
+        enforce_proof_window_and_ast_postconditions(signed, &vm)?;
+        Ok(vm)
     }
+}
+
+fn enforce_proof_identity_postconditions(
+    signed: &SignedMandate,
+    expected_key: &KeyId,
+    vm: &VerifiedMandate,
+) -> Result<(), AnchorError> {
+    if &vm.proof.signer_key != expected_key {
+        return Err(AnchorError::SignerMismatch {
+            expected: expected_key.to_string(),
+            actual: vm.proof.signer_key.to_string(),
+        });
+    }
+    if &vm.proof.signer_key != vm.ast.from().key() {
+        return Err(AnchorError::SignerMismatch {
+            expected: vm.ast.from().key().to_string(),
+            actual: vm.proof.signer_key.to_string(),
+        });
+    }
+    let expected_actor_kind = parse_actor_kind(&signed.actor_kind)?;
+    if vm.proof.actor_kind != expected_actor_kind {
+        return Err(AnchorError::ActorKindMismatch {
+            expected: expected_actor_kind,
+            actual: vm.proof.actor_kind,
+        });
+    }
+    if vm.proof.actor_kind != vm.ast.from().kind() {
+        return Err(AnchorError::ActorKindMismatch {
+            expected: vm.ast.from().kind(),
+            actual: vm.proof.actor_kind,
+        });
+    }
+    let expected_assurance = parse_assurance(&signed.assurance)?;
+    if vm.proof.assurance != expected_assurance {
+        return Err(AnchorError::UnsupportedAssurance {
+            expected: expected_assurance,
+            actual: vm.proof.assurance,
+        });
+    }
+    validate_anchor_id(&vm.proof.anchor_id)?;
+    if vm.proof.anchor_id != signed.anchor_id {
+        return Err(AnchorError::InvalidAnchorId(format!(
+            "proof anchor_id '{}' does not match envelope '{}'",
+            vm.proof.anchor_id, signed.anchor_id
+        )));
+    }
+    Ok(())
+}
+
+fn enforce_proof_window_and_ast_postconditions(
+    signed: &SignedMandate,
+    vm: &VerifiedMandate,
+) -> Result<(), AnchorError> {
+    if !is_valid_timestamp(vm.proof.valid_from) {
+        return Err(AnchorError::InvalidTimestamp(vm.proof.valid_from));
+    }
+    if !is_valid_timestamp(vm.proof.valid_until) {
+        return Err(AnchorError::InvalidTimestamp(vm.proof.valid_until));
+    }
+    if vm.proof.valid_from >= vm.proof.valid_until
+        || vm.proof.valid_from != signed.valid_from
+        || vm.proof.valid_until != signed.valid_until
+    {
+        return Err(AnchorError::InvalidValidityWindow {
+            valid_from: vm.proof.valid_from,
+            valid_until: vm.proof.valid_until,
+        });
+    }
+    let rendered = try_render_canonical(&vm.ast)
+        .map_err(|error| AnchorError::NonCanonicalMandate(ParseError::Ast { line: 0, error }))?;
+    if rendered != signed.canonical_words {
+        return Err(AnchorError::NonCanonicalMandate(ParseError::NonCanonical {
+            expected: rendered,
+        }));
+    }
+    Ok(())
 }
 
 /// Verifies a single Ed25519 [`SignedMandate`] envelope and returns a [`VerifiedMandate`].
@@ -541,118 +620,4 @@ fn decode_lower_hex_fixed<const N: usize>(input: &str) -> Result<[u8; N], String
     let mut out = [0u8; N];
     hex::decode_to_slice(input, &mut out).map_err(|err| err.to_string())?;
     Ok(out)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use handfest_core::ast::parse_rfc3339_utc;
-    use handfest_core::cnl::{parse_mandate, try_render_canonical};
-
-    struct StubPasskeyVerifier;
-
-    impl AnchorVerifier for StubPasskeyVerifier {
-        fn verify(&self, signed: &SignedMandate) -> Result<VerifiedMandate, AnchorError> {
-            let ast = parse_canonical(&signed.canonical_words)
-                .map_err(AnchorError::NonCanonicalMandate)?;
-            let signer_key = KeyId::parse(&signed.signer_key)
-                .map_err(|err| AnchorError::InvalidPublicKey(format!("invalid KeyId: {err}")))?;
-            Ok(VerifiedMandate {
-                ast,
-                proof: VerifiedAnchorProof {
-                    anchor_id: signed.anchor_id.clone(),
-                    assurance: AssuranceLevel::Passkey,
-                    signer_key,
-                    actor_kind: ActorKind::Human,
-                    valid_from: signed.valid_from,
-                    valid_until: signed.valid_until,
-                },
-            })
-        }
-    }
-
-    fn sample_signed_ed25519() -> SignedMandate {
-        let root = Ed25519Keypair::generate();
-        let leaf = Ed25519Keypair::generate();
-        let from = parse_rfc3339_utc("2026-01-01T00:00:00Z").unwrap();
-        let until = parse_rfc3339_utc("2027-01-01T00:00:00Z").unwrap();
-        let ast = parse_mandate(&format!(
-            "HANDFEST v1\n\
-             FROM human \"Root\" (key: {root})\n\
-             TO agent \"Leaf\" (key: {leaf})\n\
-             DELEGATION max 0 hops\n\
-             ALLOW git.pr.merge\n\
-             ON repo \"org/*\"\n",
-            root = root.key_id(),
-            leaf = leaf.key_id(),
-        ))
-        .unwrap();
-        let canonical = try_render_canonical(&ast).unwrap();
-        root.sign_mandate(&canonical, "anchor-1", from, until)
-            .unwrap()
-    }
-
-    #[test]
-    fn anchor_registry_dispatches_registered_schemes_and_fails_closed() {
-        let signed = sample_signed_ed25519();
-        let mut registry = AnchorRegistry::default_registry();
-        assert!(format!("{registry:?}").contains("ed25519"));
-
-        let verified = registry
-            .verify(&signed)
-            .expect("default registry verifies ed25519");
-        assert_eq!(verified.proof.assurance, AssuranceLevel::LocalKey);
-
-        let mut tampered = signed.clone();
-        tampered.signature_hex = "00".repeat(64);
-        assert!(matches!(
-            registry.verify(&tampered),
-            Err(AnchorError::InvalidSignature(_))
-        ));
-
-        let empty = AnchorRegistry::new();
-        let err = empty.verify(&signed).unwrap_err();
-        assert_eq!(
-            err,
-            AnchorError::UnsupportedKeyScheme("ed25519".to_string())
-        );
-        assert_eq!(err.to_string(), "unsupported anchor key scheme 'ed25519'");
-
-        let mut bad_key = signed.clone();
-        bad_key.signer_key = "missing-colon".to_string();
-        assert!(matches!(
-            registry.verify(&bad_key),
-            Err(AnchorError::InvalidPublicKey(_))
-        ));
-
-        let passkey_ast = parse_mandate(
-            "HANDFEST v1\n\
-             FROM human \"Root\" (key: passkey:cred1)\n\
-             TO agent \"Leaf\" (key: passkey:agent1)\n\
-             DELEGATION max 0 hops\n\
-             ALLOW git.pr.merge\n\
-             ON repo \"org/*\"\n",
-        )
-        .unwrap();
-        let passkey_signed = SignedMandate {
-            canonical_words: try_render_canonical(&passkey_ast).unwrap(),
-            anchor_id: "passkey-1".to_string(),
-            assurance: "passkey".to_string(),
-            actor_kind: "human".to_string(),
-            signer_key: "passkey:cred1".to_string(),
-            valid_from: signed.valid_from,
-            valid_until: signed.valid_until,
-            signature_hex: "00".repeat(64),
-        };
-        assert_eq!(
-            registry.verify(&passkey_signed),
-            Err(AnchorError::UnsupportedKeyScheme("passkey".to_string()))
-        );
-
-        registry.register("passkey", StubPasskeyVerifier);
-        let verified_pk = registry
-            .verify(&passkey_signed)
-            .expect("registered passkey verifier succeeds");
-        assert_eq!(verified_pk.proof.assurance, AssuranceLevel::Passkey);
-    }
 }

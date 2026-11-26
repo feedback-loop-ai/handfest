@@ -1,9 +1,11 @@
 //! Deterministic chain evaluator and hash-chained `DecisionReceipt`.
 
+use alloc::boxed::Box;
 use alloc::collections::BTreeMap;
 use alloc::format;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
+use core::fmt;
 
 use sha2::{Digest, Sha256};
 
@@ -11,7 +13,7 @@ use crate::ast::{
     is_valid_ident, is_valid_quoted_str, is_valid_timestamp, try_format_rfc3339_utc, AstError,
     Decimal, HandfestAst, KeyId, MandateId, Predicate, PredicateOp, Quota, Scalar,
 };
-use crate::lattice::{scalar_satisfies, subsumes};
+use crate::lattice::{scalar_satisfies, subsumes, NarrowError};
 use crate::{ActorKind, AssuranceLevel, Verdict};
 
 /// Normalized cryptographic / regulatory verification proof supplied by an external trust anchor.
@@ -365,44 +367,119 @@ fn build_receipt(
     receipt
 }
 
+/// Structured error returned when a mandate chain violates static structural invariants.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ChainStructureError {
+    EmptyChain,
+    RootHasParent,
+    InvalidMandateAst {
+        hop: usize,
+        source: AstError,
+    },
+    MaxHopsExceeded {
+        hop: usize,
+        parent_max_hops: u32,
+        child_max_hops: u32,
+    },
+    AttenuationFailed {
+        hop: usize,
+        source: Box<NarrowError>,
+    },
+}
+
+impl fmt::Display for ChainStructureError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::EmptyChain => f.write_str("empty mandate chain"),
+            Self::RootHasParent => f.write_str("root mandate must not declare a PARENT digest"),
+            Self::InvalidMandateAst { hop, source } => {
+                write!(f, "hop {hop}: invalid mandate AST: {source}")
+            }
+            Self::MaxHopsExceeded {
+                hop,
+                parent_max_hops,
+                child_max_hops,
+            } => write!(
+                f,
+                "hop {hop} -> {}: attenuation check failed: delegation hop overflow: parent allows max {parent_max_hops}, child claims {child_max_hops}",
+                hop + 1
+            ),
+            Self::AttenuationFailed { hop, source } => {
+                write!(f, "hop {hop} -> {}: attenuation check failed: {source}", hop + 1)
+            }
+        }
+    }
+}
+
+impl core::error::Error for ChainStructureError {
+    fn source(&self) -> Option<&(dyn core::error::Error + 'static)> {
+        match self {
+            Self::InvalidMandateAst { source, .. } => Some(source),
+            Self::AttenuationFailed { source, .. } => Some(source.as_ref()),
+            Self::EmptyChain | Self::RootHasParent | Self::MaxHopsExceeded { .. } => None,
+        }
+    }
+}
+
 /// Verifies static structural invariants of a mandate chain: non-empty chain, root absence of
 /// `PARENT`, valid canonical ASTs (returning per-hop [`MandateId`]s), and monotonic lattice
 /// attenuation (`subsumes`) across every adjacent hop.
-pub fn verify_chain_structure(chain: &[VerifiedMandate]) -> Result<Vec<MandateId>, String> {
+pub fn verify_chain_structure(
+    chain: &[VerifiedMandate],
+) -> Result<Vec<MandateId>, ChainStructureError> {
     if chain.is_empty() {
-        return Err("empty mandate chain".into());
+        return Err(ChainStructureError::EmptyChain);
     }
     if chain[0].ast.parent().is_some() {
-        return Err("root mandate must not declare a PARENT digest".into());
+        return Err(ChainStructureError::RootHasParent);
     }
     let mut chain_ids = Vec::with_capacity(chain.len());
     for (hop, vm) in chain.iter().enumerate() {
         let mid = vm
             .ast
             .try_mandate_id()
-            .map_err(|err| format!("hop {hop}: invalid mandate AST: {err}"))?;
+            .map_err(|source| ChainStructureError::InvalidMandateAst { hop, source })?;
         chain_ids.push(mid);
     }
     verify_attenuation(chain)?;
     Ok(chain_ids)
 }
 
-/// Verifies runtime chain validity at `now` for `actor_key`: structural invariants via
-/// [`verify_chain_structure`], valid RFC 3339 timestamp bounds, per-hop anchor proof bindings and
-/// validity windows, and leaf `TO` key match.
+/// Verifies runtime chain validity at `now` for `actor_key` in canonical evaluation order:
+/// AST validity, non-empty chain, valid RFC 3339 `now`, root `PARENT` absence, per-hop anchor
+/// proof bindings/timestamp bounds/validity windows, monotonic attenuation, and leaf `TO` key.
 pub fn verify_chain_runtime(
     chain: &[VerifiedMandate],
     actor_key: &KeyId,
     now: i64,
 ) -> Result<(), String> {
-    let _ = verify_chain_structure(chain)?;
+    for (hop, vm) in chain.iter().enumerate() {
+        vm.ast
+            .validate()
+            .map_err(|source| ChainStructureError::InvalidMandateAst { hop, source }.to_string())?;
+    }
+    verify_chain_runtime_prevalidated(chain, actor_key, now)
+}
+
+fn verify_chain_runtime_prevalidated(
+    chain: &[VerifiedMandate],
+    actor_key: &KeyId,
+    now: i64,
+) -> Result<(), String> {
+    if chain.is_empty() {
+        return Err(ChainStructureError::EmptyChain.to_string());
+    }
     if !is_valid_timestamp(now) {
         return Err(format!(
             "timestamp {now} outside 0000-01-01T00:00:00Z..=9999-12-31T23:59:59Z"
         ));
     }
+    if chain[0].ast.parent().is_some() {
+        return Err(ChainStructureError::RootHasParent.to_string());
+    }
 
     verify_proofs(chain, now)?;
+    verify_attenuation(chain).map_err(|err| err.to_string())?;
 
     let leaf = &chain[chain.len() - 1];
     if leaf.ast.to().key() != actor_key {
@@ -422,7 +499,7 @@ fn evaluate_chain(
     usage: &QuotaSnapshot,
     now: i64,
 ) -> Result<(), String> {
-    verify_chain_runtime(chain, &request.actor_key, now)?;
+    verify_chain_runtime_prevalidated(chain, &request.actor_key, now)?;
 
     if !is_valid_concrete_action(&request.action) {
         return Err(format!(
@@ -463,6 +540,12 @@ fn verify_proofs(chain: &[VerifiedMandate], now: i64) -> Result<(), String> {
                 vm.ast.from().kind()
             ));
         }
+        if !is_valid_timestamp(vm.proof.valid_from) || !is_valid_timestamp(vm.proof.valid_until) {
+            return Err(format!(
+                "hop {i}: anchor proof validity window [{}..{}) outside 0000-01-01T00:00:00Z..=9999-12-31T23:59:59Z",
+                vm.proof.valid_from, vm.proof.valid_until
+            ));
+        }
         if vm.proof.valid_from >= vm.proof.valid_until {
             return Err(format!(
                 "hop {i}: invalid anchor proof validity window [{}..{})",
@@ -479,13 +562,23 @@ fn verify_proofs(chain: &[VerifiedMandate], now: i64) -> Result<(), String> {
     Ok(())
 }
 
-fn verify_attenuation(chain: &[VerifiedMandate]) -> Result<(), String> {
+fn verify_attenuation(chain: &[VerifiedMandate]) -> Result<(), ChainStructureError> {
     for i in 0..chain.len().saturating_sub(1) {
         if let Err(err) = subsumes(&chain[i].ast, &chain[i + 1].ast) {
-            return Err(format!(
-                "hop {i} -> {}: attenuation check failed: {err}",
-                i + 1
-            ));
+            return Err(match err {
+                NarrowError::HopOverflow {
+                    parent_max_hops,
+                    child_max_hops,
+                } => ChainStructureError::MaxHopsExceeded {
+                    hop: i,
+                    parent_max_hops,
+                    child_max_hops,
+                },
+                source => ChainStructureError::AttenuationFailed {
+                    hop: i,
+                    source: Box::new(source),
+                },
+            });
         }
     }
     Ok(())
@@ -683,109 +776,4 @@ fn evaluate_quota(
 
 fn is_valid_concrete_action(action: &str) -> bool {
     !action.is_empty() && action.split('.').all(is_valid_ident)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::ast::{MAX_RFC3339_TIMESTAMP, MIN_RFC3339_TIMESTAMP};
-    use crate::cnl::parse_mandate;
-
-    fn key(suffix: &str) -> KeyId {
-        KeyId::parse(&format!("ed25519:{suffix}")).unwrap()
-    }
-
-    fn make_vm(text: &str, signer: &str, kind: ActorKind, win: (i64, i64)) -> VerifiedMandate {
-        VerifiedMandate {
-            ast: parse_mandate(text).unwrap(),
-            proof: VerifiedAnchorProof {
-                anchor_id: "test-anchor".into(),
-                assurance: AssuranceLevel::LocalKey,
-                signer_key: key(signer),
-                actor_kind: kind,
-                valid_from: win.0,
-                valid_until: win.1,
-            },
-        }
-    }
-
-    #[test]
-    fn verify_chain_runtime_checks_all_invariants() {
-        let root_text = "HANDFEST v1\n\
-             FROM human \"Root\" (key: ed25519:aaaa)\n\
-             TO agent \"Leaf\" (key: ed25519:bbbb)\n\
-             DELEGATION max 1 hops\n\
-             ALLOW git.pr.*\n\
-             ON repo \"org/*\"\n";
-        let vm = make_vm(root_text, "aaaa", ActorKind::Human, (100, 200));
-        let single = core::slice::from_ref(&vm);
-        let leaf = key("bbbb");
-        let sub = key("cccc");
-
-        assert_eq!(verify_chain_runtime(single, &leaf, 150), Ok(()));
-        assert_eq!(
-            verify_chain_runtime(&[], &leaf, 150),
-            Err("empty mandate chain".into())
-        );
-        for bad_ts in [MIN_RFC3339_TIMESTAMP - 1, MAX_RFC3339_TIMESTAMP + 1] {
-            let err = verify_chain_runtime(single, &leaf, bad_ts).unwrap_err();
-            assert!(err.contains("outside 0000-01-01T00:00:00Z..=9999-12-31T23:59:59Z"));
-        }
-        assert!(verify_chain_runtime(single, &sub, 150)
-            .unwrap_err()
-            .contains("does not match leaf mandate TO key"));
-        assert!(verify_chain_runtime(single, &leaf, 200)
-            .unwrap_err()
-            .contains("outside anchor proof validity window"));
-
-        let bad_signer = make_vm(root_text, "dddd", ActorKind::Human, (100, 200));
-        assert!(verify_chain_runtime(&[bad_signer], &leaf, 150)
-            .unwrap_err()
-            .contains("proof signer key"));
-        let bad_kind = make_vm(root_text, "aaaa", ActorKind::Agent, (100, 200));
-        assert!(verify_chain_runtime(&[bad_kind], &leaf, 150)
-            .unwrap_err()
-            .contains("proof actor kind"));
-        let bad_window = make_vm(root_text, "aaaa", ActorKind::Human, (200, 200));
-        assert!(verify_chain_runtime(&[bad_window], &leaf, 200)
-            .unwrap_err()
-            .contains("invalid anchor proof validity window"));
-
-        let pid = vm.ast.mandate_id();
-        let child_vm = |allow: &str| {
-            let text = format!(
-                "HANDFEST v1\nPARENT {pid}\nFROM agent \"Leaf\" (key: ed25519:bbbb)\n\
-                 TO agent \"Sub\" (key: ed25519:cccc)\nDELEGATION max 0 hops\n\
-                 ALLOW {allow}\nON repo \"org/app\"\n"
-            );
-            make_vm(&text, "bbbb", ActorKind::Agent, (100, 200))
-        };
-        let valid_child = child_vm("git.pr.merge");
-        assert_eq!(
-            verify_chain_runtime(core::slice::from_ref(&valid_child), &sub, 150),
-            Err("root mandate must not declare a PARENT digest".into())
-        );
-        assert_eq!(
-            verify_chain_structure(&[]),
-            Err("empty mandate chain".into())
-        );
-        assert_eq!(
-            verify_chain_structure(core::slice::from_ref(&valid_child)),
-            Err("root mandate must not declare a PARENT digest".into())
-        );
-        assert_eq!(
-            verify_chain_structure(&[vm.clone(), valid_child.clone()]),
-            Ok(alloc::vec![pid, valid_child.ast.mandate_id()])
-        );
-        assert!(verify_chain_structure(&[vm.clone(), child_vm("git.*")])
-            .unwrap_err()
-            .contains("attenuation check failed"));
-        assert_eq!(
-            verify_chain_runtime(&[vm.clone(), valid_child], &sub, 150),
-            Ok(())
-        );
-        assert!(verify_chain_runtime(&[vm, child_vm("git.*")], &sub, 150)
-            .unwrap_err()
-            .contains("attenuation check failed"));
-    }
 }

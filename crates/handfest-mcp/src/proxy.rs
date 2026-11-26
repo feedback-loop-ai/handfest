@@ -251,13 +251,17 @@ impl<C: Clock, L: ReceiptLedger> McpProxy<C, L> {
             return fail_upstream_protocol(client_out, Some(req_id), detail);
         }
 
-        tools.retain(|entry| {
-            entry
-                .as_object()
-                .and_then(|obj| obj.get("name"))
-                .and_then(ExactJson::as_str)
-                .is_some_and(|name| self.is_tool_permitted(name, evaluated_at))
-        });
+        if verify_chain_runtime(&self.verified_chain, &self.actor_key, evaluated_at).is_err() {
+            tools.clear();
+        } else {
+            tools.retain(|entry| {
+                entry
+                    .as_object()
+                    .and_then(|obj| obj.get("name"))
+                    .and_then(ExactJson::as_str)
+                    .is_some_and(|name| self.is_tool_permitted(name))
+            });
+        }
 
         write_raw_line(client_out, &ExactJson::Object(resp_obj).to_json_string())
     }
@@ -300,16 +304,22 @@ impl<C: Clock, L: ReceiptLedger> McpProxy<C, L> {
         )
     }
 
-    fn is_tool_permitted(&self, tool_name: &str, now: i64) -> bool {
-        if verify_chain_runtime(&self.verified_chain, &self.actor_key, now).is_err() {
-            return false;
-        }
+    fn is_tool_permitted(&self, tool_name: &str) -> bool {
         let Some(policy) = self.policy_map.get(tool_name) else {
             return false;
         };
-        self.verified_chain
-            .iter()
-            .all(|vm| vm.ast.allow().iter().any(|pat| pat.matches(&policy.action)))
+        self.verified_chain.iter().all(|vm| {
+            let action_allowed = vm.ast.allow().iter().any(|pat| pat.matches(&policy.action));
+            let resource_allowed = match policy.static_resource_id.as_deref() {
+                Some(static_id) => vm
+                    .ast
+                    .on()
+                    .iter()
+                    .any(|sel| sel.kind() == policy.resource_kind && sel.matches(static_id)),
+                None => true,
+            };
+            action_allowed && resource_allowed
+        })
     }
 }
 
@@ -342,11 +352,6 @@ fn validate_tools_list_entries(tools: &[ExactJson]) -> Result<(), String> {
         let Some(obj) = entry.as_object() else {
             return Err("malformed upstream tools/list entry: expected JSON object".to_string());
         };
-        if let Some(key) = find_non_ascii_key(obj) {
-            return Err(format!(
-                "malformed upstream tools/list entry: non-ASCII key '{key}'"
-            ));
-        }
         if let Some(key) = obj
             .keys()
             .find(|k| k.as_str() != "name" && k.eq_ignore_ascii_case("name"))
@@ -355,13 +360,47 @@ fn validate_tools_list_entries(tools: &[ExactJson]) -> Result<(), String> {
                 "malformed upstream tools/list entry: key '{key}' collides case-insensitively with 'name'"
             ));
         }
-        if let Some((a, b)) = find_case_colliding_keys(obj) {
-            return Err(format!(
-                "malformed upstream tools/list entry: key '{b}' collides case-insensitively with '{a}'"
-            ));
+        validate_tools_list_json_keys(entry)?;
+        let Some(name) = obj.get("name").and_then(ExactJson::as_str) else {
+            return Err(
+                "malformed upstream tools/list entry: missing or non-string 'name'".to_string(),
+            );
+        };
+        if name.is_empty() {
+            return Err(
+                "malformed upstream tools/list entry: 'name' must not be empty".to_string(),
+            );
         }
     }
     Ok(())
+}
+
+fn validate_tools_list_json_keys(val: &ExactJson) -> Result<(), String> {
+    match val {
+        ExactJson::Object(map) => {
+            if let Some(key) = find_non_ascii_key(map) {
+                return Err(format!(
+                    "malformed upstream tools/list entry: non-ASCII key '{key}'"
+                ));
+            }
+            if let Some((a, b)) = find_case_colliding_keys(map) {
+                return Err(format!(
+                    "malformed upstream tools/list entry: key '{b}' collides case-insensitively with '{a}'"
+                ));
+            }
+            for child in map.values() {
+                validate_tools_list_json_keys(child)?;
+            }
+            Ok(())
+        }
+        ExactJson::Array(items) => {
+            for item in items {
+                validate_tools_list_json_keys(item)?;
+            }
+            Ok(())
+        }
+        ExactJson::Null | ExactJson::Bool(_) | ExactJson::Number(_) | ExactJson::Str(_) => Ok(()),
+    }
 }
 
 fn extract_tool_call_params(

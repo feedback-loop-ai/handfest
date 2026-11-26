@@ -6,10 +6,9 @@
 use std::collections::BTreeSet;
 use std::fs;
 
-use handfest_core::ast::{
-    is_valid_field_path, is_valid_quoted_str, parse_rfc3339_utc, Decimal, Scalar, MAX_DECIMAL_SCALE,
-};
+use handfest_core::ast::{is_valid_field_path, is_valid_quoted_str, parse_rfc3339_utc, Scalar};
 use handfest_core::gate::VerifiedFacts;
+use handfest_core::json_num::{parse_canonical_json_int, parse_decimal_str, parse_json_decimal};
 
 const MAX_JSON_DEPTH: usize = 16;
 
@@ -99,18 +98,13 @@ fn parse_typed_scalar_object(
             Ok(Scalar::Timestamp(ts))
         }
         ("decimal", ExactJson::Str(s)) => {
-            let dec = Decimal::parse(s)
+            let dec = parse_decimal_str(s)
                 .map_err(|err| format!("fact '{field}': invalid decimal: {err}"))?;
             Ok(Scalar::Decimal(dec))
         }
-        ("int", ExactJson::Number(raw)) => {
-            if raw.contains(['.', 'e', 'E']) {
-                return Err(format!("fact '{field}': expected 64-bit signed integer"));
-            }
-            raw.parse::<i64>()
-                .map(Scalar::Int)
-                .map_err(|_| format!("fact '{field}': expected 64-bit signed integer"))
-        }
+        ("int", ExactJson::Number(raw)) => parse_canonical_json_int(raw)
+            .map(Scalar::Int)
+            .ok_or_else(|| format!("fact '{field}': expected 64-bit signed integer")),
         ("bool", ExactJson::Bool(b)) => Ok(Scalar::Bool(*b)),
         _ => Err(format!(
             "fact '{field}': unsupported typed scalar wrapper '{tag}'"
@@ -120,108 +114,15 @@ fn parse_typed_scalar_object(
 
 fn parse_exact_json_number(field: &str, raw: &str) -> Result<Scalar, String> {
     if !raw.contains(['.', 'e', 'E']) {
-        return raw
-            .parse::<i64>()
+        return parse_canonical_json_int(raw)
             .map(Scalar::Int)
-            .map_err(|_| format!("fact '{field}': integer '{raw}' outside 64-bit signed range"));
+            .ok_or_else(|| {
+                format!("fact '{field}': invalid or out-of-range 64-bit signed integer '{raw}'")
+            });
     }
     let dec = parse_json_decimal(raw)
         .map_err(|err| format!("fact '{field}': unsupported numeric literal '{raw}': {err}"))?;
     Ok(Scalar::Decimal(dec))
-}
-
-fn parse_json_decimal(raw: &str) -> Result<Decimal, String> {
-    let (mant_part, exp_str) = match raw.find(['e', 'E']) {
-        Some(exp_pos) => {
-            let (m, exp_part) = raw.split_at(exp_pos);
-            let exp_str = &exp_part[1..];
-            let exp_digits = exp_str.strip_prefix(['+', '-']).unwrap_or(exp_str);
-            if exp_digits.is_empty() || !exp_digits.bytes().all(|b| b.is_ascii_digit()) {
-                return Err(format!("invalid exponent '{exp_str}'"));
-            }
-            (m, Some(exp_str))
-        }
-        None => (raw, None),
-    };
-
-    let (neg, unsigned_mant) = match mant_part.strip_prefix('-') {
-        Some(rest) => (true, rest),
-        None => (false, mant_part),
-    };
-    let (int_digits, frac_digits) = match unsigned_mant.split_once('.') {
-        Some((i, f)) => (i, f),
-        None => (unsigned_mant, ""),
-    };
-
-    let mut digits = String::with_capacity(int_digits.len() + frac_digits.len());
-    digits.push_str(int_digits);
-    digits.push_str(frac_digits);
-    let trimmed_leading = digits.trim_start_matches('0');
-    if trimmed_leading.is_empty() {
-        return Ok(Decimal::ZERO);
-    }
-
-    let exp: i64 = match exp_str {
-        Some(s) => s
-            .parse()
-            .map_err(|_| format!("exponent '{s}' out of range"))?,
-        None => 0i64,
-    };
-
-    let frac_len =
-        i64::try_from(frac_digits.len()).map_err(|_| "fractional length overflow".to_string())?;
-    let trimmed = trimmed_leading.trim_end_matches('0');
-    let trailing_zeros = i64::try_from(trimmed_leading.len() - trimmed.len())
-        .map_err(|_| "trailing zero count overflow".to_string())?;
-    let net_exp = exp
-        .checked_sub(frac_len)
-        .and_then(|v| v.checked_add(trailing_zeros))
-        .ok_or_else(|| "decimal exponent overflow".to_string())?;
-
-    let mut acc: u128 = 0;
-    for b in trimmed.bytes() {
-        acc = acc
-            .checked_mul(10)
-            .and_then(|v| v.checked_add(u128::from(b - b'0')))
-            .ok_or_else(|| "decimal overflow".to_string())?;
-    }
-
-    let scale = if net_exp >= 0 {
-        if net_exp > 39 {
-            return Err("decimal overflow".to_string());
-        }
-        for _ in 0..net_exp {
-            acc = acc
-                .checked_mul(10)
-                .ok_or_else(|| "decimal overflow".to_string())?;
-        }
-        0u8
-    } else {
-        let neg_exp = net_exp
-            .checked_neg()
-            .ok_or_else(|| "decimal scale overflow".to_string())?;
-        if neg_exp > i64::from(MAX_DECIMAL_SCALE) {
-            return Err(format!(
-                "scale {neg_exp} exceeds maximum {MAX_DECIMAL_SCALE}"
-            ));
-        }
-        u8::try_from(neg_exp).map_err(|_| "decimal scale overflow".to_string())?
-    };
-
-    let mantissa = signed_from_u128(neg, acc).ok_or_else(|| "decimal overflow".to_string())?;
-    Decimal::new(mantissa, scale)
-        .map(|d| d.canonical())
-        .map_err(|err| err.to_string())
-}
-
-fn signed_from_u128(neg: bool, abs: u128) -> Option<i128> {
-    if !neg {
-        i128::try_from(abs).ok()
-    } else if abs == (i128::MAX as u128) + 1 {
-        Some(i128::MIN)
-    } else {
-        i128::try_from(abs).ok().map(|v| -v)
-    }
 }
 
 enum ExactJson {
@@ -422,6 +323,7 @@ impl<'a> JsonParser<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use handfest_core::ast::Decimal;
 
     #[test]
     fn plain_decimals_with_redundant_trailing_zeros_match_scientific_spelling() {
@@ -465,7 +367,7 @@ mod tests {
         for raw in [
             r#"{"resource.amount": 0e2147483648}"#,
             r#"{"resource.amount": 0.0e-2147483649}"#,
-            r#"{"resource.amount": -0.000e+999999999999999999999999}"#,
+            r#"{"resource.amount": 0.000e+999999999999999999999999}"#,
         ] {
             let parsed = parse_facts_arg(raw).unwrap();
             assert_eq!(
@@ -481,5 +383,32 @@ mod tests {
             err.contains("overflow") || err.contains("out of range"),
             "unexpected error: {err}"
         );
+    }
+
+    #[test]
+    fn rejects_negative_zero_and_leading_zero_integers_and_decimals_consistently() {
+        for raw in [
+            r#"{"mode":{"int":-0}}"#,
+            r#"{"mode":-0}"#,
+            r#"{"amount":-0.0}"#,
+            r#"{"amount":-0e5}"#,
+            r#"{"amount":-0.000e+999999999999999999999999}"#,
+            r#"{"amount":{"decimal":"-0"}}"#,
+            r#"{"amount":{"decimal":"-0.00"}}"#,
+            r#"{"amount":{"decimal":"010"}}"#,
+            r#"{"amount":{"decimal":"0100"}}"#,
+            r#"{"amount":{"decimal":"-010"}}"#,
+        ] {
+            assert!(
+                parse_facts_arg(raw).is_err(),
+                "CLI facts parser must reject non-canonical literal in {raw}"
+            );
+        }
+
+        let ok = parse_facts_arg(r#"{"mode":0,"wrapped":{"int":0},"dec":{"decimal":"0.00"}}"#)
+            .expect("canonical zeros must be accepted");
+        assert_eq!(ok.get("mode"), Some(&Scalar::Int(0)));
+        assert_eq!(ok.get("wrapped"), Some(&Scalar::Int(0)));
+        assert_eq!(ok.get("dec"), Some(&Scalar::Decimal(Decimal::ZERO)));
     }
 }

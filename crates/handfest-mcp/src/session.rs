@@ -210,7 +210,7 @@ impl<C: Clock, L: ReceiptLedger> McpProxy<C, L> {
                     return Err(transport.take_writer_error());
                 }
                 RecvOutcome::Timeout => {
-                    return Ok(());
+                    return handle_post_eof_timeout(&transport);
                 }
                 RecvOutcome::Disconnected => {
                     if let Some(err) = transport.poll_writer_error() {
@@ -510,32 +510,30 @@ impl<C: Clock, L: ReceiptLedger> McpProxy<C, L> {
         state: &mut SessionState,
         client_out: &mut CW,
     ) -> Result<(), ProxyError> {
-        let pending = if state
-            .active_request
-            .as_ref()
-            .is_some_and(|req| req.id == resp_id)
-        {
-            state.interleaved_count = 0;
-            state.active_request.take()
-        } else if let Some(cancelled) = state.take_cancelled(&resp_id) {
-            Some(cancelled)
-        } else {
-            let detail = match state.active_id() {
-                Some(expected) => format!(
-                    "response id mismatch: expected {}, got {}",
-                    expected.to_json_literal(),
-                    resp_id.to_json_literal()
-                ),
-                None => format!(
-                    "unexpected upstream response for id {} with no pending request",
-                    resp_id.to_json_literal()
-                ),
-            };
-            return fail_upstream_protocol(client_out, state.active_id(), detail);
-        };
-
-        let Some(pending) = pending else {
-            return Ok(());
+        let pending = match state.active_request.take() {
+            Some(req) if req.id == resp_id => {
+                state.interleaved_count = 0;
+                req
+            }
+            active => {
+                state.active_request = active;
+                if let Some(cancelled) = state.take_cancelled(&resp_id) {
+                    cancelled
+                } else {
+                    let detail = match state.active_id() {
+                        Some(expected) => format!(
+                            "response id mismatch: expected {}, got {}",
+                            expected.to_json_literal(),
+                            resp_id.to_json_literal()
+                        ),
+                        None => format!(
+                            "unexpected upstream response for id {} with no pending request",
+                            resp_id.to_json_literal()
+                        ),
+                    };
+                    return fail_upstream_protocol(client_out, state.active_id(), detail);
+                }
+            }
         };
         let id_spelling_matches = pending.id.has_same_spelling(&resp_id);
         if !id_spelling_matches {
@@ -789,3 +787,14 @@ fn handle_notification<CW: Write>(
     // Disallowed notifications (including notification `tools/call`) are dropped without forwarding.
     Ok(())
 }
+
+fn handle_post_eof_timeout(transport: &DuplexTransport) -> Result<(), ProxyError> {
+    if let Some(err) = transport.poll_writer_error() {
+        return Err(err);
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+#[path = "session_tests.rs"]
+mod tests;

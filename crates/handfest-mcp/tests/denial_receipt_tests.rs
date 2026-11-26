@@ -1046,10 +1046,10 @@ fn denial_receipt_preserves_control_char_resource_id_and_uses_empty_for_non_stri
 #[test]
 fn tools_list_hides_tools_when_clock_is_outside_rfc3339_range_even_if_proof_window_covers_it() {
     let (mut verified, agent_kp) = single_hop_chain("git.*", "repo", "*", "");
-    // Widen proof window to cover every i64 except i64::MAX so only `is_valid_timestamp(now)`
-    // can reject out-of-range timestamps.
-    verified[0].proof.valid_from = i64::MIN;
-    verified[0].proof.valid_until = i64::MAX;
+    // Set proof window to full valid RFC 3339 bounds so out-of-range `now` is rejected while
+    // in-range `now` still advertises permitted tools.
+    verified[0].proof.valid_from = handfest_core::ast::MIN_RFC3339_TIMESTAMP;
+    verified[0].proof.valid_until = handfest_core::ast::MAX_RFC3339_TIMESTAMP;
 
     let req = b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/list\",\"params\":{}}\n";
     let upstream_reply = r#"{"jsonrpc":"2.0","id":1,"result":{"tools":[{"name":"merge_pr"}]}}"#;
@@ -1076,7 +1076,7 @@ fn tools_list_hides_tools_when_clock_is_outside_rfc3339_range_even_if_proof_wind
 
     let in_range = parse_rfc3339_utc("2026-06-01T00:00:00Z").unwrap();
     let mut ok_proxy = McpProxy::new(
-        verified,
+        verified.clone(),
         agent_kp.key_id(),
         merge_pr_policy_map(),
         SqliteLedger::open_in_memory().unwrap(),
@@ -1089,6 +1089,21 @@ fn tools_list_hides_tools_when_clock_is_outside_rfc3339_range_even_if_proof_wind
         responses[0]["result"]["tools"],
         json!([{"name": "merge_pr"}])
     );
+
+    // Proof with out-of-range i64::MIN..i64::MAX bounds also hides tools even at in-range `now`.
+    verified[0].proof.valid_from = i64::MIN;
+    verified[0].proof.valid_until = i64::MAX;
+    let mut bad_proof_proxy = McpProxy::new(
+        verified,
+        agent_kp.key_id(),
+        merge_pr_policy_map(),
+        SqliteLedger::open_in_memory().unwrap(),
+        FixedClock::new(in_range),
+    )
+    .unwrap();
+    let (res, responses, _) = run_scripted(&mut bad_proof_proxy, req, &[upstream_reply]);
+    res.expect("out-of-range proof tools/list completes cleanly");
+    assert_eq!(responses[0]["result"]["tools"], json!([]));
 }
 
 #[test]

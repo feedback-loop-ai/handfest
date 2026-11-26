@@ -8,6 +8,7 @@ extern crate alloc;
 pub mod ast;
 pub mod cnl;
 pub mod gate;
+pub mod json_num;
 pub mod lattice;
 
 use alloc::string::String;
