@@ -400,6 +400,47 @@ impl fmt::Display for MappingError {
 
 impl core::error::Error for MappingError {}
 
+/// Validated [`ToolPolicyMap`] paired with pre-compiled static [`VerifiedFacts`] per tool.
+///
+/// Can only be constructed via [`ToolPolicyMap::compile`], guaranteeing that every tool policy
+/// passed [`ToolPolicyMap::validate`] and preventing callers from injecting forged static facts.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CompiledPolicyMap {
+    policy_map: ToolPolicyMap,
+    static_facts: BTreeMap<String, VerifiedFacts>,
+}
+
+impl CompiledPolicyMap {
+    /// Borrows the validated underlying [`ToolPolicyMap`].
+    #[must_use]
+    pub const fn policy_map(&self) -> &ToolPolicyMap {
+        &self.policy_map
+    }
+
+    /// Returns the pre-compiled static [`VerifiedFacts`] for `tool_name`, if admitted.
+    #[must_use]
+    pub fn static_facts_for(&self, tool_name: &str) -> Option<&VerifiedFacts> {
+        self.static_facts.get(tool_name)
+    }
+
+    /// Maps an MCP `tools/call` invocation using pre-validated policies and pre-compiled static
+    /// facts.
+    pub fn map_call_exact(
+        &self,
+        actor_key: &KeyId,
+        tool_name: &str,
+        arguments: Option<&ExactJson>,
+    ) -> Result<(ActionRequest, VerifiedFacts), MappingError> {
+        let (Some(policy), Some(static_facts)) = (
+            self.policy_map.tools.get(tool_name),
+            self.static_facts.get(tool_name),
+        ) else {
+            return Err(MappingError::UnmappedTool(tool_name.to_string()));
+        };
+        map_policy_call(actor_key, tool_name, policy, arguments, static_facts)
+    }
+}
+
 impl ToolPolicyMap {
     /// Parses and validates a [`ToolPolicyMap`] in a single pass via `ExactJson`, rejecting
     /// duplicate keys without double-parsing.
@@ -409,6 +450,30 @@ impl ToolPolicyMap {
         let map = policy_decode::decode_tool_policy_map(&parsed)?;
         map.validate()?;
         Ok(map)
+    }
+
+    /// Loads and validates a [`ToolPolicyMap`] from a JSON file on disk.
+    #[cfg(feature = "std")]
+    pub fn from_file(path: impl AsRef<std::path::Path>) -> Result<Self, MappingError> {
+        let path_ref = path.as_ref();
+        let raw = std::fs::read_to_string(path_ref).map_err(|err| {
+            MappingError::Io(format!("failed to read '{}': {err}", path_ref.display()))
+        })?;
+        Self::from_json_str(&raw)
+    }
+
+    /// Validates every tool policy and seals pre-compiled static [`VerifiedFacts`] into a
+    /// [`CompiledPolicyMap`].
+    pub fn compile(self) -> Result<CompiledPolicyMap, MappingError> {
+        self.validate()?;
+        let mut static_facts = BTreeMap::new();
+        for (tool_name, policy) in &self.tools {
+            static_facts.insert(tool_name.clone(), policy.static_verified_facts()?);
+        }
+        Ok(CompiledPolicyMap {
+            policy_map: self,
+            static_facts,
+        })
     }
 
     /// Validates every tool policy entry in this map.
@@ -442,16 +507,6 @@ impl ToolPolicyMap {
         self.map_call_exact(actor_key, tool_name, parsed.as_ref())
     }
 
-    /// Pre-compiles validated static [`VerifiedFacts`] per tool once at startup so neither
-    /// `tools/list` discovery nor `tools/call` mapping rebuilds static facts per request.
-    pub fn compile_static_facts(&self) -> Result<BTreeMap<String, VerifiedFacts>, MappingError> {
-        let mut compiled = BTreeMap::new();
-        for (tool_name, policy) in &self.tools {
-            compiled.insert(tool_name.clone(), policy.static_verified_facts()?);
-        }
-        Ok(compiled)
-    }
-
     pub fn map_call_exact(
         &self,
         actor_key: &KeyId,
@@ -465,23 +520,6 @@ impl ToolPolicyMap {
         policy.validate(tool_name)?;
         let static_facts = policy.static_verified_facts()?;
         map_policy_call(actor_key, tool_name, policy, arguments, &static_facts)
-    }
-
-    pub fn map_call_exact_prevalidated(
-        &self,
-        actor_key: &KeyId,
-        tool_name: &str,
-        arguments: Option<&ExactJson>,
-        static_facts: Option<&VerifiedFacts>,
-    ) -> Result<(ActionRequest, VerifiedFacts), MappingError> {
-        let policy = self
-            .tools
-            .get(tool_name)
-            .ok_or_else(|| MappingError::UnmappedTool(tool_name.to_string()))?;
-        let Some(precompiled) = static_facts else {
-            return Err(MappingError::UnmappedTool(tool_name.to_string()));
-        };
-        map_policy_call(actor_key, tool_name, policy, arguments, precompiled)
     }
 }
 

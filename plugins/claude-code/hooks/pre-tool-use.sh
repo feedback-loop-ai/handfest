@@ -2,7 +2,7 @@
 # Deterministic, fail-closed Claude Code PreToolUse hook for HANDFEST v1 mandates.
 #
 # Required env:
-#   HANDFEST_POLICY_MAP  ToolPolicyMap JSON path (validated by handfest-mcp's single codec via `handfest check --policy-map`)
+#   HANDFEST_POLICY_MAP  ToolPolicyMap JSON path (validated by handfest-core's single codec via `handfest check --policy-map`)
 #   HANDFEST_LEDGER      SQLite receipt/quota ledger database path
 #   HANDFEST_CHAIN       Colon-separated ordered SignedMandate JSON path(s), root first
 #   HANDFEST_ACTOR_KEY   Concrete requesting actor KeyId (e.g. ed25519:<64-hex>)

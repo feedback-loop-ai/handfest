@@ -12,7 +12,8 @@ use crate::policy::{FactSpec, FactType, MappingError, ToolPolicy, ToolPolicyMap,
 /// Decodes a [`ToolPolicyMap`] directly from a pre-parsed, duplicate-checked [`ExactJson`] tree.
 pub(super) fn decode_tool_policy_map(root: &ExactJson) -> Result<ToolPolicyMap, MappingError> {
     let obj = expect_object(root, "policy map root")?;
-    reject_unknown_keys(obj, &["tools"], "policy map root").map_err(MappingError::InvalidJson)?;
+    reject_unknown_keys(obj, &["tools"], "policy map root")
+        .map_err(|err| MappingError::InvalidJson(err.to_string()))?;
     let tools_val = obj
         .get("tools")
         .ok_or_else(|| MappingError::InvalidJson("missing required field 'tools'".to_string()))?;
@@ -42,7 +43,7 @@ fn decode_tool_policy(tool_name: &str, value: &ExactJson) -> Result<ToolPolicy, 
         ],
         &ctx,
     )
-    .map_err(MappingError::InvalidJson)?;
+    .map_err(|err| MappingError::InvalidJson(err.to_string()))?;
 
     let action = expect_required_str(obj, "action", &ctx)?;
     let resource_kind = expect_required_str(obj, "resource_kind", &ctx)?;
@@ -78,7 +79,7 @@ fn decode_arg_facts(
         let ctx = format!("tool '{tool_name}'.arg_facts['{arg_key}']");
         let spec_obj = expect_object(spec_val, &ctx)?;
         reject_unknown_keys(spec_obj, &["field", "type"], &ctx)
-            .map_err(MappingError::InvalidJson)?;
+            .map_err(|err| MappingError::InvalidJson(err.to_string()))?;
         let field = expect_required_str(spec_obj, "field", &ctx)?;
         let raw_type = expect_required_str(spec_obj, "type", &ctx)?;
         let fact_type = decode_fact_type(&raw_type, &ctx)?;

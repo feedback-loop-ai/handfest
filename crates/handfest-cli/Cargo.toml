@@ -12,7 +12,7 @@ name = "handfest"
 path = "src/main.rs"
 
 [dependencies]
-handfest-core.workspace = true
+handfest-core = { workspace = true, features = ["std"] }
 handfest-anchors.workspace = true
 handfest-ledger.workspace = true
 clap.workspace = true

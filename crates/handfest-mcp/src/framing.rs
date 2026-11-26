@@ -238,12 +238,15 @@ pub(crate) fn validate_client_envelope(
         });
     }
 
-    if let Err(message) = reject_unknown_keys(
+    if let Err(err) = reject_unknown_keys(
         obj,
         &["jsonrpc", "id", "method", "params"],
         "JSON-RPC client envelope",
     ) {
-        return Err(ClientEnvelopeError { id, message });
+        return Err(ClientEnvelopeError {
+            id,
+            message: err.to_string(),
+        });
     }
 
     let Some(method) = obj.get("method").and_then(ExactJson::as_str) else {
@@ -297,7 +300,8 @@ pub(crate) fn classify_upstream_frame(
             obj,
             &["jsonrpc", "id", "method", "params"],
             "upstream JSON-RPC request/notification",
-        )?;
+        )
+        .map_err(|err| err.to_string())?;
         if let Some(params) = obj.get("params") {
             if !matches!(params, ExactJson::Object(_) | ExactJson::Array(_)) {
                 return Err(
@@ -335,13 +339,15 @@ fn validate_response_body(
             obj,
             &["jsonrpc", "id", "result"],
             "upstream JSON-RPC response",
-        ),
+        )
+        .map_err(|err| err.to_string()),
         (false, true) => {
             reject_unknown_keys(
                 obj,
                 &["jsonrpc", "id", "error"],
                 "upstream JSON-RPC response",
-            )?;
+            )
+            .map_err(|err| err.to_string())?;
             match obj.get("error") {
                 Some(err_val) if is_valid_jsonrpc_error_object(err_val) => Ok(()),
                 _ => Err("malformed JSON-RPC error object in upstream response".to_string()),

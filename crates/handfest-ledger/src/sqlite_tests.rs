@@ -324,63 +324,11 @@ fn hardlink_open_read_only_preserves_writer_lock_and_limit_one_across_processes(
 }
 
 #[cfg(unix)]
-#[test]
-fn ro_snapshot_exclusive_probe_helper() {
-    let Ok(db_path) = std::env::var("HANDFEST_RO_SNAPSHOT_DB") else {
-        return;
-    };
-    let conn = Connection::open(&db_path).expect("probe open");
-    conn.busy_timeout(Duration::ZERO).unwrap();
-    let res = conn.execute_batch("BEGIN EXCLUSIVE; ROLLBACK;");
-    let expect_locked = std::env::var("HANDFEST_RO_SNAPSHOT_EXPECT_LOCKED").as_deref() == Ok("1");
-    if expect_locked {
-        match res {
-            Err(rusqlite::Error::SqliteFailure(err, _))
-                if err.code == rusqlite::ErrorCode::DatabaseBusy => {}
-            other => panic!(
-                "expected parent POSIX lock to fail with DatabaseBusy (SQLITE_BUSY), got: {other:?}"
-            ),
-        }
-    } else {
-        res.expect("expected child EXCLUSIVE lock to succeed after parent lock ended");
-    }
-}
-
-#[cfg(unix)]
-fn assert_cross_process_exclusive_lock(db_path: &Path, expect_locked: bool) {
-    use std::process::Command;
-
-    let exe = std::env::current_exe().expect("current test exe");
-    let output = Command::new(&exe)
-        .args([
-            "--exact",
-            "sqlite::tests::ro_snapshot_exclusive_probe_helper",
-            "--quiet",
-        ])
-        .env("HANDFEST_RO_SNAPSHOT_DB", db_path)
-        .env(
-            "HANDFEST_RO_SNAPSHOT_EXPECT_LOCKED",
-            if expect_locked { "1" } else { "0" },
-        )
-        .output()
-        .expect("spawn exclusive lock probe");
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        output.status.success(),
-        "cross-process BEGIN EXCLUSIVE probe failed (expect_locked={expect_locked})\nstdout:\n{stdout}\nstderr:\n{stderr}"
-    );
-    assert!(
-        stdout.contains("1 passed"),
-        "cross-process BEGIN EXCLUSIVE probe did not execute helper test (expect_locked={expect_locked}); stdout:\n{stdout}"
-    );
-}
+use crate::lock_probe_test_util::assert_cross_process_exclusive_lock;
 
 #[cfg(unix)]
 #[test]
 fn concurrent_open_read_only_handles_preserve_posix_shared_lock_and_snapshot_isolation() {
-    use std::process::Command;
-
     let dir = TempDir::new().unwrap();
     let db_path = dir.path().join("concurrent_ro_snapshot.sqlite");
     let (chain, req, facts, now) = sample_chain_and_req();
@@ -397,7 +345,6 @@ fn concurrent_open_read_only_handles_preserve_posix_shared_lock_and_snapshot_iso
     let ro1 = SqliteLedger::open_read_only(&db_path).unwrap();
     assert_eq!(active_handle_count(&canonical), 1);
 
-    let exe = std::env::current_exe().expect("current test exe");
     let (start_tx, start_rx) = mpsc::channel();
     let (done_tx, done_rx) = mpsc::channel();
     let writer_path = db_path.clone();
@@ -422,20 +369,7 @@ fn concurrent_open_read_only_handles_preserve_posix_shared_lock_and_snapshot_iso
         }
         assert_eq!(active_handle_count(&canonical), 1);
 
-        let locked = Command::new(&exe)
-            .args([
-                "--exact",
-                "sqlite::tests::ro_snapshot_exclusive_probe_helper",
-                "--quiet",
-            ])
-            .env("HANDFEST_RO_SNAPSHOT_DB", &db_path)
-            .env("HANDFEST_RO_SNAPSHOT_EXPECT_LOCKED", "1")
-            .status()
-            .expect("spawn locked probe");
-        assert!(
-            locked.success(),
-            "second open_read_only dropped first reader's POSIX SHARED lock!"
-        );
+        assert_cross_process_exclusive_lock(&db_path, true);
 
         start_tx.send(()).unwrap();
         assert!(
@@ -449,17 +383,7 @@ fn concurrent_open_read_only_handles_preserve_posix_shared_lock_and_snapshot_iso
     assert_eq!(maybe_rec.unwrap().total_decisions, 1);
     writer_handle.join().unwrap();
 
-    let unlocked = Command::new(&exe)
-        .args([
-            "--exact",
-            "sqlite::tests::ro_snapshot_exclusive_probe_helper",
-            "--quiet",
-        ])
-        .env("HANDFEST_RO_SNAPSHOT_DB", &db_path)
-        .env("HANDFEST_RO_SNAPSHOT_EXPECT_LOCKED", "0")
-        .status()
-        .expect("spawn unlocked probe");
-    assert!(unlocked.success());
+    assert_cross_process_exclusive_lock(&db_path, false);
 
     let (after_count, after_rec) = ro1.audit_snapshot(Some(&req.actor_key)).unwrap();
     assert_eq!(after_count, 2);
@@ -498,8 +422,6 @@ fn existing_ledger_open_flags_forbid_create_and_fail_on_missing_path() {
 #[cfg(unix)]
 #[test]
 fn audit_snapshot_shared_lock_survives_unrelated_writer_drop_with_deferred_fd() {
-    use std::process::Command;
-
     let dir = TempDir::new().unwrap();
     let ledger_a = dir.path().join("audit_a.sqlite");
     let ledger_b = dir.path().join("writer_b.sqlite");
@@ -513,7 +435,6 @@ fn audit_snapshot_shared_lock_survives_unrelated_writer_drop_with_deferred_fd() 
     }
 
     let ro1 = SqliteLedger::open_read_only(&ledger_a).unwrap();
-    let exe = std::env::current_exe().expect("current test exe");
 
     let (verified, maybe_rec) = run_audit_tx(&ro1.conn, Some(&req.actor_key), || {
         {
@@ -523,20 +444,7 @@ fn audit_snapshot_shared_lock_survives_unrelated_writer_drop_with_deferred_fd() 
             assert!(matches!(err, LedgerError::Integrity(_)));
             fs::remove_file(&victim_c_journal).unwrap();
         }
-        let locked = Command::new(&exe)
-            .args([
-                "--exact",
-                "sqlite::tests::ro_snapshot_exclusive_probe_helper",
-                "--quiet",
-            ])
-            .env("HANDFEST_RO_SNAPSHOT_DB", &ledger_a)
-            .env("HANDFEST_RO_SNAPSHOT_EXPECT_LOCKED", "1")
-            .status()
-            .expect("spawn locked probe");
-        assert!(
-            locked.success(),
-            "dropping writer B while ro1 held audit_snapshot SHARED lock dropped ro1's POSIX lock!"
-        );
+        assert_cross_process_exclusive_lock(&ledger_a, true);
     })
     .unwrap();
 
@@ -544,17 +452,7 @@ fn audit_snapshot_shared_lock_survives_unrelated_writer_drop_with_deferred_fd() 
     assert_eq!(maybe_rec.unwrap().total_decisions, 1);
     drop(ro1);
 
-    let unlocked = Command::new(&exe)
-        .args([
-            "--exact",
-            "sqlite::tests::ro_snapshot_exclusive_probe_helper",
-            "--quiet",
-        ])
-        .env("HANDFEST_RO_SNAPSHOT_DB", &ledger_a)
-        .env("HANDFEST_RO_SNAPSHOT_EXPECT_LOCKED", "0")
-        .status()
-        .expect("spawn unlocked probe");
-    assert!(unlocked.success());
+    assert_cross_process_exclusive_lock(&ledger_a, false);
 }
 
 #[cfg(unix)]

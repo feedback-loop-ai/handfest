@@ -151,8 +151,10 @@ fn typed_scalar_parses_decimal_and_timestamp_at_boundary_and_roundtrips_json() {
     let decoded = ToolPolicyMap::from_json_str(&encoded).unwrap();
     assert_eq!(decoded, map);
 
-    let compiled = map.compile_static_facts().unwrap();
-    let static_facts = compiled.get("quote").unwrap();
+    let compiled = map.clone().compile().unwrap();
+    assert_eq!(compiled.policy_map(), &map);
+    assert!(compiled.static_facts_for("missing").is_none());
+    let static_facts = compiled.static_facts_for("quote").unwrap();
     assert_eq!(
         static_facts.get("pricing.fee"),
         Some(&Scalar::Decimal(expected_dec))
@@ -163,8 +165,8 @@ fn typed_scalar_parses_decimal_and_timestamp_at_boundary_and_roundtrips_json() {
     );
     assert!(static_facts.get("context.time").is_none());
 
-    let (_, call_facts) = map
-        .map_call_exact_prevalidated(&test_actor(), "quote", None, Some(static_facts))
+    let (_, call_facts) = compiled
+        .map_call_exact(&test_actor(), "quote", None)
         .unwrap();
     assert_eq!(
         call_facts.get("pricing.fee"),
@@ -175,8 +177,8 @@ fn typed_scalar_parses_decimal_and_timestamp_at_boundary_and_roundtrips_json() {
         Some(&Scalar::Timestamp(expected_ts))
     );
     assert!(matches!(
-        map.map_call_exact_prevalidated(&test_actor(), "quote", None, None),
-        Err(MappingError::UnmappedTool(ref name)) if name == "quote"
+        compiled.map_call_exact(&test_actor(), "missing", None),
+        Err(MappingError::UnmappedTool(ref name)) if name == "missing"
     ));
 
     for bad_json in [
@@ -464,4 +466,26 @@ fn mapping_error_display_formats_every_variant() {
     for (err, expected) in cases {
         assert_eq!(err.to_string(), expected);
     }
+}
+
+#[test]
+fn compile_rejects_deserialized_invalid_policy_map() {
+    let dup_target_json = r#"{
+        "tools": {
+            "pay": {
+                "action": "finance.pay",
+                "resource_kind": "account",
+                "static_resource_id": "acct-1",
+                "arg_facts": {
+                    "a": { "field": "resource.amount", "type": "decimal" },
+                    "b": { "field": "resource.amount", "type": "decimal" }
+                }
+            }
+        }
+    }"#;
+    let deserialized: ToolPolicyMap = serde_json::from_str(dup_target_json).unwrap();
+    assert!(matches!(
+        deserialized.compile(),
+        Err(MappingError::InvalidPolicy(ref msg)) if msg.contains("duplicate arg_facts target field")
+    ));
 }

@@ -250,3 +250,27 @@ fn enforces_max_depth_on_empty_containers_at_entry() {
         );
     }
 }
+
+#[test]
+fn reject_unknown_keys_returns_typed_unknown_key_error() {
+    fn assert_core_error<E: core::error::Error>(_: &E) {}
+
+    let parsed = parse_exact_json(r#"{"allowed":1,"extra":2}"#).unwrap();
+    let obj = parsed.as_object().unwrap();
+
+    assert_eq!(
+        reject_unknown_keys(obj, &["allowed", "extra"], "envelope"),
+        Ok(())
+    );
+
+    let err = reject_unknown_keys(obj, &["allowed"], "envelope").unwrap_err();
+    assert_eq!(
+        err,
+        UnknownKeyError {
+            context: "envelope".to_string(),
+            key: "extra".to_string(),
+        }
+    );
+    assert_eq!(err.to_string(), "unexpected envelope key 'extra'");
+    assert_core_error(&err);
+}

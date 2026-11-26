@@ -499,14 +499,32 @@ impl<'a> JsonParser<'a> {
     }
 }
 
+/// Structured error returned when an [`ExactJson`] object contains a key outside the allowed set.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnknownKeyError {
+    pub context: String,
+    pub key: String,
+}
+
+impl fmt::Display for UnknownKeyError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "unexpected {} key '{}'", self.context, self.key)
+    }
+}
+
+impl core::error::Error for UnknownKeyError {}
+
 /// Rejects any key in `obj` that is not present in `allowed`.
 pub fn reject_unknown_keys(
     obj: &BTreeMap<String, ExactJson>,
     allowed: &[&str],
     context: &str,
-) -> Result<(), String> {
+) -> Result<(), UnknownKeyError> {
     if let Some(key) = obj.keys().find(|k| !allowed.contains(&k.as_str())) {
-        return Err(alloc::format!("unexpected {context} key '{key}'"));
+        return Err(UnknownKeyError {
+            context: context.to_string(),
+            key: key.clone(),
+        });
     }
     Ok(())
 }

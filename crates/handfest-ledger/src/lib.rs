@@ -3,6 +3,8 @@
 
 mod audit;
 mod codec;
+#[cfg(all(test, unix))]
+mod lock_probe_test_util;
 mod preflight;
 mod quotas;
 mod schema;

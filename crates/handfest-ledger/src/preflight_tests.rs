@@ -1130,57 +1130,7 @@ fn saturate_registry_for_reader_only_state(
 }
 
 #[cfg(unix)]
-#[test]
-fn preflight_exclusive_lock_probe_helper() {
-    let Ok(db_path) = std::env::var("HANDFEST_PREFLIGHT_LOCK_DB") else {
-        return;
-    };
-    let conn = rusqlite::Connection::open(&db_path).expect("probe open");
-    conn.busy_timeout(Duration::ZERO).unwrap();
-    let res = conn.execute_batch("BEGIN EXCLUSIVE; ROLLBACK;");
-    let expect_locked = std::env::var("HANDFEST_PREFLIGHT_EXPECT_LOCKED").as_deref() == Ok("1");
-    if expect_locked {
-        match res {
-            Err(rusqlite::Error::SqliteFailure(err, _))
-                if err.code == rusqlite::ErrorCode::DatabaseBusy => {}
-            other => panic!(
-                "expected parent POSIX lock to fail with DatabaseBusy (SQLITE_BUSY), got: {other:?}"
-            ),
-        }
-    } else {
-        res.expect("expected child EXCLUSIVE lock to succeed after parent lock ended");
-    }
-}
-
-#[cfg(unix)]
-fn assert_preflight_exclusive_lock(db_path: &Path, expect_locked: bool) {
-    use std::process::Command;
-
-    let exe = std::env::current_exe().expect("current test exe");
-    let output = Command::new(&exe)
-        .args([
-            "--exact",
-            "preflight::tests::preflight_exclusive_lock_probe_helper",
-            "--quiet",
-        ])
-        .env("HANDFEST_PREFLIGHT_LOCK_DB", db_path)
-        .env(
-            "HANDFEST_PREFLIGHT_EXPECT_LOCKED",
-            if expect_locked { "1" } else { "0" },
-        )
-        .output()
-        .expect("spawn preflight exclusive lock probe");
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        output.status.success(),
-        "cross-process BEGIN EXCLUSIVE probe failed (expect_locked={expect_locked})\nstdout:\n{stdout}\nstderr:\n{stderr}"
-    );
-    assert!(
-        stdout.contains("1 passed"),
-        "cross-process BEGIN EXCLUSIVE probe did not execute helper test (expect_locked={expect_locked}); stdout:\n{stdout}"
-    );
-}
+use crate::lock_probe_test_util::assert_cross_process_exclusive_lock as assert_preflight_exclusive_lock;
 
 #[cfg(unix)]
 #[test]
