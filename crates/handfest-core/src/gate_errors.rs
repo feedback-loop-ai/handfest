@@ -215,3 +215,21 @@ impl fmt::Display for ProofShapeError {
 }
 
 impl core::error::Error for ProofShapeError {}
+
+/// Shared non-ordering anchor proof metadata errors (`anchor_id` and timestamp bounds).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ProofMetaError {
+    EmptyAnchorId,
+    InvalidAnchorIdChars,
+    TimestampOutOfRange(i64),
+}
+
+impl From<ProofMetaError> for ProofShapeError {
+    fn from(err: ProofMetaError) -> Self {
+        match err {
+            ProofMetaError::EmptyAnchorId => Self::EmptyAnchorId,
+            ProofMetaError::InvalidAnchorIdChars => Self::InvalidAnchorIdChars,
+            ProofMetaError::TimestampOutOfRange(ts) => Self::TimestampOutOfRange(ts),
+        }
+    }
+}

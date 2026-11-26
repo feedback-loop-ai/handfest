@@ -1130,6 +1130,10 @@ const GOLDEN_WIDENED_CHILD_ID: &str =
     "sha256:ef1d0ea18bacf462a0edbfc9a141f29706e09ca6bd3f39af10b57ba84ec9c5ab";
 const GOLDEN_EXPIRED_DENIAL_RECEIPT_HASH: &str =
     "sha256:bba3a44ea6d3981a1194362d55a66ec0d2a8bba9bc2e4b7f4c2b205c3fc9356d";
+const GOLDEN_EQUAL_WINDOW_DENIAL_RECEIPT_HASH: &str =
+    "sha256:5e3c1e503d1891cbe89fbc097792c1e1017b556340d27d2fbefa4fa3cdc1d174";
+const GOLDEN_MAX_EQUAL_WINDOW_DENIAL_RECEIPT_HASH: &str =
+    "sha256:4ae56f58b8c111def0b112751df21c0443f3c7f3091eaa1cc91c3036eab250b9";
 
 fn make_runtime_vm(
     text: &str,
@@ -1372,44 +1376,69 @@ fn verify_chain_runtime_rejects_bad_anchor_id_and_validity_windows() {
             valid_until: 200,
         })
     );
+}
 
-    let empty_window = make_runtime_vm(
-        GOLDEN_ROOT_MANDATE_TEXT,
-        "aaaa",
-        ActorKind::Human,
-        (200, 200),
-    );
-    for eval_now in [199, 200, 201] {
-        assert_eq!(
-            verify_chain_runtime(std::slice::from_ref(&empty_window), &leaf, eval_now),
-            Err(RuntimeChainError::InvalidProofValidityWindow {
-                hop: 0,
-                valid_from: 200,
-                valid_until: 200,
-            })
+#[test]
+fn equal_proof_window_matches_base_denial_and_golden_receipt_hash() {
+    use handfest_core::gate::{verify_chain_runtime, RuntimeChainError};
+    use handfest_core::ActorKind;
+
+    let leaf = k("ed25519:bbbb");
+    let expected_root_id: MandateId = GOLDEN_ROOT_ID.parse().unwrap();
+    let req = ActionRequest {
+        actor_key: leaf.clone(),
+        action: "git.pr.merge".into(),
+        resource_kind: "repo".into(),
+        resource_id: "org/app".into(),
+    };
+
+    let cases = [
+        (
+            (200, 200),
+            "hop 0: invalid anchor proof validity window [200..200)",
+            GOLDEN_EQUAL_WINDOW_DENIAL_RECEIPT_HASH,
+        ),
+        (
+            (i64::MAX, i64::MAX),
+            "hop 0: invalid anchor proof validity window [9223372036854775807..9223372036854775807)",
+            GOLDEN_MAX_EQUAL_WINDOW_DENIAL_RECEIPT_HASH,
+        ),
+    ];
+
+    for ((from, until), expected_reason, expected_hash) in cases {
+        let equal_window = make_runtime_vm(
+            GOLDEN_ROOT_MANDATE_TEXT,
+            "aaaa",
+            ActorKind::Human,
+            (from, until),
         );
-    }
-    let (verdict, receipt) = authorize(
-        std::slice::from_ref(&empty_window),
-        &ActionRequest {
-            actor_key: leaf.clone(),
-            action: "git.pr.merge".into(),
-            resource_kind: "repo".into(),
-            resource_id: "org/app".into(),
-        },
-        &VerifiedFacts::new(),
-        &QuotaSnapshot::new(),
-        200,
-        None,
-    );
-    assert_eq!(
-        verdict,
-        Verdict::Deny {
-            reason: "hop 0: invalid anchor proof validity window [200..200)".into(),
+        for eval_now in [199, 200, 201] {
+            assert_eq!(
+                verify_chain_runtime(std::slice::from_ref(&equal_window), &leaf, eval_now),
+                Err(RuntimeChainError::InvalidProofValidityWindow {
+                    hop: 0,
+                    valid_from: from,
+                    valid_until: until,
+                })
+            );
         }
-    );
-    assert_eq!(receipt.verdict, verdict);
-    assert_eq!(receipt.receipt_hash, receipt.compute_hash());
+        let (verdict, receipt) = authorize(
+            std::slice::from_ref(&equal_window),
+            &req,
+            &VerifiedFacts::new(),
+            &QuotaSnapshot::new(),
+            200,
+            None,
+        );
+        let expected_verdict = Verdict::Deny {
+            reason: expected_reason.into(),
+        };
+        assert_eq!(verdict, expected_verdict);
+        assert_eq!(receipt.chain_ids, vec![expected_root_id]);
+        assert_eq!(receipt.timestamp, 200);
+        assert_eq!(receipt.verdict, expected_verdict);
+        assert_eq!(receipt.receipt_hash, expected_hash.parse().unwrap());
+    }
 }
 
 #[test]

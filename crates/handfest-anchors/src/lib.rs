@@ -19,6 +19,22 @@ pub use handfest_core::AssuranceLevel;
 /// `HANDFEST v1` text before Ed25519 signing.
 pub const SIGNING_DOMAIN_PREFIX: &[u8] = b"handfest-v1-envelope\0";
 
+/// Source of the expected identity value when a verifier proof disagrees with its input.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProofIdentitySource {
+    Envelope,
+    Mandate,
+}
+
+impl ProofIdentitySource {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Envelope => "envelope",
+            Self::Mandate => "mandate FROM",
+        }
+    }
+}
+
 /// Errors returned while loading keys, signing, or verifying trust-anchor envelopes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AnchorError {
@@ -30,7 +46,17 @@ pub enum AnchorError {
         expected: String,
         actual: String,
     },
+    ProofSignerMismatch {
+        source: ProofIdentitySource,
+        expected: String,
+        actual: String,
+    },
     ActorKindMismatch {
+        expected: ActorKind,
+        actual: ActorKind,
+    },
+    ProofActorKindMismatch {
+        source: ProofIdentitySource,
         expected: ActorKind,
         actual: ActorKind,
     },
@@ -72,11 +98,29 @@ impl fmt::Display for AnchorError {
             Self::InvalidSignature(msg) => write!(f, "invalid anchor signature: {msg}"),
             Self::NonCanonicalMandate(err) => write!(f, "invalid or non-canonical mandate: {err}"),
             Self::SignerMismatch { expected, actual } => {
-                write!(f, "signer key mismatch: expected '{expected}', got '{actual}'")
+                write!(f, "signer key mismatch: mandate FROM is '{expected}', envelope has '{actual}'")
             }
+            Self::ProofSignerMismatch {
+                source,
+                expected,
+                actual,
+            } => write!(
+                f,
+                "signer key mismatch: {} is '{expected}', proof has '{actual}'",
+                source.label()
+            ),
             Self::ActorKindMismatch { expected, actual } => {
-                write!(f, "actor kind mismatch: expected {expected:?}, got {actual:?}")
+                write!(f, "actor kind mismatch: mandate FROM is {expected:?}, envelope has {actual:?}")
             }
+            Self::ProofActorKindMismatch {
+                source,
+                expected,
+                actual,
+            } => write!(
+                f,
+                "actor kind mismatch: {} is {expected:?}, proof has {actual:?}",
+                source.label()
+            ),
             Self::InvalidActorKind(raw) => write!(f, "unknown actor kind '{raw}'"),
             Self::InvalidAssurance(raw) => write!(f, "unknown assurance level '{raw}'"),
             Self::UnsupportedAssurance { expected, actual } => write!(
@@ -367,26 +411,30 @@ fn enforce_proof_identity_postconditions(
     vm: &VerifiedMandate,
 ) -> Result<(), AnchorError> {
     if &vm.proof.signer_key != expected_key {
-        return Err(AnchorError::SignerMismatch {
+        return Err(AnchorError::ProofSignerMismatch {
+            source: ProofIdentitySource::Envelope,
             expected: expected_key.to_string(),
             actual: vm.proof.signer_key.to_string(),
         });
     }
     if &vm.proof.signer_key != vm.ast.from().key() {
-        return Err(AnchorError::SignerMismatch {
+        return Err(AnchorError::ProofSignerMismatch {
+            source: ProofIdentitySource::Mandate,
             expected: vm.ast.from().key().to_string(),
             actual: vm.proof.signer_key.to_string(),
         });
     }
     let expected_actor_kind = parse_actor_kind(&signed.actor_kind)?;
     if vm.proof.actor_kind != expected_actor_kind {
-        return Err(AnchorError::ActorKindMismatch {
+        return Err(AnchorError::ProofActorKindMismatch {
+            source: ProofIdentitySource::Envelope,
             expected: expected_actor_kind,
             actual: vm.proof.actor_kind,
         });
     }
     if vm.proof.actor_kind != vm.ast.from().kind() {
-        return Err(AnchorError::ActorKindMismatch {
+        return Err(AnchorError::ProofActorKindMismatch {
+            source: ProofIdentitySource::Mandate,
             expected: vm.ast.from().kind(),
             actual: vm.proof.actor_kind,
         });

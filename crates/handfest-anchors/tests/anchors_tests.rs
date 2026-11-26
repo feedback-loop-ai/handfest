@@ -479,7 +479,8 @@ fn envelope_metadata_tampering_invalidates_signature_and_equal_window_is_signabl
 
 mod registry_tests {
     use handfest_anchors::{
-        AnchorError, AnchorRegistry, AnchorVerifier, AssuranceLevel, Ed25519Keypair, SignedMandate,
+        AnchorError, AnchorRegistry, AnchorVerifier, AssuranceLevel, Ed25519Keypair,
+        ProofIdentitySource, SignedMandate,
     };
     use handfest_core::ast::{
         parse_rfc3339_utc, KeyId, MAX_RFC3339_TIMESTAMP, MIN_RFC3339_TIMESTAMP,
@@ -734,14 +735,15 @@ mod registry_tests {
         let signer_env_err = verify_with_stub(&mismatched_env, v).unwrap_err();
         assert_eq!(
             signer_env_err,
-            AnchorError::SignerMismatch {
+            AnchorError::ProofSignerMismatch {
+                source: ProofIdentitySource::Envelope,
                 expected: "passkey:other".to_string(),
                 actual: "passkey:cred1".to_string(),
             }
         );
         assert_eq!(
             signer_env_err.to_string(),
-            "signer key mismatch: expected 'passkey:other', got 'passkey:cred1'"
+            "signer key mismatch: envelope is 'passkey:other', proof has 'passkey:cred1'"
         );
         // 3b. Mismatched signer_key (proof != ast.from) isolated from envelope binding:
         // `vm.proof.signer_key == signed.signer_key` ("passkey:other"), ONLY `ast.from().key()` differs.
@@ -749,14 +751,15 @@ mod registry_tests {
             verify_with_stub(&mismatched_env, MutatingStubVerifier::clean()).unwrap_err();
         assert_eq!(
             signer_ast_err,
-            AnchorError::SignerMismatch {
+            AnchorError::ProofSignerMismatch {
+                source: ProofIdentitySource::Mandate,
                 expected: "passkey:cred1".to_string(),
                 actual: "passkey:other".to_string(),
             }
         );
         assert_eq!(
             signer_ast_err.to_string(),
-            "signer key mismatch: expected 'passkey:cred1', got 'passkey:other'"
+            "signer key mismatch: mandate FROM is 'passkey:cred1', proof has 'passkey:other'"
         );
 
         // 4a. Mismatched actor_kind (proof != envelope) isolated from AST binding:
@@ -767,14 +770,15 @@ mod registry_tests {
             verify_with_stub(&wrong_kind_env, MutatingStubVerifier::clean()).unwrap_err();
         assert_eq!(
             kind_env_err,
-            AnchorError::ActorKindMismatch {
+            AnchorError::ProofActorKindMismatch {
+                source: ProofIdentitySource::Envelope,
                 expected: ActorKind::Agent,
                 actual: ActorKind::Human,
             }
         );
         assert_eq!(
             kind_env_err.to_string(),
-            "actor kind mismatch: expected Agent, got Human"
+            "actor kind mismatch: envelope is Agent, proof has Human"
         );
         // 4b. Mismatched actor_kind (proof != ast.from) isolated from envelope binding:
         // `vm.proof.actor_kind == signed.actor_kind` (Agent), ONLY `ast.from().kind()` differs.
@@ -783,14 +787,15 @@ mod registry_tests {
         let kind_ast_err = verify_with_stub(&wrong_kind_env, v).unwrap_err();
         assert_eq!(
             kind_ast_err,
-            AnchorError::ActorKindMismatch {
+            AnchorError::ProofActorKindMismatch {
+                source: ProofIdentitySource::Mandate,
                 expected: ActorKind::Human,
                 actual: ActorKind::Agent,
             }
         );
         assert_eq!(
             kind_ast_err.to_string(),
-            "actor kind mismatch: expected Human, got Agent"
+            "actor kind mismatch: mandate FROM is Human, proof has Agent"
         );
     }
 
@@ -935,4 +940,59 @@ mod registry_tests {
             Verdict::Deny { ref reason } if reason.contains("invalid anchor proof validity window")
         ));
     }
+}
+
+#[test]
+fn ed25519_identity_mismatch_diagnostics_label_mandate_and_envelope() {
+    let root_kp = Ed25519Keypair::from_secret_bytes([0x11; 32]);
+    let other_kp = Ed25519Keypair::from_secret_bytes([0x22; 32]);
+    let agent_kp = Ed25519Keypair::from_secret_bytes([0x33; 32]);
+    let text = format!(
+        "HANDFEST v1\nFROM human \"Valentin\" (key: {})\nTO agent \"Bot\" (key: {})\nDELEGATION max 0 hops\nALLOW git.pr.merge\nON repo \"org/app\"\n",
+        root_kp.key_id(),
+        agent_kp.key_id()
+    );
+    let canonical = render_canonical(&parse_mandate(&text).unwrap());
+    let signed = root_kp
+        .sign_mandate(
+            &canonical,
+            "local-key",
+            ts("2026-11-24T17:00:00Z"),
+            ts("2026-11-25T01:00:00Z"),
+        )
+        .unwrap();
+
+    let mut wrong_signer = signed.clone();
+    wrong_signer.signer_key = other_kp.key_id().to_string();
+    let signer_err = verify_ed25519(&wrong_signer).unwrap_err();
+    assert_eq!(
+        signer_err,
+        AnchorError::SignerMismatch {
+            expected: root_kp.key_id().to_string(),
+            actual: other_kp.key_id().to_string(),
+        }
+    );
+    assert_eq!(
+        signer_err.to_string(),
+        format!(
+            "signer key mismatch: mandate FROM is '{}', envelope has '{}'",
+            root_kp.key_id(),
+            other_kp.key_id()
+        )
+    );
+
+    let mut wrong_kind = signed;
+    wrong_kind.actor_kind = "agent".to_string();
+    let kind_err = verify_ed25519(&wrong_kind).unwrap_err();
+    assert_eq!(
+        kind_err,
+        AnchorError::ActorKindMismatch {
+            expected: ActorKind::Human,
+            actual: ActorKind::Agent,
+        }
+    );
+    assert_eq!(
+        kind_err.to_string(),
+        "actor kind mismatch: mandate FROM is Human, envelope has Agent"
+    );
 }

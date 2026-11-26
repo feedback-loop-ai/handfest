@@ -2,7 +2,7 @@
 
 use std::collections::BTreeSet;
 use std::fs;
-use std::io::Write;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
@@ -285,16 +285,24 @@ fn handfest_mcp_emits_structured_json_for_ledger_spawn_and_runtime_errors() {
         .stderr(Stdio::piped())
         .spawn()
         .unwrap();
-    child
-        .stdin
-        .as_mut()
-        .unwrap()
-        .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"ping\"}\n")
-        .unwrap();
-    let out = child.wait_with_output().unwrap();
-    assert!(!out.status.success());
-    let (code, _) = parse_startup_error_json(&out.stderr);
+    // Keep child stdin open without writing so the test neither races with BrokenPipe
+    // after the proxy exits on malformed upstream output nor triggers clean client EOF.
+    let _stdin = child.stdin.take().unwrap();
+    let mut stderr_pipe = child.stderr.take().unwrap();
+    let mut stdout_pipe = child.stdout.take().unwrap();
+    let mut stderr_bytes = Vec::new();
+    stderr_pipe.read_to_end(&mut stderr_bytes).unwrap();
+    let mut stdout_bytes = Vec::new();
+    stdout_pipe.read_to_end(&mut stdout_bytes).unwrap();
+    let status = child.wait().unwrap();
+    drop(_stdin);
+    assert!(!status.success());
+    let (code, msg) = parse_startup_error_json(&stderr_bytes);
     assert_eq!(code, "runtime_error");
+    assert!(
+        msg.contains("upstream MCP protocol error: invalid upstream JSON"),
+        "expected malformed upstream JSON error, got: {msg}"
+    );
     codes.insert(code);
 
     assert_eq!(codes.len(), 3);

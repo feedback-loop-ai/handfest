@@ -12,6 +12,7 @@ use crate::ast::{
     is_valid_ident, is_valid_quoted_str, is_valid_timestamp, try_format_rfc3339_utc, AstError,
     Decimal, HandfestAst, KeyId, MandateId, Predicate, PredicateOp, Quota, Scalar,
 };
+use crate::gate_errors::ProofMetaError;
 pub use crate::gate_errors::{ChainStructureError, ProofShapeError, RuntimeChainError};
 use crate::lattice::{scalar_satisfies, subsumes_with_parent_id, NarrowError};
 use crate::{ActorKind, AssuranceLevel, Verdict};
@@ -470,6 +471,26 @@ fn evaluate_chain(
     Ok(())
 }
 
+fn validate_proof_meta(
+    anchor_id: &str,
+    valid_from: i64,
+    valid_until: i64,
+) -> Result<(), ProofMetaError> {
+    if anchor_id.is_empty() {
+        return Err(ProofMetaError::EmptyAnchorId);
+    }
+    if !is_valid_quoted_str(anchor_id) {
+        return Err(ProofMetaError::InvalidAnchorIdChars);
+    }
+    if !is_valid_timestamp(valid_from) {
+        return Err(ProofMetaError::TimestampOutOfRange(valid_from));
+    }
+    if !is_valid_timestamp(valid_until) {
+        return Err(ProofMetaError::TimestampOutOfRange(valid_until));
+    }
+    Ok(())
+}
+
 /// Validates shared anchor proof shape invariants: non-empty control-free `anchor_id`,
 /// RFC 3339 4-digit-year bounds for `valid_from`/`valid_until`, and `valid_from <= valid_until`.
 pub fn validate_proof_shape(
@@ -477,18 +498,7 @@ pub fn validate_proof_shape(
     valid_from: i64,
     valid_until: i64,
 ) -> Result<(), ProofShapeError> {
-    if anchor_id.is_empty() {
-        return Err(ProofShapeError::EmptyAnchorId);
-    }
-    if !is_valid_quoted_str(anchor_id) {
-        return Err(ProofShapeError::InvalidAnchorIdChars);
-    }
-    if !is_valid_timestamp(valid_from) {
-        return Err(ProofShapeError::TimestampOutOfRange(valid_from));
-    }
-    if !is_valid_timestamp(valid_until) {
-        return Err(ProofShapeError::TimestampOutOfRange(valid_until));
-    }
+    validate_proof_meta(anchor_id, valid_from, valid_until)?;
     if valid_from > valid_until {
         return Err(ProofShapeError::InvertedValidityWindow {
             valid_from,
@@ -514,31 +524,6 @@ fn verify_proofs(chain: &[VerifiedMandate], now: i64) -> Result<(), RuntimeChain
                 mandate_kind: vm.ast.from().kind(),
             });
         }
-        validate_proof_shape(
-            &vm.proof.anchor_id,
-            vm.proof.valid_from,
-            vm.proof.valid_until,
-        )
-        .map_err(|err| match err {
-            ProofShapeError::EmptyAnchorId | ProofShapeError::InvalidAnchorIdChars => {
-                RuntimeChainError::InvalidAnchorId { hop: i }
-            }
-            ProofShapeError::TimestampOutOfRange(_) => {
-                RuntimeChainError::ProofTimestampOutOfRange {
-                    hop: i,
-                    valid_from: vm.proof.valid_from,
-                    valid_until: vm.proof.valid_until,
-                }
-            }
-            ProofShapeError::InvertedValidityWindow {
-                valid_from,
-                valid_until,
-            } => RuntimeChainError::InvalidProofValidityWindow {
-                hop: i,
-                valid_from,
-                valid_until,
-            },
-        })?;
         if vm.proof.valid_from >= vm.proof.valid_until {
             return Err(RuntimeChainError::InvalidProofValidityWindow {
                 hop: i,
@@ -546,6 +531,21 @@ fn verify_proofs(chain: &[VerifiedMandate], now: i64) -> Result<(), RuntimeChain
                 valid_until: vm.proof.valid_until,
             });
         }
+        validate_proof_meta(
+            &vm.proof.anchor_id,
+            vm.proof.valid_from,
+            vm.proof.valid_until,
+        )
+        .map_err(|err| match err {
+            ProofMetaError::EmptyAnchorId | ProofMetaError::InvalidAnchorIdChars => {
+                RuntimeChainError::InvalidAnchorId { hop: i }
+            }
+            ProofMetaError::TimestampOutOfRange(_) => RuntimeChainError::ProofTimestampOutOfRange {
+                hop: i,
+                valid_from: vm.proof.valid_from,
+                valid_until: vm.proof.valid_until,
+            },
+        })?;
         if now < vm.proof.valid_from || now >= vm.proof.valid_until {
             return Err(RuntimeChainError::OutsideProofValidityWindow {
                 hop: i,
