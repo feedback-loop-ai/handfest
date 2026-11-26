@@ -190,15 +190,6 @@ impl ActiveHandleRegistry {
         self.active_writers > 0 || self.counts.contains_key(&FileIdentity { dev, ino })
     }
 
-    fn prune_uncounted_deferred_fds(&mut self) {
-        #[cfg(unix)]
-        if self.active_writers == 0 {
-            let counts = &self.counts;
-            self.deferred_fds
-                .retain(|&(dev, ino), _| counts.contains_key(&FileIdentity { dev, ino }));
-        }
-    }
-
     #[cfg(unix)]
     fn ensure_deferred_fd_capacity(&self) -> Result<(), LedgerError> {
         if self.has_active_handles() && self.total_deferred_fds() >= MAX_DEFERRED_FDS {
@@ -224,11 +215,6 @@ impl ActiveHandleRegistry {
                 self.maybe_defer_fd((fstat.dev(), fstat.ino()), file);
             }
         }
-    }
-
-    fn decrement_writer(&mut self) {
-        self.active_writers = self.active_writers.saturating_sub(1);
-        self.prune_uncounted_deferred_fds();
     }
 }
 
@@ -273,7 +259,7 @@ impl PendingWriterGuard {
 impl Drop for PendingWriterGuard {
     fn drop(&mut self) {
         if !self.committed {
-            self.state.decrement_writer();
+            self.state.active_writers = self.state.active_writers.saturating_sub(1);
         }
     }
 }
@@ -286,11 +272,10 @@ impl Drop for PendingWriterGuard {
 /// deferred in `deferred_fds` by `(st_dev, st_ino)` (reusing the first retained `File` via
 /// `SeekFrom::Start(0)` and appending duplicates) whenever `active_writers > 0` or the probed inode
 /// is currently tracked in `counts`. With `active_writers == 0`, uncounted header/journal probes
-/// close immediately and dropping any handle prunes `deferred_fds` entries absent from `counts` so
-/// a long-lived reader never exhausts the fd cap. With `active_writers > 0`, all `deferred_fds` are
-/// retained until `active_writers == 0`: SQLite's `unixClose` defers closing its own fd into
-/// `pUnused` when another connection shares the inode, so dropping an out-of-band `File` while an
-/// ABA-renamed writer may hold a POSIX `fcntl` lock on that inode would release the writer's lock.
+/// close immediately so a long-lived reader never exhausts the fd cap. On guard drop when
+/// `active_writers == 0`, `deferred_fds` is cleared only once `counts` is completely empty; while
+/// other handles remain active, only `self.id`'s own entry is removed when its count reaches zero
+/// so uncounted fds retained while a writer was active are never swept prematurely.
 pub(crate) struct ActiveHandleGuard {
     registry: &'static Mutex<ActiveHandleRegistry>,
     id: FileIdentity,
@@ -300,17 +285,27 @@ pub(crate) struct ActiveHandleGuard {
 impl Drop for ActiveHandleGuard {
     fn drop(&mut self) {
         let mut state = lock_registry(self.registry);
+        let mut removed_self = false;
         if let Some(count) = state.counts.get_mut(&self.id) {
             *count -= 1;
             if *count == 0 {
                 state.counts.remove(&self.id);
+                removed_self = true;
             }
         }
         if self.is_writer {
-            state.decrement_writer();
-        } else {
-            state.prune_uncounted_deferred_fds();
+            state.active_writers = state.active_writers.saturating_sub(1);
         }
+        #[cfg(unix)]
+        if state.active_writers == 0 {
+            if state.counts.is_empty() {
+                state.deferred_fds.clear();
+            } else if removed_self {
+                state.deferred_fds.remove(&(self.id.dev, self.id.ino));
+            }
+        }
+        #[cfg(not(unix))]
+        let _ = removed_self;
     }
 }
 

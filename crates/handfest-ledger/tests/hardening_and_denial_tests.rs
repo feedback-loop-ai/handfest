@@ -1494,3 +1494,90 @@ fn open_read_only_sequential_audits_prune_deferred_fds_while_reader_open() {
         "sequential 70-ledger helper did not run; stdout:\n{stdout}"
     );
 }
+
+#[cfg(unix)]
+#[test]
+fn dropping_writer_while_reader_remains_preserves_renamed_db_lock_helper() {
+    use std::path::PathBuf;
+
+    let Ok(dir) = std::env::var("HANDFEST_DROP_WRITER_RO_DIR") else {
+        return;
+    };
+    let dir = PathBuf::from(dir);
+    let db_a = dir.join("db_a.sqlite");
+    let db_b = dir.join("db_b.sqlite");
+    let db_c = dir.join("db_c.sqlite");
+    let db_c_moved = dir.join("db_c_moved.sqlite");
+    let db_d = dir.join("db_d.sqlite");
+
+    // Keep Handfest reader ro_a on db_a and Handfest writer w_b on db_b.
+    let ro_a = SqliteLedger::open_read_only(&db_a).unwrap();
+    let w_b = SqliteLedger::open_existing(&db_b).unwrap();
+
+    // Hold BEGIN IMMEDIATE on db_c (untracked by Handfest) and rename it to db_c_moved.
+    let writer_tx = Connection::open(&db_c).unwrap();
+    writer_tx.execute_batch("BEGIN IMMEDIATE;").unwrap();
+    fs::rename(&db_c, &db_c_moved).unwrap();
+
+    // Open & drop open_read_only on renamed db_c_moved while w_b is active, deferring db_c's fd.
+    let ro_c = SqliteLedger::open_read_only(&db_c_moved).unwrap();
+    assert_eq!(ro_c.verify_integrity().unwrap(), 1);
+    drop(ro_c);
+
+    // Drop w_b while ro_a remains open: active_writers hits 0, but db_c_moved's uncounted
+    // deferred fd MUST NOT be swept while ro_a is still open.
+    drop(w_b);
+    assert_cross_process_lock(&db_c_moved, "exclusive", true);
+    assert_cross_process_lock(&db_c_moved, "immediate", true);
+
+    // Opening & dropping an unrelated reader db_d while active_writers == 0 must also preserve
+    // db_c_moved's deferred fd and POSIX lock while ro_a stays open.
+    let ro_d = SqliteLedger::open_read_only(&db_d).unwrap();
+    assert_eq!(ro_d.verify_integrity().unwrap(), 1);
+    drop(ro_d);
+    assert_cross_process_lock(&db_c_moved, "exclusive", true);
+    assert_cross_process_lock(&db_c_moved, "immediate", true);
+
+    assert_eq!(ro_a.verify_integrity().unwrap(), 1);
+    writer_tx.execute_batch("ROLLBACK;").unwrap();
+    drop(writer_tx);
+    drop(ro_a);
+    assert_cross_process_lock(&db_c_moved, "exclusive", false);
+}
+
+#[cfg(unix)]
+#[test]
+fn dropping_writer_while_reader_remains_preserves_renamed_db_posix_lock() {
+    let dir = TempDir::new().unwrap();
+    for name in ["db_a.sqlite", "db_b.sqlite", "db_c.sqlite", "db_d.sqlite"] {
+        init_single_permit_ledger(&dir.path().join(name));
+    }
+
+    // Run in an isolated child test process so no parallel writer test keeps active_writers > 0
+    // when w_b drops.
+    let exe = std::env::current_exe().expect("current test exe");
+    let output = std::process::Command::new(&exe)
+        .args([
+            "--exact",
+            "dropping_writer_while_reader_remains_preserves_renamed_db_lock_helper",
+            "--quiet",
+        ])
+        .env("HANDFEST_DROP_WRITER_RO_DIR", dir.path())
+        .output()
+        .expect("spawn writer-drop lock preservation helper");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "writer-drop lock preservation helper failed
+stdout:
+{stdout}
+stderr:
+{stderr}"
+    );
+    assert!(
+        stdout.contains("1 passed"),
+        "writer-drop lock preservation helper did not run; stdout:
+{stdout}"
+    );
+}

@@ -446,15 +446,16 @@ assert "resource.ci_status" not in mpr.get("static_facts", {}), "policy-map must
 assert mpr["static_facts"].get("resource.environment") == {"str": "staging"}
 
 root_norm = os.path.normpath(root)
-def assert_safe_outside_path(p, loc):
+def assert_safe_outside_path(p, loc, workspace_root=root_norm):
     assert p.startswith("/"), f"{loc} must be an absolute outside-workspace path: {p}"
     assert ".." not in p.split("/"), f"{loc} must not contain '..' traversal: {p}"
     resolved = os.path.normpath(p)
+    ws_norm = os.path.normpath(workspace_root)
     assert resolved.startswith("/path/to/handfest-config/"), (
         f"{loc} resolved path '{resolved}' must stay under /path/to/handfest-config/"
     )
-    assert resolved != root_norm and not resolved.startswith(root_norm + "/"), (
-        f"{loc} resolved path '{resolved}' must not point inside workspace '{root_norm}'"
+    assert resolved != ws_norm and not resolved.startswith(ws_norm + "/"), (
+        f"{loc} resolved path '{resolved}' must not point inside workspace '{ws_norm}'"
     )
 
 # Claude Code settings.example.json must separate mcpServers into mcp.example.json, use outside-workspace paths,
@@ -488,7 +489,7 @@ def assert_all_paths_safe(node, loc):
 
 assert_all_paths_safe(cc_settings, "settings.example.json")
 
-def assert_mcp_args_safe(args, loc):
+def assert_mcp_args_safe(args, loc, workspace_root=root_norm):
     assert isinstance(args, list) and "--" in args, f"{loc} must separate upstream server command with '--'"
     sep_idx = args.index("--")
     proxy_args = args[:sep_idx]
@@ -496,9 +497,11 @@ def assert_mcp_args_safe(args, loc):
     assert upstream_args and all(isinstance(a, str) and a for a in upstream_args), (
         f"{loc} must provide a non-empty upstream command after '--'"
     )
-    singleton_flags = {"--ledger", "--policy-map", "--actor-key"}
+    required_flags = {"--chain", "--ledger", "--policy-map", "--actor-key"}
+    optional_flags = {"--now"}
+    singleton_flags = {"--ledger", "--policy-map", "--actor-key", "--now"}
     path_flags = {"--chain", "--ledger", "--policy-map"}
-    allowed_flags = path_flags | {"--actor-key"}
+    allowed_flags = required_flags | optional_flags
     seen_flags = set()
     i = 0
     while i < len(proxy_args):
@@ -545,15 +548,25 @@ def assert_mcp_args_safe(args, loc):
             assert ".." not in value.split("/"), f"{loc} contains '..' traversal in {value}"
             assert "plugins/policy-map.example.json" not in value, f"{loc} must not point inside repo plugins/"
             if flag in path_flags:
-                assert_safe_outside_path(value, f"{loc} {flag}")
-            else:
-                assert value.startswith("ed25519:") and len(value) > len("ed25519:"), (
-                    f"{loc} --actor-key must be a non-empty public KeyId (ed25519:...), got {value!r}"
+                assert_safe_outside_path(value, f"{loc} {flag}", workspace_root=workspace_root)
+            elif flag == "--now":
+                assert value and all(0x21 <= ord(ch) <= 0x7E for ch in value), (
+                    f"{loc} --now must be a non-empty timestamp without whitespace or control chars, got {value!r}"
                 )
-                assert "/" not in value and not value.endswith(".key.json"), (
+            else:
+                scheme, sep, key_val = value.partition(":")
+                assert sep == ":" and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_-]*", scheme), (
+                    f"{loc} --actor-key must have a valid KeyId scheme (<scheme>:<value>), got {value!r}"
+                )
+                assert key_val and all(0x21 <= ord(ch) <= 0x7E and ch not in ',()"/\\' for ch in key_val), (
+                    f"{loc} --actor-key value contains whitespace, control chars, or forbidden KeyId characters: {value!r}"
+                )
+                assert not value.endswith(".key.json"), (
                     f"{loc} --actor-key must be a public KeyId, not a key file path: {value!r}"
                 )
-    assert seen_flags == allowed_flags, f"{loc} must include {sorted(allowed_flags)}, got {sorted(seen_flags)}"
+    assert required_flags <= seen_flags <= allowed_flags, (
+        f"{loc} must include {sorted(required_flags)} (optional {sorted(optional_flags)}), got {sorted(seen_flags)}"
+    )
 
 # Self-test assert_mcp_args_safe invariants (singleton duplicates, --flag=value, positional tokens, multi --chain)
 base_valid = [
@@ -575,8 +588,27 @@ assert_mcp_args_safe([
     "--policy-map", "/path/to/handfest-config/policy-map.json",
     "--", "npx", "-y", "@modelcontextprotocol/server-github",
 ], "self-test-multi-value-chain")
+assert_mcp_args_safe(
+    base_valid[:8] + ["--now=2026-11-24T18:00:00Z"] + base_valid[8:],
+    "self-test-now-eq",
+)
+assert_mcp_args_safe(
+    base_valid[:8] + ["--now", "2026-11-24T18:00:00Z"] + base_valid[8:],
+    "self-test-now-separate",
+)
 for bad_label, bad_args in (
     ("dup-ledger", base_valid[:6] + ["--ledger", "/path/to/handfest-config/state/other.sqlite"] + base_valid[6:]),
+    ("dup-now", base_valid[:8] + ["--now=2026-11-24T18:00:00Z", "--now", "2026-11-24T19:00:00Z"] + base_valid[8:]),
+    ("empty-eq-now", base_valid[:8] + ["--now="] + base_valid[8:]),
+    ("whitespace-now", base_valid[:8] + ["--now=2026-11-24 18:00:00Z"] + base_valid[8:]),
+    ("missing-now-value", base_valid[:8] + ["--now"] + base_valid[8:]),
+    ("actor-key-whitespace", base_valid[:5] + ["--actor-key=ed25519:not a key"] + base_valid[6:]),
+    ("actor-key-empty-value", base_valid[:5] + ["--actor-key=ed25519:"] + base_valid[6:]),
+    ("actor-key-invalid-scheme", base_valid[:5] + ["--actor-key=123bad:abcd1234"] + base_valid[6:]),
+    ("actor-key-slash-path", base_valid[:5] + ["--actor-key=ed25519:/path/to/agent.key"] + base_valid[6:]),
+    ("actor-key-json-file", base_valid[:5] + ["--actor-key=ed25519:agent.key.json"] + base_valid[6:]),
+    ("actor-key-control-char", base_valid[:5] + ["--actor-key=ed25519:abcd\n1234"] + base_valid[6:]),
+    ("actor-key-forbidden-punct", base_valid[:5] + ["--actor-key=ed25519:abcd,1234"] + base_valid[6:]),
     ("dup-policy-map", base_valid[:6] + ["--policy-map=/path/to/handfest-config/other.json"] + base_valid[6:]),
     ("dup-actor-key", base_valid[:6] + ["--actor-key", "ed25519:deadbeef"] + base_valid[6:]),
     ("unexpected-positional", ["stray-positional"] + base_valid),
@@ -620,6 +652,36 @@ for bad_label, bad_args in (
         pass
     else:
         raise AssertionError(f"assert_mcp_args_safe unexpectedly accepted {bad_label}: {bad_args!r}")
+
+# Independently bind the workspace-containment guard with a simulated workspace root under
+# /path/to/handfest-config/repo so the /path/to/handfest-config/ prefix check passes first.
+sim_workspace_root = "/path/to/handfest-config/repo"
+for ws_label, ws_chain_path in (
+    ("inside-sim-workspace", f"{sim_workspace_root}/leaf.signed.json"),
+    ("exact-sim-workspace", sim_workspace_root),
+):
+    try:
+        assert_mcp_args_safe(
+            [
+                "--chain",
+                "/path/to/handfest-config/mandates/root.signed.json",
+                ws_chain_path,
+                "--ledger=/path/to/handfest-config/state/handfest-ledger.sqlite",
+                "--actor-key=ed25519:abcd1234",
+                "--policy-map=/path/to/handfest-config/policy-map.json",
+                "--", "npx",
+            ],
+            f"self-test-{ws_label}",
+            workspace_root=sim_workspace_root,
+        )
+    except AssertionError as exc:
+        assert "must not point inside workspace" in str(exc), (
+            f"expected workspace-containment rejection for {ws_label}, got: {exc}"
+        )
+    else:
+        raise AssertionError(
+            f"assert_mcp_args_safe unexpectedly accepted {ws_label}: {ws_chain_path!r}"
+        )
 
 for mcp_rel in ("plugins/claude-code/mcp.example.json", "plugins/dsh/mcp.example.json", "plugins/agy/mcp.example.json"):
     srv = loaded[mcp_rel]["mcpServers"]["github-handfest"]

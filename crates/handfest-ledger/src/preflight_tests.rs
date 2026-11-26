@@ -239,19 +239,24 @@ fn deferred_fds_deduplicate_by_inode_read_live_contents_and_clear_only_when_all_
     ));
     assert_eq!(reg.lock().unwrap().deferred_fds.len(), 2);
 
-    // Dropping the last writer while ro2 is STILL active prunes uncounted inodes (canonical_mut)
-    // while retaining ro2's active inode (canonical_moved) so ro2's POSIX lock is never dropped.
+    // Dropping the last writer while ro2 is STILL active must NOT sweep uncounted deferred fds
+    // (canonical_mut) retained while the writer was active, and must retain ro2's active inode
+    // (canonical_moved) so neither POSIX lock is dropped before all handles close.
     drop(writer_guard);
     {
         use std::os::unix::fs::MetadataExt;
         let moved_meta = fs::metadata(&canonical_moved).unwrap();
+        let mut_meta = fs::metadata(&canonical_mut).unwrap();
         let state = reg.lock().unwrap();
         assert_eq!(state.active_writers, 0);
         assert_eq!(state.counts.len(), 1);
-        assert_eq!(state.deferred_fds.len(), 1);
+        assert_eq!(state.deferred_fds.len(), 2);
         assert!(state
             .deferred_fds
             .contains_key(&(moved_meta.dev(), moved_meta.ino())));
+        assert!(state
+            .deferred_fds
+            .contains_key(&(mut_meta.dev(), mut_meta.ino())));
     }
 
     // Only dropping the very last handle (ro2) clears deferred_fds.
