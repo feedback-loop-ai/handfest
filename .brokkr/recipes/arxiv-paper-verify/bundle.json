@@ -12,7 +12,7 @@
         "blocked"
       ],
       "class": "work",
-      "agent": "paper-revise-fable"
+      "agent": "paper-revise-neon"
     },
     "parse-bib": {
       "results": [
@@ -206,28 +206,12 @@
               "agent": "paper-review-citations-astra",
               "class": "work"
             },
-            "proofs-fable": {
-              "agent": "paper-review-proofs-fable",
-              "class": "work"
-            },
-            "proofs-neon": {
-              "agent": "paper-review-proofs-neon",
-              "class": "work"
-            },
             "proofs-astra": {
               "agent": "paper-review-proofs-astra",
               "class": "work"
             },
-            "code-fable": {
-              "agent": "paper-review-code-fable",
-              "class": "work"
-            },
             "code-astra": {
               "agent": "paper-review-code-astra",
-              "class": "work"
-            },
-            "arxiv-fable": {
-              "agent": "paper-review-arxiv-fable",
               "class": "work"
             },
             "arxiv-astra": {

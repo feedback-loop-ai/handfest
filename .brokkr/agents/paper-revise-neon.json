@@ -1,0 +1,36 @@
+{
+  "description": "Paper reviser (gemini-4-neon at high effort) \u2014 zero Claude quota usage.",
+  "charter": "charters/paper-revise.md",
+  "models": [
+    "agy-neon"
+  ],
+  "efforts": {
+    "agy-neon": "high"
+  },
+  "hands": {
+    "kind": "workspace",
+    "network": true,
+    "binds": [
+      {
+        "path": "~/.cargo",
+        "mode": "overlay",
+        "mask": [
+          "credentials.toml",
+          "credentials"
+        ]
+      },
+      {
+        "path": "~/.rustup",
+        "mode": "ro"
+      },
+      {
+        "path": "~/.local/bin",
+        "mode": "ro"
+      },
+      {
+        "path": "~/.cache/Tectonic",
+        "mode": "rw"
+      }
+    ]
+  }
+}
