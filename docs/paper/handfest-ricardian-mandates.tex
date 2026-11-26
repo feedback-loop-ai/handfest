@@ -1,0 +1,638 @@
+\documentclass[10pt,twocolumn]{article}
+
+\usepackage[margin=0.72in,columnsep=0.25in]{geometry}
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{lmodern}
+\usepackage{microtype}
+\usepackage{amsmath,amssymb,amsthm}
+\usepackage{booktabs}
+\usepackage{array}
+\usepackage{enumitem}
+\usepackage{xcolor}
+\usepackage{listings}
+\usepackage[hyphens]{url}
+\usepackage[breaklinks=true,colorlinks=true,linkcolor=blue!60!black,citecolor=blue!60!black,urlcolor=blue!60!black]{hyperref}
+\expandafter\def\expandafter\UrlBreaks\expandafter{\UrlBreaks\do-\do\_}
+
+\newtheorem{definition}{Definition}
+\newtheorem{theorem}{Theorem}
+\newtheorem{proposition}{Proposition}
+
+\lstset{
+  basicstyle=\ttfamily\scriptsize,
+  breaklines=true,
+  breakatwhitespace=false,
+  frame=single,
+  framerule=0.4pt,
+  rulecolor=\color{black!30},
+  backgroundcolor=\color{black!3},
+  columns=fullflexible,
+  keepspaces=true,
+  showstringspaces=false,
+  aboveskip=6pt,
+  belowskip=6pt
+}
+
+\newcolumntype{L}[1]{>{\raggedright\arraybackslash}p{#1}}
+\emergencystretch=1.5em
+
+\title{\textbf{Executable Ricardian Mandates: Deterministic, Multi-Anchor Authority Vesting for Autonomous AI Agents}}
+
+\author{
+  Handfest Contributors \\
+  Feedback Loop AI \\
+  \texttt{https://github.com/feedback-loop-ai/handfest}
+}
+
+\date{November 2026}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+Autonomous AI agents increasingly execute consequential tool calls---merging code, moving funds, and provisioning infrastructure---yet current authorization mechanisms trap practitioners in a trilemma between over-privileged ambient credentials, unscalable human-in-the-loop \texttt{[y/N]} prompts, and non-auditable natural-language guardrails. We present \textbf{Executable Ricardian Mandates} and \texttt{handfest}, a deterministic, multi-anchor authorization architecture rooted in Ian Grigg's Ricardian Contract model and adapted from bilateral contracts to unilateral delegation (\emph{mandatum}). Every \texttt{HANDFEST v1} mandate establishes a strict 1:1 What-You-See-Is-What-You-Sign (WYSIWYS) bijection between canonical Controlled English and a typed abstract syntax tree (AST) whose policy-clause denotations form a meet-semilattice with a deny-all bottom $\bot$, bound by a SHA-256 content-addressed digest (\texttt{MandateId}). Sub-delegation is governed by five monotonic attenuation laws (\texttt{subsumes(parent, child)}) that are sound and decidable in pure Rust without an SMT solver (with complete entailment over single-field predicate domains and \texttt{*}-only globs), paired with atomic chain-wide quota accounting that defeats delegation-splitting attacks. The architecture strictly separates a pure \texttt{\#![no\_std]} evaluation core (\texttt{handfest-core}, zero I/O, zero system clock, single \texttt{sha2} dependency), a pluggable trust-anchor boundary (\texttt{handfest-anchors}, where \texttt{verify\_chain} currently calls \texttt{verify\_ed25519} directly and \texttt{Ed25519Verifier} delegates to \texttt{verify\_ed25519} as the implemented \texttt{AnchorVerifier} adapter, while Passkeys, EIP-712 wallets, EUDI \texttt{SD-JWT VC}, and eIDAS QES are planned adapters behind the \texttt{AnchorVerifier} seam that normalize into one \texttt{VerifiedAnchorProof}), a backend-neutral \texttt{ReceiptLedger} implemented over rollback-journal SQLite (\texttt{handfest-ledger}), a reference CLI (\texttt{handfest-cli}), and an external Model Context Protocol (MCP) stdio proxy boundary (\texttt{handfest-mcp}). We document four concrete adversarial attack families implemented and regression-tested in the \texttt{60f105e} workspace---AST second-preimage clause erasure, negative prior quota headroom and IEEE-754 \texttt{f64} decimal rounding bypasses, unauthenticated envelope metadata, and SQLite B-tree/DDL tampering---together with a fifth family of four proposed MCP JSON-RPC wire-framing defenses specified for the planned Slice~2 \texttt{handfest-mcp} proxy, grounding every implementation claim in the open-source Rust workspace (\texttt{MIT OR Apache-2.0}, commit \texttt{60f105e}, 116 passing tests).
+\end{abstract}
+
+% ============================================================================
+\section{Introduction}
+\label{sec:intro}
+
+Software systems are rapidly shifting from human-driven user interfaces to autonomous AI agents that plan, delegate to sub-agents, and invoke external APIs through standardized tool protocols such as the Model Context Protocol (MCP)~\cite{mcp_spec}. Despite rapid progress in model reasoning and tool orchestration, the authorization layer governing what an autonomous agent may actually \emph{do} remains structurally broken. Practitioners face an acute \emph{agentic authorization trilemma}:
+
+\begin{enumerate}[leftmargin=*,itemsep=2pt]
+  \item \textbf{Ambient Credentials.} Passing long-lived API keys, SSH keys, or coarse OAuth bearer tokens directly to an agent runtime violates least privilege. Under prompt injection or goal drift, a compromised model inherits the full authority of its principal, with no cryptographic boundary separating intent from execution.
+  \item \textbf{Interactive \texttt{[y/N]} Approval Fatigue.} Gating every tool call behind synchronous human confirmation destroys autonomy for multi-step workflows, degrades human oversight into rubber-stamping, and fails completely for delegated sub-agents executing asynchronously across worktrees or background pipelines.
+  \item \textbf{Non-Auditable Prose and Stochastic Guardrails.} Describing permissions in system prompts or relying on LLM-as-a-judge monitors introduces stochasticity inside the security boundary. Decisions cannot be replayed offline, cannot be proven monotonic under sub-delegation, and lack legal or forensic evidentiary standing when an incident occurs.
+\end{enumerate}
+
+This architectural gap collides directly with a 2026--2027 regulatory and enterprise convergence. Under the European Union Artificial Intelligence Act (Regulation~(EU) 2024/1689)~\cite{eu_ai_act}, Article~14 mandates effective human oversight with the ability to bound, monitor, and interrupt high-risk AI systems, while Article~50 establishes transparency obligations for AI-mediated interactions. In parallel, eIDAS~2.0 (Regulation~(EU) 2024/1183)~\cite{eidas2} and the EU Digital Identity (EUDI) Wallet Architecture and Reference Framework (ARF)~\cite{eudi_arf} are deploying standardized high-assurance cryptographic identities and Qualified Electronic Signatures (QES) backed by ETSI TS~119~612 Trusted Lists~\cite{etsi_ts_119_612}. Meanwhile, enterprise tool servers are converging on MCP~\cite{mcp_spec} over JSON-RPC~2.0~\cite{jsonrpc2}, creating an ideal external enforcement choke point \emph{outside} the language model's context window.
+
+What is missing is an authorization artifact that satisfies both sides of this convergence simultaneously: \emph{legible enough} for a human principal, corporate officer, wallet UI, or auditor to read and sign directly without hidden code, yet \emph{mathematically rigid enough} for an offline, deterministic gate to verify chains, prove monotonic sub-delegation, enforce cross-chain budgets, and emit tamper-evident audit receipts.
+
+We introduce \textbf{Executable Ricardian Mandates} and their open-source Rust reference implementation, \texttt{handfest} (from Old Norse \emph{handf{\ae}stning}, the written charter fixing in plain words the exact bounds of granted power). Adapting Ian Grigg's Ricardian Contract~\cite{grigg2004ricardian} from bilateral agreement to unilateral delegation of authority (\emph{mandatum}), \texttt{handfest} treats humans, organizations, services, and AI agents as first-class, equal actors.
+
+\paragraph{Contributions.}
+Grounded strictly in the \texttt{handfest} codebase at commit \texttt{60f105e}, this paper makes four concrete contributions:
+\begin{itemize}[leftmargin=*,itemsep=2pt]
+  \item \textbf{1:1 WYSIWYS Formal Mandate Language (\texttt{HANDFEST v1}):} A canonical Controlled-English grammar bijective with a typed AST whose policy denotations form a meet-semilattice with bottom $\bot$ (\texttt{render(parse(canon)) == canon}) and locked by a SHA-256 \texttt{MandateId}, eliminating the ``lying template'' divergence of earlier smart legal contracts (Section~\ref{sec:formal}).
+  \item \textbf{SMT-Free Decidable Monotonic Attenuation and Anti-Splitting Quotas:} Five formal attenuation laws (\texttt{subsumes(parent, child)}) verified in pure Rust over normalized per-field domains---including a 57-band discrete fixed-point \texttt{Decimal} lattice---with exact asymptotic bounds and atomic chain-wide quota enforcement (Sections~\ref{sec:laws}--\ref{sec:antisplitting}).
+  \item \textbf{Decoupled, Pure \texttt{\#![no\_std]} Architecture:} A strictly one-way workspace separating a zero-I/O pure core (\texttt{handfest-core}), a pluggable \texttt{AnchorVerifier} trust-anchor seam (\texttt{handfest-anchors}), a backend-neutral \texttt{ReceiptLedger} with hardened rollback-journal SQLite (\texttt{handfest-ledger}), a reference CLI (\texttt{handfest-cli}), and the external \texttt{handfest-mcp} proxy architecture (Section~\ref{sec:arch}).
+  \item \textbf{Adversarial Threat Analysis and Hardening:} Four implemented, test-bound attack families at commit \texttt{60f105e}---spanning AST injection, negative headroom/\texttt{f64} rounding, unauthenticated envelope fields, and SQLite B-tree/DDL tampering---plus four proposed wire-framing defenses for the planned Slice~2 \texttt{handfest-mcp} proxy (Section~\ref{sec:threats}).
+\end{itemize}
+
+% ============================================================================
+\section{Background and Related Work}
+\label{sec:related}
+
+Authorization for autonomous agents sits at the intersection of four previously separate traditions: cryptographic capability delegation, policy-as-code languages, Ricardian/computational legal contracts, and verifiable identity infrastructure. Table~\ref{tab:related} summarizes how \texttt{handfest} compares against nine representative systems across eight architectural properties.
+
+\begin{table*}[t]
+\centering
+\caption{Comparison of \texttt{handfest} against related authorization, capability, legal-contract, and identity systems. ``Yes'' indicates native first-class support; ``Part.'' indicates partial or external/optional support; ``No'' indicates outside the system's design scope. ``Exec.\ Verdict Receipts'' refers specifically to hash-chained audit receipts attesting individual tool-authorization decisions (\texttt{Permit}/\texttt{Deny}), distinct from key-lifecycle event logs.}
+\label{tab:related}
+\scriptsize
+\setlength{\tabcolsep}{3.5pt}
+\begin{tabular}{@{}L{2.95cm}cccccccc@{}}
+\toprule
+\textbf{System} &
+\textbf{1:1 WYSIWYS} &
+\textbf{Offline} &
+\textbf{SMT-Free} &
+\textbf{Anti-Split} &
+\textbf{Anchor} &
+\textbf{1st-Class} &
+\textbf{Exec.\ Verdict} &
+\textbf{\texttt{no\_std}} \\
+& \textbf{Text--AST} & \textbf{Atten.} & \textbf{Subsumes} & \textbf{Quotas} & \textbf{Agnostic} & \textbf{AI Agents} & \textbf{Receipts} & \textbf{Core} \\
+\midrule
+OAuth 2.0 / RFC 8693~\cite{rfc8693}     & No   & No   & No    & No   & Part. & Part. & No    & No  \\
+Macaroons~\cite{birgisson2014macaroons} & No   & Yes  & No    & No   & No    & No    & No    & No  \\
+Eclipse Biscuit~\cite{biscuit}          & No   & Yes  & Part. & No   & No    & No    & No    & No  \\
+UCAN~\cite{ucan}                        & No   & Yes  & Part. & No   & Part. & No    & No    & No  \\
+ERC-5573 ReCaps~\cite{erc5573}          & Part.& No   & No    & No   & No    & No    & No    & No  \\
+AWS/CNCF Cedar~\cite{cutler2024cedar}   & No   & No   & No$^\dagger$ & No & Part. & Part. & No & No  \\
+Accord / EOSIO~\cite{accord_project,eosio_ricardian} & No & No & No & No & Part. & No & Part. & No \\
+ACE / L4 / Catala~\cite{fuchs2008ace,l4_cclaw,merigoux2021catala} & Part. & No & No & No & No & No & No & No \\
+KERI / ACDC~\cite{smith2021keri,smith2023acdc} & No & Part.& No & No & No & Part. & No$^\ddagger$ & No \\
+\midrule
+\textbf{\texttt{handfest} (\texttt{HANDFEST v1})} & \textbf{Yes} & \textbf{Yes} & \textbf{Yes} & \textbf{Yes} & \textbf{Yes} & \textbf{Yes} & \textbf{Yes} & \textbf{Yes} \\
+\bottomrule
+\multicolumn{9}{@{}l@{}}{\scriptsize $^\dagger$Cedar policy equivalence and subsumption analysis (\texttt{cedar-policy-symcc}) relies on symbolic compilation to the \texttt{cvc5} SMT solver~\cite{barbosa2022cvc5}.}\\
+\multicolumn{9}{@{}l@{}}{\scriptsize $^\ddagger$KERI produces hash-chained, witnessed key-event receipts (Key Event Logs) attesting key lifecycle events rather than tool-authorization verdicts.}
+\end{tabular}
+\end{table*}
+
+\paragraph{Token Exchange and Capability Delegation.}
+OAuth~2.0 Token Exchange (RFC~8693)~\cite{rfc8693} standardizes actor delegation via nested \texttt{act} claims, but requires an online authorization server to mint every attenuated token and expresses coarse, opaque scope strings rather than a verifiable WYSIWYS text or lattice. Macaroons~\cite{birgisson2014macaroons} introduced offline monotonic attenuation via chained HMAC caveats, requiring a shared symmetric root secret. Eclipse Biscuit~\cite{biscuit} advances this model to public-key signatures with embedded Datalog facts, rules, and checks; attenuation appends sealed Datalog blocks evaluated in conjunction at verification time. UCAN~\cite{ucan} similarly builds decentralized public-key capability chains over JWT/CID proofs with resource/ability attenuation. Both Biscuit and UCAN are strong foundations for offline delegation, yet neither provides a 1:1 human-readable WYSIWYS English representation suitable for direct legal/wallet signing, neither enforces chain-wide stateful anti-splitting sum/call quotas, and general Datalog containment across arbitrary user-supplied blocks is not directly presented as a signed plain-English charter.
+
+\paragraph{Human-Readable Wallet Capabilities.}
+ERC-5573 ReCaps~\cite{erc5573} pioneered deterministic rendering of structured capability objects into an English statement inside Sign-In with Ethereum (SIWE) wallet prompts. However, ReCaps is coupled to Ethereum wallet signatures, does not support recursive offline sub-delegation chains with formal attenuation proofs, and omits stateful quota accounting and hash-chained execution receipts.
+
+\paragraph{Policy Languages and Formal Verification.}
+AWS/CNCF Cedar~\cite{cutler2024cedar} demonstrates the value of fast, safe, formally verified authorization semantics, backed by mechanized proofs and symbolic policy analysis (\texttt{cedar-policy-symcc}) targeting the \texttt{cvc5} SMT solver~\cite{barbosa2022cvc5}. Cedar excels at centralized enterprise RBAC/ABAC policy stores over rich entity hierarchies, but it is not a signed WYSIWYS delegation document and checking policy subsumption requires an external SMT solver rather than a \texttt{\#![no\_std]} library. As noted in Section~\ref{sec:limitations}, Cedar and \texttt{handfest} are complementary: an enterprise guardrail layer can evaluate organization-wide Cedar policies alongside per-delegation \texttt{HANDFEST v1} mandates.
+
+\paragraph{Ricardian Contracts and the ``Lying Template'' Flaw.}
+Ian Grigg's Ricardian Contract~\cite{grigg2004ricardian} introduced the \emph{Bow-Tie} model: a single cryptographically hashed artifact serving simultaneously as human-readable legal intent and machine-parsable parameters. Subsequent implementations---such as Accord Project Cicero/Ergo templates~\cite{accord_project} and EOSIO Ricardian contracts and clauses~\cite{eosio_ricardian}---embedded prose templates alongside external executable code (Ergo, WebAssembly, or smart-contract bytecode). This architecture suffers from the \emph{lying template flaw}: the signed prose only parameterizes an external program whose semantics can silently diverge from what the principal read. \texttt{handfest} closes this gap by restricting \texttt{HANDFEST v1} to a canonical Controlled Natural Language (CNL) that compiles 1:1 to its executable AST with zero external script payload.
+
+\paragraph{Controlled Natural Languages and Computational Law.}
+Attempto Controlled English (ACE)~\cite{fuchs2008ace} established that a carefully restricted subset of English can translate unambiguously into Discourse Representation Structures and first-order logic. Catala~\cite{merigoux2021catala} and L4~\cite{l4_cclaw} bring literate programming and deontic formalization to statutory and contractual law. \texttt{handfest} draws directly on this insight while deliberately scoping its policy clauses to a decidable, conjunctive meet-semilattice (with bottom $\bot$) rather than general first-order logic or statutory tax computation, trading Turing-completeness for SMT-free subsumption decidability and deterministic replay.
+
+\paragraph{Self-Certifying Identity and Verifiable Credentials.}
+KERI~\cite{smith2021keri} and Authentic Chained Data Containers (ACDCs)~\cite{smith2023acdc} provide decentralized key-event receipt logs and cryptographically chained credentials, while W3C Verifiable Credentials Data Model~2.0~\cite{w3c_vcdm2}, SD-JWT (RFC~9901)~\cite{rfc9901}, SD-JWT VC~\cite{ietf_sd_jwt_vc}, and EUDI ARF~\cite{eudi_arf} standardize issuer-holder-verifier identity proofs. Rather than competing with these trust infrastructures, \texttt{handfest} treats them as interchangeable \emph{input trust anchors} normalized behind its \texttt{AnchorVerifier} seam.
+% ============================================================================
+\section{Formal Model: Executable Ricardian Mandates (\texorpdfstring{\texttt{HANDFEST v1}}{HANDFEST v1})}
+\label{sec:formal}
+
+This section formalizes the \texttt{HANDFEST v1} language, its canonical bijection, its five monotonic attenuation laws, its SMT-free decidability proof sketch, and its chain-wide anti-splitting quota semantics as implemented in \texttt{crates/handfest-core}.
+
+\subsection{The 1:1 WYSIWYS Bijection and SHA-256 Knot}
+\label{sec:bijection}
+
+Let $\mathcal{V}_{\mathrm{AST}}$ denote the set of all \texttt{HandfestAst} values that pass \texttt{validate()} and have been normalized by \texttt{canonicalize()}, and let $\mathcal{C}_{\mathrm{CNL}} \subset \Sigma^*$ denote the set of canonical UTF-8 \texttt{HANDFEST v1} strings (strictly LF-terminated, no control characters inside string literals, sorted and deduplicated clause lists, and canonical decimal representations).
+
+The codec in \texttt{handfest-core/src/cnl.rs} exposes three functions:
+\begin{itemize}[leftmargin=*,itemsep=1pt]
+  \item \texttt{parse\_mandate}$: \Sigma^* \rightharpoonup \mathcal{V}_{\mathrm{AST}}$, which parses well-formed \texttt{HANDFEST v1} text, validates every lexical and structural invariant, and applies \texttt{canonicalize()};
+  \item \texttt{render\_canonical}$: \mathcal{V}_{\mathrm{AST}} \to \mathcal{C}_{\mathrm{CNL}}$ (with validating wrapper \texttt{try\_render\_canonical}), which emits the unique canonical Controlled-English rendering; and
+  \item \texttt{parse\_canonical}$: \Sigma^* \rightharpoonup \mathcal{V}_{\mathrm{AST}}$, which parses $t$ into $m = \texttt{parse\_mandate}(t)$ and rejects $t$ with \texttt{ParseError::NonCanonical} unless $\texttt{render\_canonical}(m) = t$ byte-for-byte.
+\end{itemize}
+
+\begin{theorem}[Canonical WYSIWYS Bijection]
+\label{thm:bijection}
+Restricted to $\mathcal{V}_{\mathrm{AST}}$ and $\mathcal{C}_{\mathrm{CNL}}$, the pair $(\texttt{render\_canonical}, \texttt{parse\_canonical})$ forms a bijection:
+\begin{align}
+  \forall m \in \mathcal{V}_{\mathrm{AST}}:\;
+    &\texttt{\small parse\_canonical}( \nonumber\\
+    &\quad \texttt{\small render\_canonical}(m)) = m, \label{eq:rt-ast} \\
+  \forall t \in \mathcal{C}_{\mathrm{CNL}}:\;
+    &\texttt{\small render\_canonical}( \nonumber\\
+    &\quad \texttt{\small parse\_canonical}(t)) = t. \label{eq:rt-txt}
+\end{align}
+\end{theorem}
+
+Every validated mandate therefore possesses a unique content-addressed identifier (Grigg's Bow-Tie knot~\cite{grigg2004ricardian}):
+\[\small
+\begin{aligned}
+  \texttt{MandateId}(m) \;=\; &\mathrm{SHA\text{-}256}\!\big( \\
+  &\quad \texttt{try\_render\_canonical}(m)\big).
+\end{aligned}
+\]
+Here \texttt{MandateId} hashes \texttt{canonical\_words} alone, identifying the canonical mandate text in every child \texttt{PARENT} pointer, quota counter, and audit receipt. At the trust-anchor layer, \texttt{handfest-anchors} enforces \texttt{parse\_canonical} before both signing and verification, while its Ed25519 signature covers a domain-separated, length-prefixed envelope (\texttt{signing\_payload}) that binds \texttt{canonical\_words} together with envelope metadata (\texttt{anchor\_id}, \texttt{assurance}, \texttt{actor\_kind}, \texttt{signer\_key}, and the proof validity window $[\texttt{valid\_from}, \texttt{valid\_until})$; Section~\ref{sec:attack-envelope}). Thus the mandate text contains no hidden scripts or whitespace ambiguity, and no envelope metadata is left unauthenticated.
+
+\subsection{Canonical Grammar, Typed AST, and Policy Meet-Semilattice}
+\label{sec:grammar}
+
+Figure~\ref{fig:grammar} reproduces the normative \texttt{HANDFEST v1} EBNF grammar from \texttt{specs/grammar.ebnf}, and Figure~\ref{fig:example} illustrates a concrete two-hop delegation from a human principal through an orchestrator to an ephemeral agent seat.
+
+\begin{figure}[t]
+\begin{lstlisting}
+mandate       = "HANDFEST v1" NL
+                [ "PARENT " digest NL ]
+                "FROM " actor_decl NL
+                "TO " actor_decl NL
+                "DELEGATION max " uint (" hop"|" hops") NL
+                "ALLOW " action_list NL
+                "ON " resource_list NL
+                [ "WHERE " predicate
+                  ( NL "  AND " predicate )* NL ]
+                [ "LIMIT " quota
+                  ( NL "  AND " quota )* NL ] ;
+
+actor_decl    = actor_kind " " quoted_str
+                " (key: " key_id ( ", " attr_kv )* ")" ;
+actor_kind    = "human" | "org" | "agent" | "service" ;
+attr_kv       = ident ": " scalar ;
+action_list   = action_pat ( ", " action_pat )* ;
+action_pat    = ident ( "." ident )* [ ".*" ] ;
+resource_list = resource_sel ( ", " resource_sel )* ;
+resource_sel  = ident " " quoted_glob ;
+predicate     = field_path " " (
+                  ("=="|">="|">"|"<="|"<") " " scalar
+                | "IN {" scalar_list "}"
+                | "PREFIX " quoted_str ) ;
+quota         = uint ( " call" | " calls" )
+              | decimal " " unit_ident
+                " sum(" field_path ")" ;
+field_path    = ident ( "." ident )* ;
+scalar_list   = scalar ( ", " scalar )* ;
+scalar        = quoted_str | rfc3339_ts
+              | decimal | int | bool ;
+bool          = "true" | "false" ;
+digest        = "sha256:" hex64 ;
+key_id        = ident ":" non_ws ;
+NL            = "\n" ;
+\end{lstlisting}
+\caption{Syntax excerpt of the \texttt{HANDFEST v1} Controlled-English grammar (\texttt{specs/grammar.ebnf}). Lexical terminal rules---including ASCII identifier syntax, control-character bans in \texttt{quoted\_str}, RFC~3339 UTC bounds, and forbidden delimiters (whitespace, \texttt{,}, \texttt{(}, \texttt{)}, \texttt{"}) in \texttt{key\_id} values---are enforced by \texttt{handfest-core/src/ast.rs} and \texttt{cnl.rs}. For numeric agreement on \texttt{DELEGATION} and call \texttt{LIMIT} clauses, \texttt{parse\_mandate} accepts either singular or plural units (\texttt{hop}/\texttt{hops}, \texttt{call}/\texttt{calls}), whereas canonical rendering emits singular \texttt{1 hop}/\texttt{1 call} for count~$1$ and plural \texttt{hops}/\texttt{calls} for $0$ or $\ge 2$ (enforced by \texttt{parse\_canonical}).}
+\label{fig:grammar}
+\end{figure}
+
+\begin{figure}[t]
+\begin{lstlisting}
+# Root Mandate M0 (signed by human principal)
+HANDFEST v1
+FROM human "valentin" (key: ed25519:9b1e...44a0)
+TO agent "brokkr:dispatcher" (key: ed25519:3c8d...19f2)
+DELEGATION max 1 hop
+ALLOW git.pr.merge
+ON repo "feedback-loop-ai/*"
+WHERE context.time >= 2026-11-24T17:10:00Z
+  AND context.time < 2026-11-25T01:10:00Z
+  AND resource.author == "valentin"
+  AND resource.ci_status == "passing"
+LIMIT 5 calls
+
+# Child Mandate M1 (attenuated by dispatcher for seat)
+HANDFEST v1
+PARENT sha256:8f4e...c901
+FROM agent "brokkr:dispatcher" (key: ed25519:3c8d...19f2)
+TO agent "brokkr:seat:ship" (key: ed25519:7a20...e114)
+DELEGATION max 0 hops
+ALLOW git.pr.merge
+ON repo "feedback-loop-ai/handfest"
+WHERE context.time >= 2026-11-24T17:15:00Z
+  AND context.time < 2026-11-24T17:18:00Z
+  AND resource.author == "valentin"
+  AND resource.ci_status == "passing"
+  AND resource.pr == 492
+LIMIT 1 call
+\end{lstlisting}
+\caption{Illustrative root-to-child attenuation in \texttt{HANDFEST v1}. Leading \texttt{\#} annotations and abbreviated hex keys/digest (\texttt{...}) are for exposition only; canonical mandates contain no comments, carry full 64-character lowercase hex SHA-256 \texttt{PARENT} digests (and, specifically for the \texttt{ed25519:} keys in this example, full 64-character lowercase hex public keys enforced by \texttt{Ed25519Verifier}, whereas \texttt{handfest-core} itself accepts general scheme-specific \texttt{KeyId} values), and sort clause lists by typed Rust \texttt{Ord} (for predicates: field path, then \texttt{PredicateOp} variant order, then typed \texttt{Scalar} order).}
+\label{fig:example}
+\end{figure}
+
+\begin{definition}[Typed Mandate AST]
+\label{def:ast}
+A validated mandate $m \in \mathcal{V}_{\mathrm{AST}}$ is an 8-tuple
+\[
+  m = (\mathit{parent},\, \mathit{from},\, \mathit{to},\, h,\, A,\, R,\, W,\, Q)
+\]
+where:
+\begin{itemize}[leftmargin=*,itemsep=1pt]
+  \item $\mathit{parent} \in \{\bot\} \cup \{0,1\}^{256}$ is an optional \texttt{MandateId};
+  \item $\mathit{from}, \mathit{to}$ are \texttt{ActorDecl} records carrying an exhaustive \texttt{ActorKind} $\in \{\texttt{Human}, \texttt{Org}, \texttt{Agent}, \texttt{Service}\}$, a control-character-free name, a validated \texttt{KeyId} (\texttt{scheme:value}), and a canonical \texttt{BTreeMap} of typed attributes (forbidding the reserved key \texttt{"key"});
+  \item $h \in \mathbb{N}_{<2^{32}}$ is \texttt{max\_hops};
+  \item $A \neq \emptyset$ is a sorted, deduplicated set of \texttt{ActionPat} dotted-identifier patterns with optional trailing \texttt{.*};
+  \item $R \neq \emptyset$ is a sorted, deduplicated set of \texttt{ResourceSel} pairs $(\mathit{kind}, \mathit{glob})$ over \texttt{*}-only globs;
+  \item $W$ is a sorted, deduplicated conjunction of \texttt{Predicate} clauses $(f, \mathit{op})$ over typed scalars $\texttt{Scalar} ::= \texttt{Str} \mid \texttt{Int}(i64) \mid \texttt{Decimal}(m \cdot 10^{-s}) \mid \texttt{Timestamp}(t) \mid \texttt{Bool}$, where \texttt{Decimal} has signed mantissa $m \in [-2^{127}, 2^{127}-1]$ and scale $0 \le s \le 28$, and \texttt{Timestamp} is restricted to valid RFC~3339 UTC seconds in $[0000\text{-}01\text{-}01\text{T}00{:}00{:}00\text{Z},\allowbreak\; 9999\text{-}12\text{-}31\text{T}23{:}59{:}59\text{Z}]$ ($[-62{,}167{,}219{,}200,\allowbreak\; 253{,}402{,}300{,}799]$);
+  \item $Q$ is a sorted, deduplicated list of non-negative \texttt{Quota} constraints, either \texttt{Calls}$(n \in \mathbb{N}_{<2^{64}})$ or \texttt{Sum}$(\mathit{max} \in \texttt{Decimal}_{\ge 0},\, \mathit{unit},\, \mathit{field})$.
+\end{itemize}
+\end{definition}
+
+All fields of \texttt{HandfestAst} are private in Rust; construction proceeds strictly through \texttt{parse\_mandate} or \texttt{HandfestAstBuilder::build()}, both of which enforce \texttt{validate()} and \texttt{canonicalize()}.
+
+\paragraph{Semantic Policy Carrier and Meet-Semilattice.}
+Raw mandates in $\mathcal{V}_{\mathrm{AST}}$ do \emph{not} themselves form a meet-semilattice under one-hop \texttt{subsumes}: each hop strictly decrements \texttt{max\_hops} ($h_C \le h_P - 1$, making the relation irreflexive) and fixes $\mathit{parent}_C = \texttt{MandateId}(P)$; distinct but mutually entailing syntax tuples (e.g., \texttt{ALLOW a.*, a.b} versus \texttt{ALLOW a.*}, or \texttt{WHERE x >= 5 AND x <= 5} versus \texttt{WHERE x == 5}) violate antisymmetry on raw syntax; finite action and resource lists supply no universal top $\top$ (since \texttt{ActionPat} requires at least one concrete leading segment and \texttt{ResourceSel} names concrete resource kinds); and syntactically valid mandates in $\mathcal{V}_{\mathrm{AST}}$ can still be semantically unsatisfiable through contradictory \texttt{WHERE} predicates or a zero-call limit (\texttt{LIMIT 0 calls}). Instead, the algebraic structure lives on the \emph{semantic policy carrier}: let $[\![ p ]\!] \subseteq \mathcal{E}$ denote the set of evaluation tuples $(a, r, F, u, \texttt{now})$ (concrete action $a$, concrete resource $r$, verified fact map $F$, non-negative single-mandate usage snapshot $u$ of prior call count and per-\texttt{(unit, field)} sum totals, and valid UTC evaluation timestamp \texttt{now}, which binds \texttt{context.time} independently of $F$) permitted by a policy-clause tuple $p = (A, R, W, Q)$, and define $\mathcal{S} = \{[\![ p ]\!] \mid p = (A, R, W, Q)\} \cup \{\bot\}$ (equivalently, policy-clause tuples quotiented by semantic equivalence $p_1 \equiv p_2 \iff [\![ p_1 ]\!] = [\![ p_2 ]\!]$), ordered by inclusion $[\![ p_1 ]\!] \subseteq [\![ p_2 ]\!]$. Every empty denotation---including valid mandates with contradictory predicates or \texttt{LIMIT 0 calls}, as well as empty intersections of disjoint action sets, resource globs, or field domains---maps to the least element $\bot = \emptyset$ (deny-all). Because finite intersections of action-pattern unions, \texttt{*}-only glob unions, per-field predicate conjunctions, and pointwise-minimum quota ceilings remain representable (or empty), $(\mathcal{S}, \subseteq, \sqcap, \bot)$ is an antisymmetric meet-semilattice with bottom $\bot$ (and no universal top $\top$), with binary meet $[\![ p_1 ]\!] \sqcap [\![ p_2 ]\!] = [\![ p_1 ]\!] \cap [\![ p_2 ]\!]$. A complete mandate in $\mathcal{V}_{\mathrm{AST}}$ pairs a policy-clause tuple (whose denotation lies in $\mathcal{S}$, possibly $\bot$) with delegation-header metadata $(\mathit{parent}, \mathit{from}, \mathit{to}, h)$; one-hop \texttt{subsumes(P, C)} enforces policy refinement in $\mathcal{S}$ alongside strict acyclic delegation-header handoff and explicitly rejects contradictory child predicates.
+\subsection{The Five Monotonic Attenuation Laws}
+\label{sec:laws}
+
+Given a parent mandate $P = (\mathit{parent}_P, \mathit{from}_P, \mathit{to}_P, h_P, A_P, R_P, W_P, Q_P)$ and a child mandate $C = (\mathit{parent}_C, \mathit{from}_C, \mathit{to}_C, h_C, A_C, R_C, W_C, Q_C)$, the pure function \texttt{subsumes(P, C)} in \texttt{handfest-core/src/lattice.rs} first validates both ASTs and then verifies five conjunctive invariants.
+
+\begin{definition}[Monotonic Attenuation Relation $P \succeq C$]
+\label{def:subsumes}
+$P$ subsumes $C$ (\texttt{subsumes(P, C) == Ok(())}) if and only if:
+\begin{enumerate}[leftmargin=*,itemsep=2pt]
+  \item \textbf{Handoff and Actor-Kind Preservation:}
+    \[\small
+    \begin{aligned}
+      \mathit{parent}_C &= \texttt{MandateId}(P) \\
+      \land\;\mathit{from}_C.\mathit{key} &= \mathit{to}_P.\mathit{key} \\
+      \land\;\mathit{from}_C.\mathit{kind} &= \mathit{to}_P.\mathit{kind}.
+    \end{aligned}
+    \]
+    Preserving \texttt{ActorKind} prevents an AI agent from reclassifying itself as a \texttt{human} or \texttt{org} when sub-delegating.
+  \item \textbf{Strict Delegation Hop Decrement:}
+    \[
+      h_P \ge 1 \;\land\; h_C \le h_P - 1.
+    \]
+    This bounds chain depth statically by $h_{\mathrm{root}} + 1$ and makes delegation loops impossible.
+  \item \textbf{Action and Resource Subsumption:}
+    \[
+      \forall a_c \in A_C,\; \exists a_p \in A_P : a_p \sqsupseteq_{\mathrm{act}} a_c
+    \]
+    and
+    \[
+      \forall r_c \in R_C,\; \exists r_p \in R_P : r_p \sqsupseteq_{\mathrm{res}} r_c.
+    \]
+    Here $a_p \sqsupseteq_{\mathrm{act}} a_c$ holds iff $a_p$ and $a_c$ are exact-equal non-wildcards, or $a_p$ is a wildcard prefix $s_1.\dots.s_k.*$ and $a_c$ shares prefix $s_1.\dots.s_k$ with length $\ge k$ (if wildcard) or $> k$ (if concrete). For resources, $(k_p, g_p) \sqsupseteq_{\mathrm{res}} (k_c, g_c)$ holds iff $k_p = k_c$ and \texttt{glob\_subsumes}$(g_p, g_c)$ holds over \texttt{*}-only globs (every string matched by $g_c$ is matched by $g_p$).
+  \item \textbf{Conjunctive Predicate Implication:}
+    Grouping $W_C$ by field path $f$, every constrained field $f$ must admit a satisfiable normalized domain $\mathcal{D}_C(f)$ (contradictory child predicates fail closed with \texttt{NarrowError::ContradictoryPredicates}), and for every parent predicate $(f, \phi_P) \in W_P$:
+    \[
+      f \in \mathrm{dom}(\mathcal{D}_C) \;\land\; \mathcal{D}_C(f) \models \phi_P.
+    \]
+  \item \textbf{Quota Monotonicity:}
+    All sum quota limits in $Q_P \cup Q_C$ are non-negative, every $\texttt{Calls}(n_p) \in Q_P$ is matched by some $\texttt{Calls}(n_c) \in Q_C$ with $n_c \le n_p$, and every $\texttt{Sum}(m_p, u, f) \in Q_P$ is matched by some $\texttt{Sum}(m_c, u, f) \in Q_C$ with $m_c \le m_p$.
+\end{enumerate}
+\end{definition}
+
+\subsection{SMT-Free Decidability and Complexity}
+\label{sec:decidability}
+
+General policy containment in expressive languages (e.g., arbitrary cross-field arithmetic or disjunctive Datalog) requires SMT solving~\cite{barbosa2022cvc5} or is undecidable. \texttt{HANDFEST v1} deliberately restricts \texttt{WHERE} to per-field conjunctions of equality, order comparisons, finite \texttt{IN} sets, and string \texttt{PREFIX} constraints. This design yields an exact, SMT-free decision procedure.
+
+\begin{theorem}[Soundness, SMT-Free Decidability, and Component Completeness]
+\label{thm:decidability}
+For any validated mandates $P, C \in \mathcal{V}_{\mathrm{AST}}$, \texttt{subsumes(P, C)} terminates deterministically without an SMT solver and is sound over shared per-mandate usage snapshots and an explicit evaluation timestamp \texttt{now}: whenever \texttt{subsumes(P, C)} returns \texttt{Ok(())}, for every concrete action request $(a, r)$, verified fact map $F$, valid UTC evaluation timestamp \texttt{now} (which binds \texttt{context.time} independently of $F$), and shared non-negative per-mandate usage snapshot $u$ (identical prior call and per-\texttt{(unit, field)} sum usage evaluated against both $C$ and $P$), if $(a, r, F, u, \texttt{now})$ is permitted by $C$'s \texttt{ALLOW}, \texttt{ON}, \texttt{WHERE}, and \texttt{LIMIT} clauses, then it is also permitted by $P$'s corresponding clauses. (At runtime, each mandate carries its own \texttt{MandateId}-keyed entry in \texttt{QuotaSnapshot}: e.g., when $P$ and $C$ both declare \texttt{LIMIT 1 call} while $P$ has prior usage $1$ and $C$ has prior usage $0$, $C$'s clause passes in isolation against its own counter while $P$'s fails; \texttt{evaluate\_chain} therefore checks every mandate ID in the chain against its own snapshot entry, Section~\ref{sec:antisplitting}.) Completeness holds at the proved component boundaries: for any field $f$ explicitly constrained in $W_C$ whose child constraints normalize successfully via \texttt{FieldDomain::from\_ops} to a satisfiable \texttt{FieldDomain}, \texttt{FieldDomain::implies} is complete for \emph{generic scalar entailment}---that is, over arbitrary \texttt{Scalar} assignments to $f$ across all five \texttt{ScalarKind} domains (with bounded RFC~3339 \texttt{Timestamp}s and valid \texttt{Decimal}s, without assuming runtime type-pinning such as \texttt{context.time} always being bound to \texttt{Timestamp(now)})---and \texttt{glob\_subsumes} is complete for \texttt{*}-only glob inclusion $L(g_c) \subseteq L(g_p)$. Whole-mandate soundness (as stated above) still holds unconditionally under runtime type-pinning, whereas whole-mandate \texttt{subsumes} is intentionally conservative (incomplete) when: (i)~a child omits a parent-constrained field whose parent predicate is tautologically satisfied by the runtime domain---for example, the runtime clock already satisfies its minimum RFC~3339 timestamp bound, yet \texttt{check\_predicates} rejects a child that omits an explicit \texttt{context.time >= 0000-01-01T00:00:00Z} parent clause; (ii)~a child constrains a runtime type-pinned field with a heterogeneous \texttt{IN} set---for example, \texttt{context.time IN \{2026-01-01T00:00:00Z, 0\}}, where at runtime \texttt{context.time} is always bound to \texttt{Timestamp(now)} so integer \texttt{0} is unreachable and the child entails \texttt{context.time >= 0000-01-01T00:00:00Z}, yet \texttt{FieldDomain::implies} evaluates generic scalar entailment over every member of the child \texttt{IN} set (including \texttt{0}) and rejects the hop; or (iii)~a child has empty denotation via \texttt{LIMIT 0 calls} or an unsatisfiable \texttt{WHERE} conjunction (for example, \texttt{x == 0 AND y > 5 AND y < 6} vacuously entails \texttt{x == 1}, yet \texttt{check\_predicates} propagates the \texttt{FieldDomain::from\_ops} normalization error and rejects the hop fail-closed before calling \texttt{FieldDomain::implies}).
+\end{theorem}
+
+\begin{proof}[Proof Sketch]
+Because \texttt{WHERE} clauses contain no cross-field terms and no disjunction across distinct fields, generic scalar satisfiability of $W_C$---quantified over arbitrary \texttt{Scalar} assignments to each field path $f$ across all five \texttt{ScalarKind} domains (with bounded RFC~3339 \texttt{Timestamp}s and valid \texttt{Decimal}s, without assuming runtime type-pinning such as \texttt{context.time} always being bound to \texttt{Timestamp(now)})---decomposes independently per field path $f$, and whenever $W_C$ is satisfiable (every constrained field in $W_C$ admits a satisfying \texttt{Scalar} assignment), generic scalar entailment of each parent predicate $\phi_P(f)$ decomposes independently to per-field entailment on $f$ (without satisfiability, an unsatisfiable constraint on another field---such as \texttt{y > 5 AND y < 6} alongside \texttt{x == 0}---makes $W_C$ vacuously entail \texttt{x == 1} even though \texttt{x == 0} alone does not). In \texttt{lattice.rs}, \texttt{check\_predicates} enforces this premise by normalizing every child-constrained field via \texttt{FieldDomain::from\_ops} and propagating any contradiction error before invoking \texttt{FieldDomain::implies}; whole-mandate soundness under runtime type-pinning follows immediately because the runtime assignments to $f$ form a subset of these \texttt{Scalar} assignments. For each field $f$ appearing in $W_C$, \texttt{FieldDomain::from\_ops} constructs a canonical tuple $(\mathit{kind}, \mathit{lower}, \mathit{upper}, \mathit{eq}, \mathit{finite}, \mathit{prefix})$:
+\begin{enumerate}[leftmargin=*,itemsep=1pt]
+  \item \textbf{Discrete Normalization:} Ordering on \texttt{Bool} is rejected. On \texttt{Int} ($i64$), \texttt{Timestamp} (bounded RFC~3339 seconds), and \texttt{Decimal} ($i128 \times 10^{-s}$, $0 \le s \le 28$), strict inequalities ($x > v$, $x < v$) normalize to closed bounds ($x \ge \mathrm{succ}(v)$, $x \le \mathrm{pred}(v)$). Crucially, \texttt{Decimal} is a \emph{finite} discrete total order partitioned into $2 \cdot 28 + 1 = 57$ contiguous scale bands (\texttt{band\_coord} $\in 0\dots 56$), so \texttt{next\_up()} and \texttt{next\_down()} run in $O(S)$ ($S=28$, i.e., $O(1)$) time. In \texttt{ast.rs}, \texttt{discrete\_count\_to(lo, hi)} returns \texttt{Some(0)} for $lo > hi$, returns the exact \texttt{u128} cardinality in $O(1)$ arithmetic whenever $lo$ and $hi$ lie in the same band ($b_{\mathrm{lo}} = b_{\mathrm{hi}}$) or adjacent bands ($b_{\mathrm{hi}} = b_{\mathrm{lo}} + 1$) without \texttt{u128} overflow, and returns \texttt{None} for invalid scales, \texttt{u128} overflow, or non-adjacent bands ($b_{\mathrm{hi}} > b_{\mathrm{lo}} + 1$). This cutoff preserves completeness for interval-to-\texttt{IN} entailment against any representable finite \texttt{BTreeSet} $P_{\mathrm{set}}$: every intermediate band contains at least $\lfloor 0.9 \cdot 2^{127} \rfloor > 1.5 \times 10^{38}$ inhabitants (and \texttt{u128} overflow exceeds $2^{128}-1$), strictly greater than any representable \texttt{usize} set size $|P_{\mathrm{set}}| \le \texttt{usize::MAX}$ ($\le 2^{64}-1$ on 64-bit targets), so \texttt{None} guarantees $[lo, hi] \not\subseteq P_{\mathrm{set}}$.
+  \item \textbf{String and Prefix Intervals:} Any \texttt{PREFIX} $p$ narrows the lexicographic UTF-8 string interval to $[p, \mathrm{prefix\_upper\_bound}(p))$, where the upper bound increments the last non-\texttt{char::MAX} Unicode scalar value of $p$ (or yields \texttt{None} when every character equals \texttt{char::MAX}). Conversely, \texttt{FieldDomain::implies\_prefix($p$)} accepts a child domain iff: (a)~the child carries a prefix starting with $p$; (b)~$p$ is empty and the child field has kind \texttt{Str}; or (c)~the child's lower bound $(lo, \mathit{inc}_{\mathrm{lo}})$ satisfies $lo \ge p$ or ($\neg\mathit{inc}_{\mathrm{lo}} \land p = lo\Vert\texttt{'\textbackslash 0'}$), and either $\mathrm{prefix\_upper\_bound}(p) = \texttt{None}$ or the child's upper bound $(hi, \mathit{inc}_{\mathrm{hi}})$ satisfies $hi < u$ or ($hi = u \land \neg\mathit{inc}_{\mathrm{hi}}$), where $u = \mathrm{prefix\_upper\_bound}(p)$ (for example, $x \ge \texttt{"ab"} \land x < \texttt{"ac"}$, where $u = \texttt{"ac"}$ is excluded).
+  \item \textbf{Contradiction Detection and \texttt{IN} Sets:} \texttt{finalize()} clamps implicit domain bounds, pins $lo = hi$ to equality, rejects empty intervals, incompatible prefixes, or type mismatches, and filters any finite \texttt{IN} set intersection against all bounds (failing closed if empty).
+  \item \textbf{Entailment Check:} If $\mathit{finite}$ (or $\mathit{eq}$) is populated, \texttt{implies($\phi_P$)} tests every surviving member directly. Otherwise, interval-to-\texttt{IN} entailment ($\mathcal{D}_C(f) \models x \in P_{\mathrm{set}}$) checks whether the closed discrete interval $[lo, hi]$ has exact inhabitant count $c \le |P_{\mathrm{set}}|$ via \texttt{discrete\_count\_to} (or integer difference) and, only when $c \le |P_{\mathrm{set}}|$, enumerates all $c$ inhabitants to test membership in $P_{\mathrm{set}}$.
+\end{enumerate}
+
+For \texttt{*}-only globs, \texttt{glob\_subsumes($g_p, g_c$)} in \texttt{ast.rs} collapses adjacent \texttt{*} wildcards into literal segments $(p_0, \dots, p_m)$ and $(c_0, \dots, c_k)$ and handles three distinct cases: (i)~if $g_p$ is literal ($m = 0$), return true iff $g_c$ is literal ($k = 0$) and $p_0 = c_0$; (ii)~if $g_c$ is literal ($k = 0, m \ge 1$), return \texttt{glob\_matches($g_p, c_0$)} directly, which rejects overlapping anchors such as $g_p = \texttt{"ab*bc"}$ against literal $g_c = \texttt{"abc"}$; and (iii)~if both contain wildcards ($m \ge 1, k \ge 1$), consume $p_0$ from the front of $c_0$ via \texttt{strip\_prefix} (remainder $c'_0$) and $p_m$ from the end of $c_k$ via \texttt{strip\_suffix} (remainder $c'_k$)---disjoint because $c_0$ and $c_k$ are separated by at least one \texttt{*}---and then greedily match each middle literal $p_1, \dots, p_{m-1}$ leftmost-first across $(c'_0, c_1, \dots, c_{k-1}, c'_k)$, advancing past each match. Because \texttt{*} matches $\Sigma^*$, this three-case procedure is sound and complete for $L(g_c) \subseteq L(g_p)$.
+
+\paragraph{Asymptotic Complexity.}
+Let $|A|, |R|, |W|, |Q|$ denote clause counts, $|\mathrm{Attr}_M| = |\mathit{from}_M.\mathit{attrs}| + |\mathit{to}_M.\mathit{attrs}|$ total actor-attribute count of mandate $M$, $\|M\|$ total structural/serialized byte size of $M$ (spanning \texttt{from}/\texttt{to} names, keys, and $|\mathrm{Attr}_M|$ attributes plus all clauses), $d_{\max}$ max action depth, $|g|_{\max}$ max glob length, $|a_{\mathrm{req}}|$, $|k_{\mathrm{req}}|$, and $|r|_{\max}$ request byte lengths for \texttt{action}, \texttt{resource\_kind}, and \texttt{resource\_id}, $k_{\max} \ge 1$ max comparison byte length across keys, scalars, action identifier segments, resource kinds, field paths, and quota units, $S_{c,\max} = \max(1, \max |S_c|)$ max child \texttt{IN}-set size, $|P_{\max}|$ max parent \texttt{IN}-set size ($0$ if $W_P$ contains no \texttt{IN} clause), $|I_{\max}|$ max \texttt{IN}-set size across an evaluated mandate, $|F|$ fact-map size, and $|U| = |\texttt{per\_mandate}| + \sum_m |\texttt{sums}(m)|$ total \texttt{QuotaSnapshot} entry count (covering both the outer \texttt{MandateId} map and each inner \texttt{(unit, field)} sum map). Single-hop \texttt{subsumes($P, C$)} runs in polynomial time $T_{\mathrm{sub}}$ given by the sum of \texttt{parent.validate()}, \texttt{child.validate()} (which validates $C$'s \texttt{from}/\texttt{to} names, keys, $|\mathrm{Attr}_C|$ actor attributes, and every clause), and \texttt{parent.try\_mandate\_id()} (canonical rendering and SHA-256 digest of $P$) in $O(\|P\| + \|C\|)$ plus:
+\begin{itemize}[leftmargin=*,itemsep=1pt]
+  \item Actions: $O(|A_C| \cdot |A_P| \cdot d_{\max} \cdot k_{\max})$;
+  \item Resources: $O(|R_C| \cdot |R_P| \cdot ((|g_p|_{\max}+1)(|g_c|_{\max}+1) + k_{\max}))$;
+  \item Predicates: domain construction takes $O\big((|W_C|\log(|W_C|+1) + \sum |S_c|\log(|S_c|+1))\,k_{\max}\big)$, and checking $|W_P|$ parent predicates takes $O\big(|W_P|\,(\log(|W_C|+1) + S_{c,\max}(1 + \log(|P_{\max}|+1)) + |P_{\max}|\log(|P_{\max}|+1))\,k_{\max}\big)$, since each parent predicate either scans up to $S_{c,\max}$ surviving child \texttt{IN} members---incurring $O(S_{c,\max}\,k_{\max})$ per non-\texttt{IN} parent bound even when $|P_{\max}| = 0$, or $O(S_{c,\max}\log(|P_{\max}|+1)\,k_{\max})$ against a parent \texttt{IN} set---or runs at most $|P_{\max}|$ interval-to-\texttt{IN} membership checks;
+  \item Quotas: $O(|Q_P| \cdot |Q_C| \cdot k_{\max})$.
+\end{itemize}
+At runtime, \texttt{evaluate\_chain} (invoked by \texttt{authorize}) rejects an empty chain ($|L| = 0$) in $O(1)$ time. For any non-empty input chain of length $|L| \ge 1$, it first verifies anchor proofs across the input chain in $O(|L|\,k_{\max})$ and then calls \texttt{subsumes} on adjacent hops (at most $\max(|L|-1, 0)$ times); the root hop bound $|L| \le h_{\mathrm{root}} + 1$ holds only after attenuation succeeds, since \texttt{verify\_proofs} (and \texttt{authorize}'s initial \texttt{try\_mandate\_id} pass) can scan an overlong input first. After attenuation succeeds, \texttt{evaluate\_chain} validates the concrete request once (\texttt{is\_valid\_concrete\_action}, \texttt{is\_valid\_ident}, \texttt{is\_valid\_quoted\_str}, and leaf \texttt{actor\_key} matching) in $T_{\mathrm{req}} = O(|a_{\mathrm{req}}| + |k_{\mathrm{req}}| + |r|_{\max} + k_{\max})$, and evaluates each mandate ($|L|$ times) in per-hop cost $T_{\mathrm{eval}} = O\big(|A|(d_{\max} k_{\max} + |a_{\mathrm{req}}|) + |R|(k_{\max} + (|g|_{\max}+1)(|r|_{\max}+1)) + |W|\big(|I_{\max}| + (\log(|F|+1) + \log(|I_{\max}|+1) + 1) k_{\max}\big) + |Q|(\log(|F|+1) + \log(|U|+1) + 1) k_{\max}\big)$, where the $(|g|_{\max}+1)(|r|_{\max}+1)$ term bounds both \texttt{ResourceSel::matches} scanning \texttt{resource\_id} via \texttt{is\_valid\_quoted\_str} even on an empty selector glob ($|g|_{\max}=0$) and \texttt{glob\_matches} scanning trailing \texttt{*} wildcards even on an empty \texttt{resource\_id} ($|r|_{\max}=0$), the $|a_{\mathrm{req}}|$ term accounts for wildcard trailing-segment validation in \texttt{ActionPat::matches}, the linear $|I_{\max}|$ term accounts for \texttt{check\_predicate\_type}'s \texttt{set.iter().any(...)} kind scan on \texttt{IN} predicates (which exits before membership lookup on a kind miss, whereas a late kind match incurs both the linear scan and the subsequent $O(\log(|I_{\max}|+1)\,k_{\max})$ \texttt{BTreeSet::contains} lookup, with the stated sum upper-bounding both), and $\log(|U|+1)\,k_{\max}$ bounds both levels of \texttt{QuotaSnapshot::sum\_for}. Total \texttt{evaluate\_chain} time is $O(1)$ for $|L| = 0$ and $O\big(T_{\mathrm{req}} + \max(|L|-1, 0)\,T_{\mathrm{sub}} + |L|\,T_{\mathrm{eval}}\big)$ for $|L| \ge 1$ (with $|L| \le h_{\mathrm{root}} + 1$ once attenuation succeeds; \texttt{authorize} additionally performs up to $|L|$ initial \texttt{try\_mandate\_id} validations/renderings and receipt hashing, adding $O(\sum_{i=0}^{|L|-1}\|M_i\| + T_{\mathrm{req}})$). \qedhere
+\end{proof}
+
+\subsection{Chain-Wide Anti-Splitting Quota Accounting}
+\label{sec:antisplitting}
+
+Monotonic attenuation alone is insufficient to enforce quantitative budgets. Consider a root mandate $M_0$ granting \texttt{LIMIT 5 calls} (or \texttt{LIMIT 100.0 USD sum(resource.amount)}) to an orchestrator with \texttt{max 1 hop}. Without chain-wide tracking, a malicious or compromised orchestrator could mint ten distinct child mandates $M_{1,1}, \dots, M_{1,10}$, each legally attenuated to \texttt{LIMIT 1 call}, and execute ten calls total---bypassing $M_0$'s budget by \emph{delegation splitting}.
+
+\begin{proposition}[Anti-Splitting Conservation]
+\label{prop:antisplitting}
+Let $M_0 \succeq M_1 \succeq \dots \succeq M_k$ be any valid delegation chain evaluated through \texttt{handfest-core::gate::authorize} and persisted via \texttt{ReceiptLedger::evaluate\_and\_record}, under the precondition that all permits for chains rooted at $M_0$ commit against the \emph{same shared, intact accounting state} (a single serialized ledger instance with no uncoordinated replicas or rollback resets). Because:
+\begin{enumerate}[leftmargin=*,itemsep=1pt]
+  \item \texttt{evaluate\_chain} evaluates \emph{every} mandate $M_i$ ($0 \le i \le k$) in conjunction against its prior usage in \texttt{QuotaSnapshot} (including $M_0$'s aggregate counters), and
+  \item \texttt{SqliteLedger::evaluate\_and\_record} executes inside a single serialized \texttt{BEGIN IMMEDIATE} transaction that increments \texttt{quota\_calls} (and every declared \texttt{quota\_sums} key) for \emph{all} distinct \texttt{MandateId}s in the chain iff the verdict is \texttt{Verdict::Permit},
+\end{enumerate}
+the cumulative calls and sums permitted across \emph{all} descendant chains rooted at $M_0$ through that ledger can never exceed $M_0$'s declared \texttt{LIMIT} clauses. Conversely, two independent ledgers without shared state each start at zero usage and can each grant $M_0$'s full root allowance; multi-host deployments therefore require a single shared serialized ledger backend or centralized quota broker.
+\end{proposition}
+
+Notably, \texttt{handfest-ledger/src/quotas.rs} only charges a \texttt{Quota::Sum} key on mandates that declare that \texttt{(unit, field)} quota, preventing undeclared descendant sum keys from polluting an unconstrained root while still charging every constrained ancestor atomically.
+% ============================================================================
+\section{System Architecture and Decoupled Seams}
+\label{sec:arch}
+
+\texttt{handfest} follows a strict \emph{functional core, imperative shell} architecture governed by SOLID dependency inversion, with one-way crate-wrapper bans and permissive-only license rules declared in \texttt{deny.toml} (checked via \texttt{cargo deny check}). Figure~\ref{fig:arch} depicts the end-to-end execution flow and strictly one-way crate dependency graph.
+
+\begin{figure*}[t]
+\begin{lstlisting}
+   [Principal / Wallet / eIDAS QES]           [Orchestrator (e.g., Brokkr)]
+     Signs canonical HANDFEST v1 M0   ----->    Attenuates M0 -> M1 (subsumes)
+                   |                                         |
+                   +--------------------+--------------------+
+                                        v
+     +---------------------------------------------------------------------+
+     | handfest-anchors (AnchorVerifier -> VerifiedAnchorProof)            |
+     |   [Implemented] Ed25519Verifier (RFC 8032 verify_strict)            |
+     |   [Roadmapped]  Passkeys, EIP-712, EUDI SD-JWT VC, ETSI TS 119 612  |
+     +-------------------+-------------------------------+-----------------+
+                         | Vec<VerifiedMandate>          | Vec<VerifiedMandate>
+                         v                               v
+     +-------------------------------+   +---------------------------------+
+     | handfest-cli check (Impl.)    |   | handfest-mcp (Proposed Slice 2) |
+     | <- Operator/broker supplies:  |   | <- Untrusted AI Agent (stdio)   |
+     |    --chain, --actor-key,      |   | - Pins root key & caller actor  |
+     |    --facts, --now             |   | - Supplies host Clock &         |
+     | - verify_chain checks each    |   |   broker VerifiedFacts          |
+     |   envelope against FROM key   |   | - Pre-gate refusals             |
+     |                               |   |   -> record_denial()            |
+     +---------------+---------------+   +----------------+----------------+
+                     |                                    |
+                     +-----------------+------------------+
+                                       v
+     +---------------------------------------------------------------------+
+     | handfest-ledger::evaluate_and_record() (ReceiptLedger trait seam)   |
+     |   BEGIN IMMEDIATE (SqliteLedger, journal_mode=DELETE, sync=FULL):   |
+     |   1. Load QuotaSnapshot + prev_receipt_hash                         |
+     |   2. Call handfest-core::gate::authorize() (#![no_std], pure)       |
+     |      - Anchor proofs, ActorKind, [valid_from, valid_until)          |
+     |      - subsumes(M_i, M_{i+1}) + M_0 && ... && M_k + QuotaSnapshot   |
+     |   3. On Permit: increment chain-wide quota_calls / quota_sums       |
+     |   4. Append hash-chained DecisionReceipt (Permit & Deny) -> COMMIT  |
+     +-------------------+-------------------------------+-----------------+
+                         | Permit (ONLY after COMMIT)    | Deny (after COMMIT)
+                         v                               v
+              [Forward to Upstream /            [Refuse Request
+               CLI Exit 0]                       (-32001 / CLI Exit != 0)]
+
+   Crate DAG (one-way, deny.toml):   Read-only audit (0444/0555):
+     handfest-cli   handfest-mcp*      SqliteLedger::open_read_only()
+        /  |  \       /  |  \          -> audit_snapshot() (integrity_check,
+       v   |   v     v   |   v            hash-chain, HWM, TrackRecord)
+   anchors | ledger  anchors | ledger    (*handfest-mcp planned in Slice 2)
+        \  v  /         \  v  /
+         core            core
+\end{lstlisting}
+\caption{End-to-end \texttt{handfest} execution pipeline showing atomic quota and receipt persistence before forwarding a \texttt{Permit} (matching \texttt{SqliteLedger::evaluate\_and\_record}), together with the strictly one-way workspace dependency graph.}
+\label{fig:arch}
+\end{figure*}
+
+\subsection{Pure \texorpdfstring{\texttt{\#![no\_std]}}{no\_std} Functional Core (\texorpdfstring{\texttt{handfest-core}}{handfest-core})}
+\label{sec:core}
+
+\texttt{handfest-core} is compiled with \texttt{\#![no\_std]} and \texttt{extern crate alloc}, forbidding unsafe code (\texttt{\#![forbid(unsafe\_code)]}) and depending exclusively on \texttt{sha2} (\texttt{0.10}, \texttt{default-features = false}). It performs zero filesystem I/O, zero network access, zero system clock reads, and zero randomness. Every external input---the evaluation timestamp \texttt{now: i64}, normalized trust-anchor proofs (\texttt{VerifiedAnchorProof}), caller- or broker-supplied \texttt{VerifiedFacts}, prior chain-wide \texttt{QuotaSnapshot}, and \texttt{prev\_receipt\_hash}---enters \texttt{authorize()} as a pure value argument.
+
+Exact financial and resource budgets use \texttt{Decimal} (\texttt{i128} mantissa, \texttt{scale <= 28}) backed by a custom fixed-width 256-bit unsigned integer (\texttt{U256}) in \texttt{ast.rs} for overflow-safe, exact base-10 \texttt{checked\_add} without floating-point drift. Every ruling returns a \texttt{(Verdict, DecisionReceipt)} pair whose \texttt{receipt\_hash} is a domain-separated SHA-256 hash (\texttt{"HANDFEST-RECEIPT-v1\textbackslash 0"}) over a length-prefixed encoding of \texttt{prev\_receipt\_hash}, \texttt{chain\_ids}, \texttt{actor\_key}, canonicalized \texttt{action} and \texttt{resource}, \texttt{timestamp}, and \texttt{verdict}. Pre-gate refusals (such as unknown tools or missing facts before a chain reaches \texttt{authorize}) construct identically framed receipts via \texttt{build\_denial\_receipt()}. Because \texttt{authorize()} is purely functional, replaying it with the original evaluation inputs (verified mandate chain, \texttt{ActionRequest}, \texttt{VerifiedFacts}, \texttt{QuotaSnapshot}, \texttt{now}, and \texttt{prev\_receipt\_hash}) reproduces the exact \texttt{(Verdict, DecisionReceipt)} byte-for-byte offline on any architecture; note that \texttt{DecisionReceipt} itself stores compact commitments (\texttt{chain\_ids}, actor, action, resource, timestamp, verdict, and hash links) and omits the full mandate texts and runtime \texttt{VerifiedFacts}.
+
+\subsection{Pluggable Trust-Anchor Boundary (\texorpdfstring{\texttt{handfest-anchors}}{handfest-anchors})}
+\label{sec:anchors}
+
+Real-world principals authenticate through heterogeneous identity infrastructures: developer SSH/Ed25519 keys, FIDO2/WebAuthn Passkeys~\cite{w3c_webauthn2}, EIP-712 crypto wallets~\cite{eip712}, EUDI \texttt{SD-JWT VC}~\cite{ietf_sd_jwt_vc} / ISO \texttt{mdoc} wallets~\cite{eudi_arf}, and eIDAS Qualified Electronic Signatures validated against ETSI TS~119~612 Trusted Lists~\cite{etsi_ts_119_612}. Hardcoding any single cryptographic scheme into policy evaluation would violate open/closed extensibility.
+
+\texttt{handfest-anchors} isolates signature and identity verification behind a minimal \texttt{AnchorVerifier} trait:
+\[\small
+\begin{aligned}
+  &\texttt{verify}(\&\texttt{SignedMandate}) \\
+  &\quad \to \texttt{Result<VerifiedMandate, AnchorError>}.
+\end{aligned}
+\]
+Every verifier normalizes its scheme-specific evidence into a single \texttt{VerifiedAnchorProof} carrying \texttt{anchor\_id}, a monotonically ordered \texttt{AssuranceLevel} enum (\texttt{LocalKey} $<$ \texttt{CryptoWallet} $<$ \texttt{Passkey} $<$ \texttt{SubstantialEidas} $<$ \texttt{QualifiedQes}), \texttt{signer\_key}, \texttt{actor\_kind}, and the half-open validity interval $[\texttt{valid\_from},\allowbreak\, \texttt{valid\_until})$.
+
+At commit \texttt{60f105e}, \texttt{handfest-anchors} ships \texttt{Ed25519Verifier} and \texttt{Ed25519Keypair} built on \texttt{ed25519-dalek} with strict RFC~8032 verification (\texttt{verify\_strict})~\cite{rfc8032}, strict lowercase fixed-width hex decoding, and \texttt{\#[serde(deny\_unknown\_fields)]} on \texttt{SignedMandate} and \texttt{Ed25519KeyFile}. Implementing additional Passkey, EIP-712, EUDI \texttt{SD-JWT VC}, or ETSI TS~119~612 QES verifiers requires zero changes to \texttt{handfest-core} or \texttt{handfest-ledger}, which consume only \texttt{VerifiedMandate} / \texttt{VerifiedAnchorProof}. However, at commit \texttt{60f105e}, the helper \texttt{handfest-anchors::verify\_chain} selects \texttt{verify\_ed25519} for every hop, and \texttt{handfest-cli} calls \texttt{verify\_chain} and \texttt{SqliteLedger::open} directly; exposing additional anchor or ledger adapters to consumers therefore requires adding an \texttt{AnchorRegistry} dispatcher in \texttt{handfest-anchors} (routing each hop by scheme/\texttt{anchor\_id}) and wiring consumer configuration/CLI flags to select the desired registry and \texttt{ReceiptLedger} backend.
+
+\subsection{Backend-Neutral \texorpdfstring{\texttt{ReceiptLedger}}{ReceiptLedger} and Rollback-Journal SQLite (\texorpdfstring{\texttt{handfest-ledger}}{handfest-ledger})}
+\label{sec:ledger}
+
+\texttt{handfest-ledger} defines the backend-agnostic \texttt{ReceiptLedger} trait with five cohesive operations: \texttt{evaluate\_and\_record}, \texttt{record\_denial}, \texttt{verify\_integrity}, \texttt{track\_record}, and \texttt{audit\_snapshot}. The reference implementation, \texttt{SqliteLedger}, persists receipts (\texttt{receipts}), call counters (\texttt{quota\_calls}), and sum counters (\texttt{quota\_sums}) in bundled SQLite~\cite{hipp_sqlite}.
+
+A notable systems-engineering design choice in commit \texttt{60f105e} is migrating \texttt{SqliteLedger} from WAL mode to classic \textbf{rollback-journal mode} (\texttt{PRAGMA journal\_mode = DELETE}, \texttt{PRAGMA synchronous = FULL}). While WAL mode is popular for high-concurrency web services, a read-only SQLite connection on a WAL database still depends on \texttt{-wal}/\texttt{-shm} sidecars---it can reuse existing readable sidecars when present, but fails when inspecting a standalone \texttt{0444} ledger inside a \texttt{0555} read-only directory where no \texttt{-shm} file exists and the reader cannot create one. Handfest therefore uses rollback-journal mode for sidecar-free read-only auditing (\texttt{SqliteLedger::open\_read\_only}) with \texttt{PRAGMA query\_only = ON} across concurrent OS processes.
+
+Hardening this read-only and cross-process boundary required three additional mechanisms in \texttt{preflight.rs}, \texttt{schema.rs}, and \texttt{audit.rs}:
+\begin{enumerate}[leftmargin=*,itemsep=1pt]
+  \item \textbf{Pre-Open Header and Sidecar Preflight:} Before SQLite touches a path, \texttt{open\_read\_only} canonicalizes symlinks, inspects the raw 100-byte SQLite header (rejecting truncated, non-SQLite, or WAL-header databases with zero sidecars created), checks for uncheckpointed \texttt{-wal} files, and applies bounded exponential backoff (up to 500\,ms) if a transient active \texttt{-journal} is observed during a concurrent writer commit.
+  \item \textbf{POSIX \texttt{fcntl} Lock Preservation:} On Unix, closing \emph{any} file descriptor pointing to an inode drops \emph{all} process-owned \texttt{fcntl} locks on that inode (even across hard links). \texttt{preflight.rs} tracks open handles in a process-local, inode-keyed \texttt{(st\_dev, st\_ino)} registry (\texttt{ActiveHandleGuard}), skipping raw \texttt{File::open} probes whenever this process already holds an open handle on the same inode.
+  \item \textbf{Single-Snapshot Verification and Track Record:} \texttt{audit\_snapshot} executes schema validation, full \texttt{PRAGMA integrity\_check}, contiguous \texttt{seq} and SHA-256 hash-chain replay, \texttt{sqlite\_sequence} high-water-mark checking, \texttt{quota\_calls} numerical reconciliation against persisted \texttt{Permit} receipts, structural \texttt{quota\_sums} validation (verifying valid identifiers, canonical non-negative \texttt{Decimal} totals, uniqueness, and that each row corresponds to a \texttt{MandateId} with persisted permits---since omitted \texttt{VerifiedFacts} omit per-call sum deltas and therefore allow a local writer to alter an existing \texttt{quota\_sums.total} to another canonical non-negative value without changing the receipt tip), and \texttt{TrackRecord} projection inside one read transaction, preventing TOCTOU skew under concurrent writers. Local hash-chain replay checks internal consistency across the persisted receipt sequence and \texttt{quota\_calls} table, and because \texttt{sqlite\_sequence} and \texttt{receipts} live in the same SQLite file, local tail-deletion detection relies on an intact local \texttt{sqlite\_sequence} high-water mark; detecting a coherent in-place rewrite of one or more receipt rows (recomputing downstream \texttt{receipt\_hash}/\texttt{prev\_receipt\_hash} links and reconciling quota tables), whole-database rollback to a coherent earlier prefix, or wholesale replacement with a freshly built history therefore requires an independently retained external commitment covering the edited receipt or tip (such as a pinned \texttt{receipt\_hash} and \texttt{seq} or an append-only transparency log).
+\end{enumerate}
+
+\subsection{Reference CLI (\texorpdfstring{\texttt{handfest-cli}}{handfest-cli}) and External MCP Proxy Architecture (\texorpdfstring{\texttt{handfest-mcp}}{handfest-mcp})}
+\label{sec:cli-mcp}
+
+\texttt{handfest-cli} exposes six subcommands whose normal outputs (and \texttt{check} \texttt{Deny} verdicts) write canonical text, identifiers, or JSON to \texttt{stdout}, while CLI errors emit plain diagnostics on \texttt{stderr} with a non-zero exit status: \texttt{fmt} (canonicalize a mandate), \texttt{keygen} (generate an Ed25519 key, printing JSON to \texttt{stdout} by default, or with \texttt{--out} installing the key file via atomic temp-file rename, \texttt{sync\_all}, and mode \texttt{0600} on Unix while writing directly to the target path on non-Unix platforms and printing the \texttt{KeyId}), \texttt{sign}, \texttt{verify} (chain signatures plus \texttt{subsumes}), \texttt{check} (verify mandate signatures via \texttt{verify\_chain}, evaluate via \texttt{SqliteLedger::evaluate\_and\_record}, emit a JSON verdict on \texttt{stdout}, and exit 0 on \texttt{Permit} or non-zero on \texttt{Deny}), and \texttt{audit} (read-only integrity check emitting JSON on \texttt{stdout}, including a \texttt{TrackRecord} object only when \texttt{--actor-key} is supplied). Notably, \texttt{handfest-anchors::verify\_chain} authenticates each envelope's signature against that mandate's own \texttt{FROM} key without pinning a root trust anchor, and \texttt{handfest-cli check} accepts \texttt{--chain} and \texttt{--actor-key} (alongside \texttt{--action}, \texttt{--resource-kind}, \texttt{--resource-id}, \texttt{--facts}, and \texttt{--now}) as explicit operator- or broker-supplied CLI arguments rather than enforcing a trusted root allowlist, authenticating a remote caller, or querying an external fact broker or host clock (and does not invoke \texttt{record\_denial()}). Runtime facts are parsed through a custom lossless JSON parser (\texttt{facts.rs}) that supports inline objects, \texttt{@file} paths, and Unix FIFOs without routing numbers through IEEE-754 \texttt{f64}.
+
+For live AI agents, \texttt{specs/architecture.md} and \texttt{README.md} define the external \texttt{handfest-mcp} stdio JSON-RPC proxy (Slice~2 roadmap; architectural boundary in progress and not yet a workspace member at commit \texttt{60f105e}). Sitting strictly \emph{outside} the AI model between the harness and upstream MCP servers, \texttt{handfest-mcp} selects and pins trusted root principals (verifying that the root mandate's \texttt{FROM} key and \texttt{AssuranceLevel} match a configured, schema-validated trust-anchor root bundle rather than accepting arbitrary self-signed chains), binds \texttt{ActionRequest.actor\_key} to its own authenticated/launcher-provisioned caller session identity (never to untrusted JSON-RPC parameters supplied by the model), filters \texttt{tools/list} to hide ungranted tools, maps \texttt{tools/call} requests through a typed \texttt{ToolPolicyMap} configuration (never hardcoding harness or vendor names), supplies host \texttt{Clock} and broker-verified \texttt{VerifiedFacts} (so a prompt-injected model cannot spoof timestamps, authors, or CI status), forwards permitted calls, and returns structured JSON-RPC \texttt{-32001} errors while logging pre-gate denials via \texttt{ReceiptLedger::record\_denial}.
+% ============================================================================
+\section{Threat Model and Adversarial Case Study}
+\label{sec:threats}
+
+\paragraph{Threat Model.}
+We assume a strong adversary controlling: (i)~the AI agent's prompts and tool-call arguments (including prompt-injected payloads), (ii)~a compromised intermediate orchestrator attempting to widen capabilities, reclassify \texttt{ActorKind}, or split quotas across child mandates, (iii)~the untrusted JSON-RPC wire input on the MCP stdio boundary, and (iv)~local filesystem write access to tamper with persisted SQLite ledger files between invocations. The trusted computing base (TCB) comprises the root principal's trust-anchor signing device, the trusted source of evaluation inputs and identity bindings---specifically, for \texttt{handfest-cli check}, the invoking operator or broker supplying \texttt{--chain}, \texttt{--actor-key}, \texttt{--facts}, and \texttt{--now} (because \texttt{verify\_chain} authenticates each envelope against its own \texttt{FROM} key without pinning a root trust anchor and \texttt{check} takes the chain and actor key as explicit arguments); and, for the proposed \texttt{handfest-mcp} proxy, the proxy's configured trust-anchor root bundle (pinning the trusted root \texttt{FROM} key), its authenticated/launcher-bound caller session identity (binding \texttt{ActionRequest.actor\_key} independently of model input), and its host \texttt{Clock} and broker \texttt{VerifiedFacts} providers---together with the deterministic \texttt{handfest-core} / \texttt{handfest-anchors} / \texttt{handfest-ledger} enforcement binary.
+
+During iterative adversarial code review and threat modeling of \texttt{handfest} and its planned MCP broker boundary, four implemented attack families drove structural hardening at commit \texttt{60f105e}, and a fifth family of four MCP JSON-RPC wire-framing attacks was cataloged as proposed defenses for the planned Slice~2 proxy. Table~\ref{tab:threats} summarizes all five classes and their implementation status.
+
+\begin{table*}[t]
+\centering
+\caption{Summary of four implemented, test-bound adversarial attack families in \texttt{handfest} at commit \texttt{60f105e} and a fifth family of four proposed wire-framing defenses for the planned Slice~2 \texttt{handfest-mcp} proxy.}
+\label{tab:threats}
+\scriptsize
+\setlength{\tabcolsep}{4pt}
+\begin{tabular}{@{}L{2.9cm}L{1.8cm}L{4.3cm}L{4.2cm}L{2.7cm}@{}}
+\toprule
+\textbf{Attack Family} & \textbf{Layer} & \textbf{Exploit Mechanism} & \textbf{Root-Cause Defense} & \textbf{Evidence / Status} \\
+\midrule
+1. AST Second-Preimage / \texttt{WHERE} Erasure &
+\texttt{core} (\texttt{ast}, \texttt{cnl}) &
+Newline \& syntax injection inside \texttt{ResourceSel.kind} renders colliding \texttt{HANDFEST v1} text with erased \texttt{WHERE} clauses. &
+Private AST fields, constructor/builder \texttt{validate()}, control-char ban, \texttt{try\_mandate\_id()}. &
+Bound in \texttt{core\_tests.rs} (commit \texttt{60f105e}). \\
+\addlinespace[3pt]
+2. Negative Headroom \& \texttt{f64} Decimal Bypass &
+\texttt{core} (\texttt{gate}), \texttt{cli} (\texttt{facts}) &
+Negative prior sum widens headroom; \texttt{100.000000000000001} rounds to \texttt{100.0} in IEEE-754 \texttt{f64}, bypassing \texttt{LIMIT 100.0}. &
+Explicit \texttt{is\_negative()} rejection in \texttt{evaluate\_quota}; custom lossless token-to-\texttt{Decimal} JSON lexer. &
+Bound in \texttt{gate\_tests.rs}, \texttt{cli\_tests.rs} (\texttt{60f105e}). \\
+\addlinespace[3pt]
+3. Unauthenticated Envelope Metadata &
+\texttt{anchors} (\texttt{lib.rs}) &
+Rewriting \texttt{valid\_until}, \texttt{assurance}, or \texttt{actor\_kind} in JSON envelope without breaking text-only signature. &
+Domain-separated \texttt{signing\_payload()} with length-prefixed metadata + \texttt{verify\_strict} + \texttt{deny\_unknown\_fields}. &
+Bound in \texttt{anchors\_tests.rs} (\texttt{60f105e}). \\
+\addlinespace[3pt]
+4. MCP JSON-RPC Wire-Framing Smuggling &
+\texttt{mcp} proxy boundary (Slice~2) &
+Bare-\texttt{\textbackslash r} desync; Go \texttt{EqualFold}/\texttt{SimpleFold} (\texttt{U+017F}/\texttt{U+212A}) key smuggling; \texttt{"error":null} bypass; FIFO cancel eviction. &
+Strict LF-only framing; duplicate/folded key ban + strict re-serialization; \texttt{result}/\texttt{error} mutual exclusion; fail-closed backpressure. &
+Proposed defenses (Slice~2; not implemented or tested at \texttt{60f105e}; bare-\texttt{\textbackslash r} and \texttt{result}+\texttt{error} rules cited in \texttt{docs/\allowbreak house-rules.md}). \\
+\addlinespace[3pt]
+5. SQLite Ledger Integrity Tampering &
+\texttt{ledger} (\texttt{schema}, \texttt{audit}) &
+Tail row deletion; rogue \texttt{AFTER INSERT} trigger; \texttt{COLLATE NOCASE} DDL swap; index-only B-tree bit-flip. &
+\texttt{sqlite\_sequence} HWM check (given an intact local HWM); exact \texttt{sqlite\_master} DDL verification on \texttt{open} \& \texttt{audit}; full \texttt{PRAGMA integrity\_check}. &
+Bound in \texttt{ledger\_tests.rs}, \texttt{hardening\_\allowbreak and\_\allowbreak denial\_\allowbreak tests.rs} (\texttt{60f105e}). \\
+\bottomrule
+\end{tabular}
+\end{table*}
+
+\subsection{Attack 1: Unvalidated AST Second-Preimage and \texorpdfstring{\texttt{WHERE}}{WHERE} Clause Erasure}
+
+If a caller constructs an AST with unvalidated public fields and hashes \texttt{render\_canonical(ast)}, newline injection creates a cryptographic second-preimage collision on \texttt{MandateId}. Specifically, as captured in \texttt{core\_tests.rs}, inserting the string
+\begin{lstlisting}
+z_pad "x"\nWHERE resource.author ==
+\end{lstlisting}
+as \texttt{ResourceSel.kind} with pattern \texttt{"valentin"} causes \texttt{render\_canonical} to emit text byte-for-byte identical to a legitimate mandate carrying \texttt{ON z\_pad "x"} and \texttt{WHERE resource.author == "valentin"}. An AST carrying \emph{no} \texttt{WHERE} clauses could thus collide with a constrained mandate's SHA-256 \texttt{MandateId}, erasing policy predicates while preserving signature validity.
+
+\paragraph{Defense.}
+\texttt{HandfestAst} and all sub-types hide their fields behind validated constructors (\texttt{ResourceSel::new}, \texttt{ActorDecl::new}, \texttt{Predicate::new}, \texttt{HandfestAstBuilder::build}). Identifiers strictly match ASCII identifier syntax (\texttt{is\_valid\_ident}), quoted strings reject all control characters including NUL, LF, CR, and TAB (\texttt{is\_valid\_quoted\_str}), and both \texttt{try\_render\_canonical()} and \texttt{try\_mandate\_id()} re-run \texttt{validate()} before producing canonical bytes or digests.
+
+\subsection{Attack 2: Negative Prior Quota Headroom and IEEE-754 \texorpdfstring{\texttt{f64}}{f64} Rounding Bypass}
+
+Two distinct numeric attacks target quantitative \texttt{LIMIT} budgets:
+\begin{enumerate}[leftmargin=*,itemsep=1pt]
+  \item \textbf{Negative Prior Headroom Fail-Open:} If a corrupted or tampered \texttt{QuotaSnapshot} supplies a negative prior sum (e.g., $-50.0\;\text{USD}$), naive addition $\mathit{used} + \Delta \le \mathit{max}$ would silently \emph{expand} remaining budget above the signed limit. \texttt{handfest-core/src/gate.rs} rejects negative \texttt{max}, negative runtime fact $\Delta$, and negative prior \texttt{used} unconditionally inside \texttt{evaluate\_quota()}, while \texttt{handfest-ledger} enforces \texttt{CHECK (calls >= 0)} in SQL, parses \texttt{Decimal} totals and rejects negative values during evaluation load (\texttt{quotas.rs::load\_quota\_snapshot}), and additionally enforces canonical \texttt{Decimal} spelling (\texttt{total\_raw == total.to\_string()}) during audit (\texttt{audit.rs::validate\_quota\_sum\_row}).
+  \item \textbf{IEEE-754 \texttt{f64} JSON Rounding Bypass:} Standard JSON deserializers (\texttt{serde\_json::Value}) parse numeric literals via 64-bit binary floating point. Under \texttt{LIMIT 100.0 USD sum(resource.amount)}, the payload \texttt{\{"resource.amount": 100.000000000000001\}} silently rounds to \texttt{100.0} in \texttt{f64} and slips past the ceiling; similarly, tiny charges like \texttt{1e-8} lose precision across repeated accumulations. \texttt{handfest-cli/src/facts.rs} replaces \texttt{serde\_json::Value} with a dedicated recursive-descent exact JSON parser (\texttt{MAX\_JSON\_DEPTH = 16}) that rejects duplicate object keys, parses bare integer JSON tokens into \texttt{Scalar::Int(i64)}, and lexes decimal or scientific-notation tokens (as well as explicit \texttt{\{"decimal": "..."\}} wrappers) directly into base-10 \texttt{Scalar::Decimal} ($i128$ mantissa, scale $\le 28$). Thus \texttt{facts.rs} preserves \texttt{100.000000000000001} losslessly as \texttt{Scalar::Decimal} without rounding to \texttt{100.0}, which \texttt{handfest-core}'s \texttt{evaluate\_quota()} then deterministically denies against \texttt{LIMIT 100.0} while accounting for \texttt{0.00000001} and \texttt{1e-8} exactly.
+\end{enumerate}
+
+\subsection{Attack 3: Unauthenticated Envelope Metadata}
+\label{sec:attack-envelope}
+
+A subtle vulnerability in signature-wrapper designs occurs when the cryptographic signature covers only the canonical mandate text (\texttt{canonical\_words}) while leaving envelope metadata (\texttt{valid\_from}, \texttt{valid\_until}, \texttt{anchor\_id}, \texttt{assurance}, \texttt{actor\_kind}) outside the signed byte string. An attacker holding a validly signed mandate could arbitrarily extend \texttt{valid\_until} by years or spoof \texttt{assurance: "qualified\_qes"} on a local Ed25519 key.
+
+\paragraph{Defense.}
+In \texttt{handfest-anchors/src/lib.rs}, \texttt{signing\_payload()} prepends \texttt{SIGNING\_DOMAIN\_PREFIX} (\texttt{b"handfest-v1-envelope\textbackslash 0"}), length-prefixes \texttt{anchor\_id}, \texttt{assurance}, \texttt{actor\_kind}, and \texttt{signer\_key} with big-endian \texttt{u64} lengths, appends big-endian \texttt{i64} \texttt{valid\_from} and \texttt{valid\_until}, and finishes with length-prefixed \texttt{canonical\_words}. Enforcement separates three distinct stages: (1)~\emph{signing} (\texttt{Ed25519Keypair::sign\_mandate}) enforces \texttt{parse\_canonical}, validates \texttt{anchor\_id}, $[\texttt{valid\_from},\allowbreak\, \texttt{valid\_until})$, and \texttt{ast.from().key() == self.key\_id()}, populates \texttt{assurance = "local\_key"} and \texttt{actor\_kind} from the AST, and signs \texttt{signing\_payload()}; (2)~\emph{JSON decoding} rejects extraneous keys on \texttt{SignedMandate} (and \texttt{Ed25519KeyFile}) via \texttt{\#[serde(deny\_unknown\_fields)]}; and (3)~\emph{strict verification} (\texttt{verify\_ed25519}) re-runs \texttt{parse\_canonical}, validates \texttt{anchor\_id} and the validity window, checks \texttt{actor\_kind == ast.from().kind()}, \texttt{assurance == AssuranceLevel::LocalKey}, and \texttt{signer\_key == ast.from().key()}, decodes strict lowercase fixed-width hex public keys and signatures, recomputes \texttt{signing\_payload()}, and verifies with \texttt{ed25519-dalek}'s \texttt{verify\_strict} to prevent signature malleability.
+\subsection{Attack 4: MCP JSON-RPC Wire-Framing Attacks}
+
+At commit \texttt{60f105e}, \texttt{handfest-mcp} is on the Slice~2 roadmap and has no implementation or regression tests in \texttt{crates/}. Adversarial threat modeling of MCP stdio JSON-RPC~2.0 proxies~\cite{mcp_spec,jsonrpc2} identifies four wire-level attacks that could bypass policy enforcement \emph{before} a request reaches \texttt{handfest-core}. Two of these fail-closed wire-framing rules (bare \texttt{\textbackslash r} and simultaneous \texttt{result}+\texttt{error}) are cited explicitly in \texttt{docs/house-rules.md}, and all four constitute \emph{proposed defenses} for the Slice~2 proxy:
+\begin{enumerate}[leftmargin=*,itemsep=1pt]
+  \item \textbf{Bare-CR (\texttt{\textbackslash r}) Frame Smuggling:} MCP stdio transports delimit messages by newlines. If a proxy splits strictly on \texttt{\textbackslash n} while an upstream server treats bare \texttt{\textbackslash r} as a frame delimiter (or vice versa), an attacker can embed a second smuggled JSON-RPC request inside a single line that the proxy treats as harmless trailing text or a string fragment. \emph{Proposed defense:} Strict LF-only framing that fails closed on any bare \texttt{\textbackslash r} byte outside validated JSON strings (and rejects unescaped control characters).
+  \item \textbf{Go \texttt{encoding/json} \texttt{EqualFold} and Unicode \texttt{SimpleFold} (\texttt{U+017F} / \texttt{U+212A}) Key Smuggling:} Many upstream MCP tool servers are written in Go, whose standard \texttt{encoding/json} unmarshaler matches struct fields using \texttt{strings.EqualFold} (Unicode \texttt{SimpleFold}). Under \texttt{SimpleFold}, Latin small letter long s (\texttt{U+017F}) folds to ASCII \texttt{'s'} and the Kelvin sign (\texttt{U+212A}) folds to ASCII \texttt{'k'}. A crafted JSON-RPC object carrying a key such as \texttt{"\textbackslash u017fcope"} or \texttt{"to\textbackslash u212aen"} can evade an exact-case proxy inspection while binding cleanly to a Go struct field downstream. \emph{Proposed defense:} Reject duplicate or Unicode-fold-colliding object keys at the proxy edge, validate closed schemas strictly, and re-serialize canonical ASTs rather than forwarding raw wire bytes.
+  \item \textbf{\texttt{"error": null} \texttt{tools/list} Filter Bypass:} JSON-RPC~2.0 specifies that a response MUST contain either \texttt{result} or \texttt{error}, never both~\cite{jsonrpc2}. A hostile or buggy server returning \texttt{\{"result": \{"tools": [...]\}, "error": null\}} can trick a proxy checking key presence (\texttt{obj.contains\_key("error")}) into bypassing \texttt{tools/list} filtering and leaking ungranted tool schemas to the model. \emph{Proposed defense:} Fail closed whenever both \texttt{result} and \texttt{error} keys appear in the same JSON-RPC response, regardless of whether either value is \texttt{null}.
+  \item \textbf{FIFO Cancellation-Table Eviction:} Proxies typically track in-flight request IDs in a bounded map to correlate \texttt{notifications/cancelled} and responses. If the table uses FIFO eviction when full, a malicious agent can flood dummy requests to evict a pending authorization or cancellation record, desynchronizing response filtering or letting a cancelled call pass uninspected. \emph{Proposed defense:} Enforce fail-closed backpressure---rejecting new requests with a structured overload error once the in-flight table reaches capacity rather than silently evicting live entries.
+\end{enumerate}
+
+\subsection{Attack 5: SQLite Ledger Integrity Attacks}
+
+A local adversary with write access to the SQLite database file can mount four structural tampering attacks that evade naive hash-chain verification:
+\begin{enumerate}[leftmargin=*,itemsep=1pt]
+  \item \textbf{Tail Deletion (Intact Local HWM):} Deleting the most recent rows from \texttt{receipts} leaves the surviving prefix's SHA-256 chain internally consistent. \emph{Defense:} \texttt{receipts.seq} uses \texttt{INTEGER PRIMARY KEY AUTOINCREMENT}, and \texttt{audit.rs} verifies exact equality between the contiguous row count and the high-water-mark entry in \texttt{sqlite\_sequence} (accepting an absent \texttt{receipts} row---or absent \texttt{sqlite\_sequence} table---when the receipt count is zero, while rejecting a missing table/row whenever receipts exist and always rejecting NULL, mismatched, or duplicate \texttt{sqlite\_sequence} rows), in addition to reconciling \texttt{quota\_calls} exactly against persisted \texttt{Permit} receipts---catching local tail deletions whenever the local \texttt{sqlite\_sequence} high-water mark remains intact.
+  \item \textbf{Rogue SQLite Triggers:} Injecting \texttt{CREATE TRIGGER wipe\_quotas AFTER INSERT ON receipts BEGIN UPDATE quota\_calls SET calls = 0; END;} turns the gate's own next \texttt{record\_denial} or \texttt{evaluate\_and\_record} write into a quota reset weapon. \emph{Defense:} \texttt{SqliteLedger::open()} invokes \texttt{initialize\_or\_verify\_schema()} inside a \texttt{BEGIN IMMEDIATE} transaction \emph{before} any write executes, enumerating every row of \texttt{sqlite\_master} and rejecting any unexpected table, index, trigger, or view.
+  \item \textbf{\texttt{COLLATE NOCASE} DDL Substitution:} Rebuilding \texttt{quota\_sums} with \texttt{unit TEXT NOT NULL COLLATE NOCASE} preserves primary-key presence and valid rows, yet allows SQLite to collapse \texttt{"USD"} and \texttt{"usd"} differently from Rust's case-sensitive \texttt{BTreeMap}. \emph{Defense:} \texttt{schema.rs} compares the normalized \texttt{sql} column of every table and index in \texttt{sqlite\_master} for exact string equality against the canonical DDL constants on both \texttt{open()} and \texttt{verify\_integrity()}.
+  \item \textbf{Index/Table B-Tree Desynchronization:} Flipping a single byte inside the leaf page of \texttt{idx\_receipts\_actor\_key} while leaving the \texttt{receipts} table B-tree untouched causes a full table scan (and \texttt{PRAGMA quick\_check}) to succeed while indexed queries return corrupted or missing records. \emph{Defense:} \texttt{verify\_schema\_integrity()} executes full \texttt{PRAGMA integrity\_check}, which verifies index-to-table B-tree parity and catches index-only tampering on both \texttt{open()} and read-only \texttt{audit\_snapshot()}.
+\end{enumerate}
+As noted in Section~\ref{sec:ledger}, these local checks verify internal consistency against the invariants enforced on the single database file: hash-chain-breaking receipt-row edits that fail to preserve valid \texttt{receipt\_hash}/\texttt{prev\_receipt\_hash} links (via hash-chain replay), \texttt{quota\_calls} mismatches against persisted \texttt{Permit} receipts, local tail deletion under an intact \texttt{sqlite\_sequence} high-water mark, DDL/trigger substitution, index/table B-tree desynchronization, and malformed, negative, non-canonical, or orphaned \texttt{quota\_sums} rows. Two local-writer boundaries remain outside single-file verification. First, because \texttt{DecisionReceipt} omits per-call sum deltas (\texttt{VerifiedFacts}), an in-place edit that replaces an existing \texttt{quota\_sums.total} with another canonical non-negative \texttt{Decimal} on a mandate with persisted permits does not change the receipt tip and is not caught by \texttt{audit\_snapshot()}. Second, because local hash-chain replay checks only internal consistency and \texttt{sqlite\_sequence} shares one SQLite database file with \texttt{receipts}, a local filesystem adversary can perform a coherent in-place rewrite of one or more receipt rows (recomputing \texttt{receipt\_hash} and \texttt{prev\_receipt\_hash} through the tip and updating quota tables consistently), roll back the entire database file to a coherent earlier prefix (or jointly truncate \texttt{receipts}, quota tables, and \texttt{sqlite\_sequence}), or replace the database wholesale with a freshly generated, internally self-consistent history; detecting a coherent in-place rewrite, whole-database rollback, or wholesale replacement therefore requires an independently retained external commitment covering the edited receipt or tip, such as an externally pinned \texttt{receipt\_hash} (and \texttt{seq}) or an append-only transparency log.
+
+% ============================================================================
+\section{Implementation, Verification, and Reproducibility}
+\label{sec:impl}
+
+The reference implementation is maintained as a four-crate Rust workspace (Edition~2021, MSRV~1.88, pinned toolchain~1.98.0) dual-licensed under \texttt{MIT OR Apache-2.0} at \url{https://github.com/feedback-loop-ai/handfest}. Table~\ref{tab:crates} reports exact line counts, test counts, and external dependencies measured directly at commit \texttt{60f105e}.
+
+\begin{table*}[t]
+\centering
+\caption{Workspace inventory of \texttt{handfest} at commit \texttt{60f105e}, partitioned by directory (\texttt{src/}: 8,383 LOC; \texttt{tests/}: 6,297 LOC; 116 passing tests spanning inline unit tests and integration tests). Because \texttt{src/} includes 1,277 lines of embedded \texttt{\#[cfg(test)]} unit tests (10 in \texttt{core}, 1,203 in \texttt{ledger}, and 64 in \texttt{cli}), the workspace totals 7,106 non-test LOC and 7,574 combined test-source LOC.}
+\label{tab:crates}
+\scriptsize
+\begin{tabular}{@{}L{2.5cm}rrrcl@{}}
+\toprule
+\textbf{Crate} & \textbf{\texttt{src/} LOC} & \textbf{\texttt{tests/} LOC} & \textbf{Tests} & \textbf{\texttt{no\_std}} & \textbf{External Dependencies (\texttt{Cargo.toml})} \\
+\midrule
+\texttt{handfest-core}    & 4,031 & 2,489 &  38 & Yes & \texttt{sha2} (0.10, \texttt{default-features = false}) \\
+\texttt{handfest-anchors} &   483 &   478 &   6 & No  & \texttt{ed25519-dalek}, \texttt{rand\_core}, \texttt{hex}, \texttt{serde}, \texttt{serde\_json} \\
+\texttt{handfest-ledger}  & 2,921 & 2,585 &  65 & No  & \texttt{rusqlite} (0.32, \texttt{bundled}), \texttt{serde}, \texttt{serde\_json} \\
+\texttt{handfest-cli}     &   948 &   745 &   7 & No  & \texttt{clap}, \texttt{serde}, \texttt{serde\_json} \\
+\midrule
+\textbf{Total}            & \textbf{8,383} & \textbf{6,297} & \textbf{116} & --- & Permissive-only (\texttt{deny.toml}), zero \texttt{unsafe} \\
+\bottomrule
+\end{tabular}
+\end{table*}
+
+\paragraph{Engineering Gates vs.\ House-Rules Testing Standard.}
+All crates inherit workspace-wide lints enforcing \texttt{\#![forbid(unsafe\_code)]}, \texttt{unreachable\_pub = "warn"}, and explicit \texttt{\#[expect(..., reason = "...")]} annotations instead of silent \texttt{\#[allow(...)]}, while \texttt{clippy.toml} caps functions at $\le 100$ lines, nesting depth $\le 5$, and parameters $\le 7$. The observed automated gates passing at commit \texttt{60f105e} are \texttt{cargo fmt}, \texttt{cargo clippy} (\texttt{-D warnings}), and \texttt{cargo test} (116 passing tests). Separately, \texttt{deny.toml} specifies permissive-only license rules and the strictly one-way crate-wrapper bans checked by \texttt{cargo deny check} (not run automatically by \texttt{cargo build}/\texttt{clippy}/\texttt{test}), and \texttt{docs/house-rules.md} sets an engineering standard targeting 100\% line and branch coverage alongside exact-variant negative tests and mutation checks on security guards. Neither line/branch coverage measurement nor universal automated mutation testing is executed as part of the recorded workspace gate run (which verifies the 116 passing tests without producing a coverage report), and individual test assertions remain to be tightened---for instance, while \texttt{anchors\_tests.rs} binds \texttt{AnchorError::UnsupportedAssurance} in its dedicated assurance-elevation test, its separate envelope-payload mutation test asserts \texttt{verify\_ed25519(\&bad\_assurance)\allowbreak .is\_err()}, which accepts any verification error (including a later signature failure).
+
+\paragraph{Performance Posture and Reproducibility.}
+All core lattice checks and chain evaluations operate strictly in memory with the polynomial worst-case bounds derived in Section~\ref{sec:decidability}---$O(1)$ for an empty chain ($|L|=0$) and $O\big(T_{\mathrm{req}} + \max(|L|-1, 0)\,T_{\mathrm{sub}} + |L|\,T_{\mathrm{eval}}\big)$ for non-empty input chains $|L| \ge 1$ (with $|L| \le h_{\mathrm{root}} + 1$ once attenuation succeeds) in \texttt{evaluate\_chain} (covering one-time request validation, per-hop \texttt{subsumes} including \texttt{child.validate()}, empty-glob- and empty-\texttt{resource\_id}-safe selector matching in $O((|g|_{\max}+1)(|r|_{\max}+1))$, surviving child \texttt{IN}-set scans, two-level \texttt{QuotaSnapshot} lookups, and runtime \texttt{IN} kind-check scans), with per-predicate entailment bounded by $O\big((S_{c,\max}(1 + \log(|P_{\max}|+1)) + |P_{\max}|\log(|P_{\max}|+1))\,k_{\max}\big)$---with zero external solver overhead. Rather than reporting uncalibrated ad-hoc timings, we leave a full Criterion micro-benchmark suite across chain depths, predicate shapes, and signature algorithms as reproducible future work. Given a locally cached Rust~1.98.0 toolchain (\texttt{rust-toolchain.toml}) and dependency cache matching \texttt{Cargo.lock}, the workspace gates can be reproduced strictly offline at commit \texttt{60f105e} with:
+\begin{lstlisting}
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets \
+  --locked --offline -- -D warnings
+cargo test --workspace --locked --offline
+\end{lstlisting}
+
+% ============================================================================
+\section{Limitations and Future Work}
+\label{sec:limitations}
+
+Several deliberate scope boundaries remain open for subsequent slices of the \texttt{handfest} roadmap (\texttt{specs/architecture.md}):
+
+\begin{itemize}[leftmargin=*,itemsep=2pt]
+  \item \textbf{Revocation and Status Lists:} At commit \texttt{60f105e}, \texttt{handfest-core::gate::authorize} accepts no revocation-status input and therefore cannot withdraw an already-issued mandate before expiry. Today, deployments limit exposure windows by issuing short envelope validity intervals (\texttt{[valid\_from, valid\_until)}), tight \texttt{WHERE context.time} bounds, and ephemeral leaf mandates. Pre-expiry revocation---essential for long-lived root mandates such as corporate standing powers of attorney---is future work via offline-verifiable revocation checks (e.g., W3C Bitstring Status Lists or signed CRL snapshots) supplied as pure inputs to \texttt{handfest-core}.
+  \item \textbf{Multi-Anchor Verifier Modules and Consumer Dispatch:} Implementing additive \texttt{AnchorVerifier} modules in \texttt{handfest-anchors} for WebAuthn Passkeys~\cite{w3c_webauthn2}, EIP-712 wallets~\cite{eip712}, EUDI \texttt{SD-JWT VC}~\cite{ietf_sd_jwt_vc} / \texttt{mdoc}~\cite{eudi_arf}, and ETSI TS~119~612 EU LOTL / JAdES QES~\cite{etsi_ts_119_612}, paired with an \texttt{AnchorRegistry} dispatcher and consumer-side adapter selection in \texttt{handfest-cli} and \texttt{handfest-mcp}.
+  \item \textbf{MCP Proxy Implementation (\texttt{handfest-mcp}):} Completing the Slice~2 stdio JSON-RPC proxy and Brokkr capability broker integration implementing all four wire-framing defenses from Section~\ref{sec:threats} alongside typed \texttt{ToolPolicyMap} configuration.
+  \item \textbf{Enterprise Policy Bridge (\texttt{handfest-cedar}):} Composing \texttt{handfest}'s per-delegation WYSIWYS mandates with an optional Cedar~\cite{cutler2024cedar} organizational guardrail engine so enterprises can enforce global invariants alongside unilateral delegations.
+  \item \textbf{External Ledger Anchoring, Shared Distributed Quotas, and Dependency Slimming:} Adding external tip-hash checkpointing (to detect wholesale ledger replacement), shared transactional ledger backends (e.g., Postgres) for multi-host anti-splitting conservation, an append-only JSONL \texttt{ReceiptLedger} requiring zero C/SQLite dependencies, and progressive elimination of thin utility crates (\texttt{hex}, thin CLI/JSON glue) per \texttt{docs/house-rules.md}.
+  \item \textbf{Mechanized Verification and Benchmarks:} Formalizing Theorem~\ref{thm:bijection} and Theorem~\ref{thm:decidability} in a proof assistant or bounded model checker (e.g., Kani/Lean) and publishing a reproducible Criterion latency/throughput benchmark suite.
+\end{itemize}
+
+% ============================================================================
+\section{Conclusion}
+\label{sec:conclusion}
+
+Safe deployment of autonomous AI agents requires replacing ambient secrets and stochastic guardrails with cryptographically grounded, human-legible, and deterministically enforceable delegation. \textbf{Executable Ricardian Mandates} unify Ian Grigg's WYSIWYS Bow-Tie principle with an SMT-free monotonic policy meet-semilattice and acyclic delegation refinement, chain-wide anti-splitting quota accounting, pluggable trust anchors, and tamper-evident rollback-journal audit ledgers. Through the \texttt{handfest} reference implementation, we demonstrate that an entire deterministic authorization core can live in pure \texttt{\#![no\_std]} Rust with zero unsafe code, providing a practical foundation for auditable, legally legible authority vesting across humans, organizations, services, and AI agents.
+
+\bibliographystyle{plain}
+\bibliography{references}
+
+\end{document}
