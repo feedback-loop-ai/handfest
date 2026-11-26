@@ -152,17 +152,11 @@ def validate_json_tree(root, code: str, ctx: str) -> None:
         if type(cur) is str:
             if has_surrogate(cur):
                 raise HookError(code, f"{ctx}: lone UTF-16 surrogate in JSON string")
-        elif isinstance(cur, dict):
+        elif isinstance(cur, (dict, list)):
             next_depth = depth + 1
             if next_depth > MAX_JSON_DEPTH:
                 raise HookError(code, f"{ctx}: JSON nesting depth exceeds {MAX_JSON_DEPTH}")
-            for v in cur.values():
-                stack.append((v, next_depth))
-        elif isinstance(cur, list):
-            next_depth = depth + 1
-            if next_depth > MAX_JSON_DEPTH:
-                raise HookError(code, f"{ctx}: JSON nesting depth exceeds {MAX_JSON_DEPTH}")
-            for item in cur:
+            for item in (cur.values() if isinstance(cur, dict) else cur):
                 stack.append((item, next_depth))
 
 

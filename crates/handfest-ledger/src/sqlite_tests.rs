@@ -620,11 +620,11 @@ fn reader_only_deferred_fd_child_helper() {
     assert_eq!(deferred_fd_count(), 0);
 
     let (verified, maybe_rec) = run_audit_tx(&ro1.conn, Some(&req.actor_key), || {
-        // 1. Fresh raw header open on a second DB while active_writers == 0 retains its fd while
-        //    ro_b is live, then prunes db_b's entry on drop (counts[db_b] == 0 && active_writers == 0).
+        // 1. Fresh raw header open on an unrelated DB while active_writers == 0 closes immediately
+        //    before open_conn (never occupying deferred_fds for an uncounted inode).
         {
             let ro_b = SqliteLedger::open_read_only(&db_b).unwrap();
-            assert_eq!(deferred_fd_count(), 1);
+            assert_eq!(deferred_fd_count(), 0);
             assert_eq!(ro_b.verify_integrity().unwrap(), 1);
         }
         assert_eq!(active_writer_count(), 0);

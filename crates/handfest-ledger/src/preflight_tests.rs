@@ -239,13 +239,19 @@ fn deferred_fds_deduplicate_by_inode_read_live_contents_and_clear_only_when_all_
     ));
     assert_eq!(reg.lock().unwrap().deferred_fds.len(), 2);
 
-    // Dropping writer while ro2 is STILL active MUST NOT clear deferred_fds.
+    // Dropping the last writer while ro2 is STILL active prunes uncounted inodes (canonical_mut)
+    // while retaining ro2's active inode (canonical_moved) so ro2's POSIX lock is never dropped.
     drop(writer_guard);
     {
+        use std::os::unix::fs::MetadataExt;
+        let moved_meta = fs::metadata(&canonical_moved).unwrap();
         let state = reg.lock().unwrap();
         assert_eq!(state.active_writers, 0);
-        assert!(!state.counts.is_empty());
-        assert_eq!(state.deferred_fds.len(), 2);
+        assert_eq!(state.counts.len(), 1);
+        assert_eq!(state.deferred_fds.len(), 1);
+        assert!(state
+            .deferred_fds
+            .contains_key(&(moved_meta.dev(), moved_meta.ino())));
     }
 
     // Only dropping the very last handle (ro2) clears deferred_fds.
@@ -564,10 +570,21 @@ fn reader_only_deferred_fds_prune_on_last_inode_drop_and_clear_on_final_reader_d
         assert!(state.deferred_fds.is_empty());
     }
 
-    // Opening db_b while ro_a is active defers db_b's fd; dropping one of two readers on db_b
-    // keeps it (counts[db_b] == 1), and dropping the last reader on db_b prunes it while ro_a lives.
+    // With active_writers == 0, opening an unrelated db_b, probing bad_c, or probing 70 distinct
+    // failed headers and rollback journals must NOT accumulate uncounted entries in deferred_fds.
     let ((), ro_b1) = open_read_only_guarded_in(reg, &db_b, |_| Ok(())).unwrap();
     let ((), ro_b2) = open_read_only_guarded_in(reg, &db_b, |_| Ok(())).unwrap();
+    assert!(reg.lock().unwrap().deferred_fds.is_empty());
+
+    // Hard-linked journal probe on tracked inode db_b MUST defer db_b's fd while db_b is active,
+    // keep it when ro_b1 drops (counts[db_b] == 1), and prune it when ro_b2 drops while ro_a lives.
+    let db_b_hl_journal = dir.path().join("hl_db_b.sqlite-journal");
+    fs::hard_link(&db_b, &db_b_hl_journal).unwrap();
+    assert!(matches!(
+        probe_rollback_journal_once(reg, &db_b_hl_journal),
+        Err(LedgerError::Integrity(_))
+    ));
+    fs::remove_file(&db_b_hl_journal).unwrap();
     assert_eq!(reg.lock().unwrap().deferred_fds.len(), 1);
     drop(ro_b1);
     assert_eq!(reg.lock().unwrap().deferred_fds.len(), 1);
@@ -579,12 +596,31 @@ fn reader_only_deferred_fds_prune_on_last_inode_drop_and_clear_on_final_reader_d
         assert!(state.deferred_fds.is_empty());
     }
 
-    // An uncounted failed raw probe while ro_a is active stays deferred until ro_a drops.
+    // 70 distinct failed header probes + 70 distinct journal probes while ro_a is active must NOT
+    // retain uncounted fds or exhaust MAX_DEFERRED_FDS (64), leaving subsequent valid audits green.
     assert!(matches!(
         open_read_only_guarded_in(reg, &bad_c, |_| Ok(())),
         Err(LedgerError::Integrity(_))
     ));
-    assert_eq!(reg.lock().unwrap().deferred_fds.len(), 1);
+    for i in 0..70 {
+        let bad_i = dir.path().join(format!("bad_hdr_{i}.sqlite"));
+        fs::write(&bad_i, [0u8; SQLITE_HEADER_LEN]).unwrap();
+        let bad_i = fs::canonicalize(&bad_i).unwrap();
+        assert!(matches!(
+            open_read_only_guarded_in(reg, &bad_i, |_| Ok(())),
+            Err(LedgerError::Integrity(_))
+        ));
+
+        let jrnl_i = dir.path().join(format!("probe_{i}.sqlite-journal"));
+        fs::write(&jrnl_i, [0u8; ROLLBACK_JOURNAL_HDR_LEN]).unwrap();
+        assert_eq!(
+            probe_rollback_journal_once(reg, &jrnl_i).unwrap(),
+            JournalProbe::Clean
+        );
+    }
+    assert!(reg.lock().unwrap().deferred_fds.is_empty());
+    let ((), ro_after) = open_read_only_guarded_in(reg, &db_b, |_| Ok(())).unwrap();
+    drop(ro_after);
 
     drop(ro_a);
     {

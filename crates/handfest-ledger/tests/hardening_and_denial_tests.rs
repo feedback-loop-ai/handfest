@@ -1409,6 +1409,28 @@ fn open_read_only_sequential_70_ledgers_helper() {
     let ro_a = SqliteLedger::open_read_only(&ledger_a).unwrap();
     assert_eq!(ro_a.verify_integrity().unwrap(), 1);
 
+    // 1. 70 consecutive failed header probes (no guard created/dropped) must never exhaust the
+    //    64-descriptor cap while ro_a stays open.
+    for i in 0..70 {
+        let bad_path = dir.join(format!("bad_{i}.sqlite"));
+        assert!(matches!(
+            SqliteLedger::open_read_only(&bad_path),
+            Err(LedgerError::Integrity(_))
+        ));
+    }
+
+    // 2. 70 consecutive rollback-journal probes (no guard created/dropped) must never exhaust the
+    //    64-descriptor cap while ro_a stays open.
+    for i in 0..70 {
+        let bad_j_db = dir.join(format!("bad_journal_db_{i}.sqlite"));
+        assert!(matches!(
+            SqliteLedger::open_read_only(&bad_j_db),
+            Err(LedgerError::Integrity(ref m)) if m.contains("SQLite database header")
+        ));
+    }
+
+    // 3. 70 sequential valid read-only audits (each with a distinct clean rollback journal) must
+    //    all succeed while ro_a stays open.
     for i in 0..70 {
         let db_path = dir.join(format!("db_{i}.sqlite"));
         let meta = fs::metadata(&db_path).unwrap();
@@ -1432,9 +1454,21 @@ fn open_read_only_sequential_audits_prune_deferred_fds_while_reader_open() {
     let dir = TempDir::new().unwrap();
     let ledger_a = dir.path().join("ledger_a.sqlite");
     init_single_permit_ledger(&ledger_a);
+    let mut sqlite_magic_journal = [0u8; 28];
+    sqlite_magic_journal[..16].copy_from_slice(b"SQLite format 3\0");
     for i in 0..70 {
+        let bad_path = dir.path().join(format!("bad_{i}.sqlite"));
+        fs::write(&bad_path, [0u8; 100]).unwrap();
+        let bad_j_db = dir.path().join(format!("bad_journal_db_{i}.sqlite"));
+        fs::copy(&ledger_a, &bad_j_db).unwrap();
+        let bad_j = dir
+            .path()
+            .join(format!("bad_journal_db_{i}.sqlite-journal"));
+        fs::write(&bad_j, sqlite_magic_journal).unwrap();
         let db_path = dir.path().join(format!("db_{i}.sqlite"));
         fs::copy(&ledger_a, &db_path).unwrap();
+        let journal_path = dir.path().join(format!("db_{i}.sqlite-journal"));
+        fs::write(&journal_path, [0u8; 28]).unwrap();
     }
 
     // Run in an isolated child test process so no parallel writer test in this binary can hold

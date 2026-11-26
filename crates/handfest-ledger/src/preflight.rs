@@ -185,10 +185,17 @@ impl ActiveHandleRegistry {
         self.deferred_fds.values().map(Vec::len).sum()
     }
 
-    fn maybe_clear_deferred_fds(&mut self) {
+    #[cfg(unix)]
+    fn should_defer_inode(&self, (dev, ino): (u64, u64)) -> bool {
+        self.active_writers > 0 || self.counts.contains_key(&FileIdentity { dev, ino })
+    }
+
+    fn prune_uncounted_deferred_fds(&mut self) {
         #[cfg(unix)]
-        if !self.has_active_handles() {
-            self.deferred_fds.clear();
+        if self.active_writers == 0 {
+            let counts = &self.counts;
+            self.deferred_fds
+                .retain(|&(dev, ino), _| counts.contains_key(&FileIdentity { dev, ino }));
         }
     }
 
@@ -204,7 +211,7 @@ impl ActiveHandleRegistry {
 
     #[cfg(unix)]
     fn maybe_defer_fd(&mut self, key: (u64, u64), file: File) {
-        if self.has_active_handles() {
+        if self.should_defer_inode(key) {
             self.deferred_fds.entry(key).or_default().push(file);
         }
     }
@@ -221,7 +228,7 @@ impl ActiveHandleRegistry {
 
     fn decrement_writer(&mut self) {
         self.active_writers = self.active_writers.saturating_sub(1);
-        self.maybe_clear_deferred_fds();
+        self.prune_uncounted_deferred_fds();
     }
 }
 
@@ -275,15 +282,15 @@ impl Drop for PendingWriterGuard {
 /// in this process, keyed by [`FileIdentity`].
 ///
 /// While `counts[id] > 0`, `open_read_only_guarded` skips raw `File::open` on that inode so POSIX
-/// `close()` never drops in-process `fcntl` locks. On Unix, while any handle is active
-/// (`active_writers > 0 || !counts.is_empty()`), raw header/journal `File` handles are deferred in
-/// `deferred_fds` by `(st_dev, st_ino)` (reusing the first retained `File` via `SeekFrom::Start(0)`
-/// and appending duplicates). When `counts[id]` reaches `0` and `active_writers == 0`, `id`'s entry
-/// is pruned so a long-lived reader never accumulates unrelated deferred fds. When
-/// `active_writers > 0`, `deferred_fds` is intentionally retained until `active_writers == 0 &&
-/// counts.is_empty()`: SQLite's `unixClose` defers closing its own fd into `pUnused` when another
-/// connection shares the inode, so dropping an out-of-band `File` while an ABA-renamed writer may
-/// hold a POSIX `fcntl` lock on that inode would release the writer's lock.
+/// `close()` never drops in-process `fcntl` locks. On Unix, raw header/journal `File` handles are
+/// deferred in `deferred_fds` by `(st_dev, st_ino)` (reusing the first retained `File` via
+/// `SeekFrom::Start(0)` and appending duplicates) whenever `active_writers > 0` or the probed inode
+/// is currently tracked in `counts`. With `active_writers == 0`, uncounted header/journal probes
+/// close immediately and dropping any handle prunes `deferred_fds` entries absent from `counts` so
+/// a long-lived reader never exhausts the fd cap. With `active_writers > 0`, all `deferred_fds` are
+/// retained until `active_writers == 0`: SQLite's `unixClose` defers closing its own fd into
+/// `pUnused` when another connection shares the inode, so dropping an out-of-band `File` while an
+/// ABA-renamed writer may hold a POSIX `fcntl` lock on that inode would release the writer's lock.
 pub(crate) struct ActiveHandleGuard {
     registry: &'static Mutex<ActiveHandleRegistry>,
     id: FileIdentity,
@@ -293,25 +300,17 @@ pub(crate) struct ActiveHandleGuard {
 impl Drop for ActiveHandleGuard {
     fn drop(&mut self) {
         let mut state = lock_registry(self.registry);
-        let mut last_for_id = false;
         if let Some(count) = state.counts.get_mut(&self.id) {
             *count -= 1;
             if *count == 0 {
                 state.counts.remove(&self.id);
-                last_for_id = true;
             }
         }
         if self.is_writer {
             state.decrement_writer();
         } else {
-            state.maybe_clear_deferred_fds();
+            state.prune_uncounted_deferred_fds();
         }
-        #[cfg(unix)]
-        if last_for_id && state.active_writers == 0 {
-            state.deferred_fds.remove(&(self.id.dev, self.id.ino));
-        }
-        #[cfg(not(unix))]
-        let _ = last_for_id;
     }
 }
 
