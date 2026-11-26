@@ -1003,6 +1003,66 @@ fn cached_rollback_journal_fd_rewinds_to_start_on_repeated_clean_probes() {
 }
 
 #[cfg(unix)]
+#[test]
+fn cached_rollback_journal_probe_succeeds_at_deferred_fd_ceiling() {
+    static REG: OnceLock<Mutex<ActiveHandleRegistry>> = OnceLock::new();
+    let reg = REG.get_or_init(|| Mutex::new(ActiveHandleRegistry::default()));
+
+    let dir = TempDir::new().unwrap();
+    let db_a = write_valid_header_file(&dir.path().join("db_a.sqlite"));
+    let db_b = write_valid_header_file(&dir.path().join("db_b.sqlite"));
+    let db_new = write_valid_header_file(&dir.path().join("db_new.sqlite"));
+    let journal = dir.path().join("cached_db.sqlite-journal");
+    fs::write(&journal, [0u8; ROLLBACK_JOURNAL_HDR_LEN]).unwrap();
+
+    let ((), ro_a) = open_read_only_guarded_in(reg, &db_a, |_| Ok(())).unwrap();
+    let ((), w_b) = open_writable_guarded_in(reg, &db_b, || Ok(())).unwrap();
+
+    // Cache the clean rollback journal fd while a writer is active (1 of 64).
+    assert_eq!(
+        probe_rollback_journal_once(reg, &journal).unwrap(),
+        JournalProbe::Clean
+    );
+    assert_eq!(reg.lock().unwrap().total_deferred_fds(), 1);
+
+    // Fill the remaining 63 slots to reach MAX_DEFERRED_FDS (64), then drop the writer.
+    for i in 1..MAX_DEFERRED_FDS {
+        let fill = write_valid_header_file(&dir.path().join(format!("jrnl_cap_fill_{i}.sqlite")));
+        let ((), ro_fill) = open_read_only_guarded_in(reg, &fill, |_| Ok(())).unwrap();
+        drop(ro_fill);
+    }
+    assert_eq!(reg.lock().unwrap().total_deferred_fds(), MAX_DEFERRED_FDS);
+    drop(w_b);
+    assert_eq!(reg.lock().unwrap().active_writers, 0);
+
+    // Trigger an inode-swap race to push retained descriptors to the hard ceiling (65).
+    {
+        let mut state = reg.lock().unwrap();
+        let res = inspect_sqlite_header_with_opener(&mut state, &db_new, |path| {
+            fs::remove_file(path)?;
+            fs::hard_link(&db_a, path)?;
+            open_no_follow_read_only(path)
+        });
+        assert_deferred_fd_cap_err(res);
+        assert_eq!(state.total_deferred_fds(), MAX_DEFERRED_FDS + 1);
+    }
+
+    // Probing the cached clean rollback journal at 65 MUST hit the cache before capacity checks,
+    // returning Clean with zero additional raw opens and an unchanged descriptor count.
+    let calls_before = raw_open_calls();
+    let probe = probe_rollback_journal_once(reg, &journal).unwrap();
+    assert_eq!(probe, JournalProbe::Clean);
+    assert_eq!(raw_open_calls(), calls_before);
+    assert_eq!(
+        reg.lock().unwrap().total_deferred_fds(),
+        MAX_DEFERRED_FDS + 1
+    );
+
+    drop(ro_a);
+    assert!(reg.lock().unwrap().deferred_fds.is_empty());
+}
+
+#[cfg(unix)]
 fn assert_deferred_fd_cap_err<T>(res: Result<T, LedgerError>) {
     assert!(matches!(
         res,

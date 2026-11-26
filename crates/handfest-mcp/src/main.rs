@@ -248,7 +248,7 @@ fn build_proxy(cli: &Cli) -> Result<McpProxy<RuntimeClock, SqliteLedger>, Startu
     })?;
 
     let policy_map =
-        handfest_mcp::mapping::load_policy_map_file(&cli.policy_map).map_err(|err| match err {
+        handfest_mcp::ToolPolicyMap::from_file(&cli.policy_map).map_err(|err| match err {
             MappingError::Io(msg) => {
                 StartupError::PolicyIo(format!("failed to load --policy-map: {msg}"))
             }

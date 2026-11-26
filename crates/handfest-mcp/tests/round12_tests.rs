@@ -473,7 +473,7 @@ fn handfest_mcp_emits_chain_invalid_for_broken_attenuation() {
 }
 
 #[test]
-fn load_policy_map_file_public_api_loads_valid_and_rejects_missing_file() {
+fn tool_policy_map_from_file_public_api_loads_valid_and_rejects_missing_file() {
     let dir = tempfile::TempDir::new().unwrap();
     let policy_path = dir.path().join("policy.json");
     std::fs::write(
@@ -490,14 +490,28 @@ fn load_policy_map_file_public_api_loads_valid_and_rejects_missing_file() {
     )
     .unwrap();
 
-    let loaded = handfest_mcp::mapping::load_policy_map_file(&policy_path).unwrap();
+    let loaded = handfest_mcp::ToolPolicyMap::from_file(&policy_path).unwrap();
     assert_eq!(loaded.tools.len(), 1);
+    loaded.validate().unwrap();
+    assert_eq!(
+        loaded.get("merge_pr").map(|p| p.action.as_str()),
+        Some("git.pr.merge")
+    );
+    let encoded = serde_json::to_string(&loaded).unwrap();
+    let decoded: handfest_mcp::ToolPolicyMap = serde_json::from_str(&encoded).unwrap();
+    assert_eq!(decoded, loaded);
+    let dup_err = serde_json::from_str::<handfest_mcp::ToolPolicyMap>(
+        r#"{"tools":{"a":{"action":"x.y","resource_kind":"r","static_resource_id":"1"},"a":{"action":"x.z","resource_kind":"r","static_resource_id":"2"}}}"#,
+    )
+    .unwrap_err();
+    assert!(dup_err.to_string().contains("duplicate key"));
+
     let compiled: handfest_mcp::CompiledPolicyMap = loaded.compile().unwrap();
     assert!(compiled.policy_map().get("merge_pr").is_some());
 
     let missing_path = dir.path().join("missing.json");
     assert!(matches!(
-        handfest_mcp::mapping::load_policy_map_file(&missing_path),
+        handfest_mcp::ToolPolicyMap::from_file(&missing_path),
         Err(handfest_mcp::MappingError::Io(ref msg)) if msg.contains("failed to read")
     ));
 }
