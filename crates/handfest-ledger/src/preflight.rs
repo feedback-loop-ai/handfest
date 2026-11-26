@@ -127,6 +127,38 @@ where
     Ok((conn, ActiveHandleGuard(id)))
 }
 
+/// Validates that an existing ledger path resolves to a regular SQLite rollback-journal file
+/// (`>= 100` bytes with valid header magic) and opens a writable connection while holding the
+/// process-local active-handle registry lock.
+///
+/// Never creates missing files; skips raw `File::open` header inspection when `refcount > 0` on
+/// the same inode so POSIX `fcntl` locks held by active handles in this process are preserved.
+pub(crate) fn open_existing_writable_guarded<T, F>(
+    path: &Path,
+    open_conn: F,
+) -> Result<(T, ActiveHandleGuard), LedgerError>
+where
+    F: FnOnce(&Path) -> Result<T, LedgerError>,
+{
+    let mut map = active_handles()
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
+    let canonical = fs::canonicalize(path).map_err(|err| {
+        LedgerError::Storage(format!(
+            "existing ledger '{}' not found or inaccessible: {err}",
+            path.display()
+        ))
+    })?;
+    let meta = stat_existing_regular_file(&canonical, "existing ledger")?;
+    let id = FileIdentity::from_metadata(&canonical, &meta);
+    if map.get(&id).copied().unwrap_or(0) == 0 {
+        inspect_sqlite_header(&canonical)?;
+    }
+    let conn = open_conn(&canonical)?;
+    *map.entry(id.clone()).or_insert(0) += 1;
+    Ok((conn, ActiveHandleGuard(id)))
+}
+
 /// Validates read-only sidecars and opens a read-only ledger connection while holding the
 /// process-local active-handle registry lock across the `refcount == 0` check, header inspection,
 /// SQLite open, and refcount increment.
@@ -140,14 +172,14 @@ pub(crate) fn open_read_only_guarded<T, F>(
 where
     F: FnOnce(&Path) -> Result<T, LedgerError>,
 {
-    stat_read_only_regular_file(canonical)?;
+    stat_existing_regular_file(canonical, "read-only ledger")?;
     check_wal_sidecar(&append_suffix(canonical, "-wal"))?;
     check_rollback_journal_sidecar(&append_suffix(canonical, "-journal"))?;
 
     let mut map = active_handles()
         .lock()
         .unwrap_or_else(PoisonError::into_inner);
-    let meta = stat_read_only_regular_file(canonical)?;
+    let meta = stat_existing_regular_file(canonical, "read-only ledger")?;
     let id = FileIdentity::from_metadata(canonical, &meta);
     if map.get(&id).copied().unwrap_or(0) == 0 {
         inspect_sqlite_header(canonical)?;
@@ -157,22 +189,22 @@ where
     Ok((conn, ActiveHandleGuard(id)))
 }
 
-fn stat_read_only_regular_file(canonical: &Path) -> Result<fs::Metadata, LedgerError> {
+fn stat_existing_regular_file(canonical: &Path, label: &str) -> Result<fs::Metadata, LedgerError> {
     let meta = fs::metadata(canonical).map_err(|err| {
         LedgerError::Integrity(format!(
-            "failed to stat read-only ledger '{}': {err}",
+            "failed to stat {label} '{}': {err}",
             canonical.display()
         ))
     })?;
     if !meta.is_file() {
         return Err(LedgerError::Integrity(format!(
-            "read-only ledger '{}' is not a regular file",
+            "{label} '{}' is not a regular file",
             canonical.display()
         )));
     }
     if meta.len() < SQLITE_HEADER_LEN as u64 {
         return Err(LedgerError::Integrity(format!(
-            "read-only ledger '{}' is truncated ({} bytes; minimum {SQLITE_HEADER_LEN})",
+            "{label} '{}' is truncated ({} bytes; minimum {SQLITE_HEADER_LEN})",
             canonical.display(),
             meta.len()
         )));

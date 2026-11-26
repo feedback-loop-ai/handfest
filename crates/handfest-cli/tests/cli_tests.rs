@@ -743,3 +743,162 @@ fn keygen_overwriting_world_readable_file_enforces_0600() {
         "overwritten secret key file must have 0o600 permissions, got {mode:#o}"
     );
 }
+
+fn minimal_empty_sqlite_db_bytes() -> Vec<u8> {
+    // Valid 4096-byte single-page SQLite 3 rollback-journal database with empty sqlite_master.
+    let mut page = vec![0u8; 4096];
+    page[0..16].copy_from_slice(b"SQLite format 3\0");
+    page[16..18].copy_from_slice(&4096u16.to_be_bytes());
+    page[18] = 1; // legacy rollback write version
+    page[19] = 1; // legacy rollback read version
+    page[21] = 64;
+    page[22] = 32;
+    page[23] = 32;
+    page[24..28].copy_from_slice(&1u32.to_be_bytes()); // file change counter
+    page[28..32].copy_from_slice(&1u32.to_be_bytes()); // database size = 1 page
+    page[40..44].copy_from_slice(&1u32.to_be_bytes()); // schema cookie
+    page[56..60].copy_from_slice(&1u32.to_be_bytes()); // text encoding = UTF-8
+    page[92..96].copy_from_slice(&1u32.to_be_bytes()); // version-valid-for
+    page[96..100].copy_from_slice(&3_045_000u32.to_be_bytes());
+    page[100] = 0x0d; // leaf table B-tree page (0 cells)
+    page[105..107].copy_from_slice(&4096u16.to_be_bytes()); // start of cell content area
+    page
+}
+
+#[test]
+fn check_require_existing_ledger_rejects_missing_zero_byte_and_empty_schema_and_accepts_initialized(
+) {
+    let dir = TempDir::new().unwrap();
+    let (root_key_path, root_key) = keygen_to(dir.path(), "root.key.json");
+    let (_agent_key_path, agent_key) = keygen_to(dir.path(), "agent.key.json");
+
+    let mandate_path = dir.path().join("root.hf");
+    fs::write(
+        &mandate_path,
+        format!(
+            concat!(
+                "HANDFEST v1\n",
+                "FROM human \"valentin\" (key: {root_key})\n",
+                "TO agent \"brokkr:agent\" (key: {agent_key})\n",
+                "DELEGATION max 0 hops\n",
+                "ALLOW git.pr.merge\n",
+                "ON repo \"feedback-loop-ai/*\"\n",
+                "LIMIT 2 calls\n",
+            ),
+            root_key = root_key,
+            agent_key = agent_key
+        ),
+    )
+    .unwrap();
+    let signed_path = dir.path().join("root.signed.json");
+    sign_to(
+        &mandate_path,
+        &root_key_path,
+        "2026-11-24T00:00:00Z",
+        "2026-11-26T00:00:00Z",
+        &signed_path,
+    );
+
+    let check_with_flag = |ledger: &Path, require_existing: bool| {
+        let mut args = vec![
+            "check",
+            "--ledger",
+            path_str(ledger),
+            "--chain",
+            path_str(&signed_path),
+            "--actor-key",
+            &agent_key,
+            "--action",
+            "git.pr.merge",
+            "--resource-kind",
+            "repo",
+            "--resource-id",
+            "feedback-loop-ai/handfest",
+            "--now",
+            "2026-11-24T12:00:00Z",
+        ];
+        if require_existing {
+            args.push("--require-existing-ledger");
+        }
+        run_raw(&args)
+    };
+
+    // 1. Missing ledger fails closed without creating the file.
+    let missing = dir.path().join("missing.sqlite");
+    let out = check_with_flag(&missing, true);
+    assert!(!out.status.success(), "missing ledger must fail closed");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("failed to open ledger"),
+        "expected ledger open error, got: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(!missing.exists(), "missing ledger must not be created");
+
+    // 2. 0-byte ledger fails closed without initializing tables.
+    let zero_byte = dir.path().join("zero.sqlite");
+    fs::write(&zero_byte, b"").unwrap();
+    let out = check_with_flag(&zero_byte, true);
+    assert!(!out.status.success(), "0-byte ledger must fail closed");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("failed to open ledger"),
+        "expected ledger open error, got: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        fs::metadata(&zero_byte).unwrap().len(),
+        0,
+        "0-byte ledger must not be initialized"
+    );
+
+    // 3. Empty-schema SQLite DB fails closed without initializing tables.
+    let empty_schema = dir.path().join("empty_schema.sqlite");
+    let empty_bytes = minimal_empty_sqlite_db_bytes();
+    fs::write(&empty_schema, &empty_bytes).unwrap();
+    let out = check_with_flag(&empty_schema, true);
+    assert!(
+        !out.status.success(),
+        "empty-schema SQLite DB must fail closed under --require-existing-ledger"
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("failed to open ledger"),
+        "expected ledger open error, got: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        fs::read(&empty_schema).unwrap(),
+        empty_bytes,
+        "empty-schema SQLite DB must not be modified or initialized"
+    );
+
+    // 4. Without --require-existing-ledger, that same empty-schema SQLite DB initializes cleanly,
+    //    and subsequent --require-existing-ledger checks succeed on the initialized ledger.
+    let init_out = check_with_flag(&empty_schema, false);
+    assert!(
+        init_out.status.success(),
+        "initial check without --require-existing-ledger failed: {}",
+        String::from_utf8_lossy(&init_out.stderr)
+    );
+    let init_json: Value = serde_json::from_slice(&init_out.stdout).unwrap();
+    assert_eq!(init_json["verdict"], "permit");
+
+    let existing_out = check_with_flag(&empty_schema, true);
+    assert!(
+        existing_out.status.success(),
+        "check with --require-existing-ledger on initialized ledger failed: {}",
+        String::from_utf8_lossy(&existing_out.stderr)
+    );
+    let existing_json: Value = serde_json::from_slice(&existing_out.stdout).unwrap();
+    assert_eq!(existing_json["verdict"], "permit");
+
+    let audit_out = run_ok(&[
+        "audit",
+        "--ledger",
+        path_str(&empty_schema),
+        "--actor-key",
+        &agent_key,
+    ]);
+    let audit_json: Value = serde_json::from_str(&audit_out).unwrap();
+    assert_eq!(audit_json["status"], "ok");
+    assert_eq!(audit_json["verified_receipts"], 2);
+    assert_eq!(audit_json["track_record"]["permits"], 2);
+}

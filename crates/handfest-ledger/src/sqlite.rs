@@ -15,9 +15,12 @@ use rusqlite::{
 };
 
 use crate::audit::{run_audit_tx, run_verified_track_record};
-use crate::preflight::{open_read_only_guarded, open_writable_guarded, ActiveHandleGuard};
+use crate::preflight::{
+    open_existing_writable_guarded, open_read_only_guarded, open_writable_guarded,
+    ActiveHandleGuard,
+};
 use crate::quotas::{apply_quota_updates, compute_quota_updates, load_quota_snapshot};
-use crate::schema::initialize_or_verify_schema;
+use crate::schema::{initialize_or_verify_schema, verify_existing_schema};
 use crate::{LedgerError, ReceiptLedger, TrackRecord};
 
 const BUSY_TIMEOUT_MS: u64 = 5_000;
@@ -47,20 +50,26 @@ impl SqliteLedger {
     /// disables SQLite URI parsing, and verifies `PRAGMA journal_mode = DELETE`.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, LedgerError> {
         let path = path.as_ref();
-        let raw_os = path.as_os_str();
-        if raw_os.is_empty() || raw_os == ":memory:" || is_sqlite_uri_path(raw_os) {
-            return Err(LedgerError::Storage(
-                "empty, ':memory:', or 'file:' URI path rejected by SqliteLedger::open; use open_in_memory() for ephemeral ledgers"
-                    .to_string(),
-            ));
-        }
+        validate_file_path(path, "SqliteLedger::open")?;
         let flags = OpenFlags::SQLITE_OPEN_READ_WRITE
             | OpenFlags::SQLITE_OPEN_CREATE
             | OpenFlags::SQLITE_OPEN_NO_MUTEX;
         let (conn, handle_guard) = open_writable_guarded(path, || {
             Connection::open_with_flags(path, flags).map_err(LedgerError::from)
         })?;
-        Self::init(conn, Some(handle_guard), "delete")
+        Self::init(conn, Some(handle_guard), "delete", true)
+    }
+
+    /// Opens an already-initialized rollback-journal SQLite ledger at `path` without creating
+    /// missing files or running `CREATE TABLE` on empty schemas.
+    pub fn open_existing(path: impl AsRef<Path>) -> Result<Self, LedgerError> {
+        let path = path.as_ref();
+        validate_file_path(path, "SqliteLedger::open_existing")?;
+        let flags = OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX;
+        let (conn, handle_guard) = open_existing_writable_guarded(path, |canonical| {
+            Connection::open_with_flags(canonical, flags).map_err(LedgerError::from)
+        })?;
+        Self::init(conn, Some(handle_guard), "delete", false)
     }
 
     /// Opens an existing SQLite ledger in strict read-only mode.
@@ -111,13 +120,14 @@ impl SqliteLedger {
     /// Opens an in-memory SQLite ledger for testing or ephemeral execution.
     pub fn open_in_memory() -> Result<Self, LedgerError> {
         let conn = Connection::open_in_memory()?;
-        Self::init(conn, None, "memory")
+        Self::init(conn, None, "memory", true)
     }
 
     fn init(
         conn: Connection,
         handle_guard: Option<ActiveHandleGuard>,
         expected_journal_mode: &str,
+        allow_create_schema: bool,
     ) -> Result<Self, LedgerError> {
         // Bind `Self` immediately so `conn` always drops before `_handle_guard` on any error.
         let mut ledger = Self {
@@ -127,6 +137,9 @@ impl SqliteLedger {
         ledger
             .conn
             .busy_timeout(Duration::from_millis(BUSY_TIMEOUT_MS))?;
+        if !allow_create_schema {
+            verify_existing_schema(&mut ledger.conn)?;
+        }
         let actual_mode: String =
             ledger
                 .conn
@@ -138,7 +151,9 @@ impl SqliteLedger {
         }
         ledger.conn.pragma_update(None, "synchronous", "FULL")?;
         ledger.conn.pragma_update(None, "foreign_keys", "ON")?;
-        initialize_or_verify_schema(&mut ledger.conn)?;
+        if allow_create_schema {
+            initialize_or_verify_schema(&mut ledger.conn)?;
+        }
         Ok(ledger)
     }
 
@@ -286,6 +301,16 @@ fn load_latest_receipt_hash(tx: &Transaction<'_>) -> Result<Option<MandateId>, L
             .map(Some)
             .map_err(|err| LedgerError::Integrity(format!("corrupt latest receipt_hash: {err}"))),
     }
+}
+
+fn validate_file_path(path: &Path, caller: &str) -> Result<(), LedgerError> {
+    let raw_os = path.as_os_str();
+    if raw_os.is_empty() || raw_os == ":memory:" || is_sqlite_uri_path(raw_os) {
+        return Err(LedgerError::Storage(format!(
+            "empty, ':memory:', or 'file:' URI path rejected by {caller}; use open_in_memory() for ephemeral ledgers"
+        )));
+    }
+    Ok(())
 }
 
 fn is_sqlite_uri_path(raw: &std::ffi::OsStr) -> bool {
@@ -492,7 +517,7 @@ mod tests {
     #[test]
     fn init_rejects_unexpected_journal_mode_and_corrupt_latest_hash() {
         let mem = Connection::open_in_memory().unwrap();
-        let err = SqliteLedger::init(mem, None, "delete").unwrap_err();
+        let err = SqliteLedger::init(mem, None, "delete", true).unwrap_err();
         assert!(matches!(err, LedgerError::Storage(_)));
         assert!(err.to_string().contains("ledger storage error"));
         assert!(std::error::Error::source(&err).is_none());

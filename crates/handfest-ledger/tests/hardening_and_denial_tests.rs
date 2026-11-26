@@ -1000,3 +1000,115 @@ fn corrupt_database_page_header_and_page_size_bytes_map_to_integrity_error() {
         "writable open on corrupt page-size bytes must return LedgerError::Integrity, got: {rw_err:?}"
     );
 }
+
+#[test]
+fn open_existing_rejects_missing_truncated_non_sqlite_and_empty_schema() {
+    let dir = TempDir::new().unwrap();
+
+    // 1. Missing file fails without creating a file.
+    let missing = dir.path().join("does_not_exist.sqlite");
+    assert!(matches!(
+        SqliteLedger::open_existing(&missing),
+        Err(LedgerError::Storage(_))
+    ));
+    assert!(
+        !missing.exists(),
+        "open_existing must never create a missing ledger file"
+    );
+
+    // 2. Empty / ':memory:' / 'file:' URI paths fail closed.
+    for bad in ["", ":memory:", "file:test.sqlite?mode=memory"] {
+        assert!(matches!(
+            SqliteLedger::open_existing(bad),
+            Err(LedgerError::Storage(_))
+        ));
+    }
+
+    // 3. 0-byte and <100-byte truncated files fail without initializing tables.
+    let zero_byte = dir.path().join("zero_byte.sqlite");
+    fs::write(&zero_byte, b"").unwrap();
+    assert!(matches!(
+        SqliteLedger::open_existing(&zero_byte),
+        Err(LedgerError::Integrity(_))
+    ));
+    assert_eq!(fs::metadata(&zero_byte).unwrap().len(), 0);
+
+    let short_file = dir.path().join("short.sqlite");
+    fs::write(&short_file, b"SQLite format 3\0short").unwrap();
+    assert!(matches!(
+        SqliteLedger::open_existing(&short_file),
+        Err(LedgerError::Integrity(_))
+    ));
+    assert_eq!(fs::read(&short_file).unwrap(), b"SQLite format 3\0short");
+
+    // 4. Non-SQLite >=100-byte file and directory paths fail closed.
+    let non_sqlite = dir.path().join("not_sqlite.bin");
+    let garbage = vec![b'X'; 256];
+    fs::write(&non_sqlite, &garbage).unwrap();
+    assert!(matches!(
+        SqliteLedger::open_existing(&non_sqlite),
+        Err(LedgerError::Integrity(_))
+    ));
+    assert_eq!(fs::read(&non_sqlite).unwrap(), garbage);
+    assert!(matches!(
+        SqliteLedger::open_existing(dir.path()),
+        Err(LedgerError::Integrity(_))
+    ));
+
+    // 5. Empty-schema SQLite DB (valid header, 0 rows in sqlite_master) fails without DDL.
+    let empty_sqlite = dir.path().join("empty_schema.sqlite");
+    {
+        let raw = Connection::open(&empty_sqlite).unwrap();
+        raw.execute_batch("VACUUM;").unwrap();
+    }
+    assert!(fs::metadata(&empty_sqlite).unwrap().len() >= 100);
+    assert!(matches!(
+        SqliteLedger::open_existing(&empty_sqlite),
+        Err(LedgerError::Integrity(_))
+    ));
+    let raw = Connection::open(&empty_sqlite).unwrap();
+    let table_count: i64 = raw
+        .query_row("SELECT count(*) FROM sqlite_master", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(
+        table_count, 0,
+        "open_existing must never create tables in an empty-schema SQLite DB"
+    );
+}
+
+#[test]
+fn open_existing_accepts_valid_initialized_ledger_and_persists_receipts() {
+    let dir = TempDir::new().unwrap();
+    let (vm, req, facts) = sum_and_calls_mandate();
+    let valid = dir.path().join("valid_initialized.sqlite");
+
+    {
+        let mut init_ledger = SqliteLedger::open(&valid).unwrap();
+        let (v1, _) = init_ledger
+            .evaluate_and_record(
+                std::slice::from_ref(&vm),
+                &req,
+                &facts,
+                ts("2026-11-24T18:00:00Z"),
+            )
+            .unwrap();
+        assert_eq!(v1, Verdict::Permit);
+    }
+
+    let mut existing = SqliteLedger::open_existing(&valid).unwrap();
+    assert_eq!(existing.verify_integrity().unwrap(), 1);
+    let (v2, _) = existing
+        .evaluate_and_record(
+            std::slice::from_ref(&vm),
+            &req,
+            &facts,
+            ts("2026-11-24T18:01:00Z"),
+        )
+        .unwrap();
+    assert_eq!(v2, Verdict::Permit);
+    assert_eq!(existing.verify_integrity().unwrap(), 2);
+
+    // Second open_existing while first handle is open exercises the refcount > 0 path cleanly.
+    let existing2 = SqliteLedger::open_existing(&valid).unwrap();
+    assert_eq!(existing2.verify_integrity().unwrap(), 2);
+}

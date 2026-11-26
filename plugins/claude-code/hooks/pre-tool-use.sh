@@ -1,4 +1,4 @@
-#!/usr/bin/env bash
+#!/bin/bash
 # Deterministic, fail-closed Claude Code PreToolUse hook for HANDFEST v1 mandates.
 #
 # Required env:
@@ -10,9 +10,9 @@
 # Optional env:
 #   HANDFEST_BIN                  Path or command name for `handfest` CLI (default: handfest)
 #   HANDFEST_NOW                  Fixed RFC 3339 UTC timestamp (defaults to host UTC clock)
-#   HANDFEST_ALLOW_CREATE_LEDGER  Set to "1" only during initial setup to allow creating a missing ledger file
+#   HANDFEST_ALLOW_CREATE_LEDGER  Set to "1" only during initial setup to allow creating/initializing a ledger file
 #
-# Requirements: bash, python3 (3.10+, standard library only)
+# Requirements: /bin/bash, python3 (3.10+, standard library only; test suite requires 3.11+)
 #
 # Exit codes:
 #   0  ONLY when `handfest check` returns Permit with a valid sha256 receipt_hash
@@ -20,6 +20,11 @@
 
 trap '' PIPE
 set -euo pipefail
+
+if ! { : 3>&1; } 2>/dev/null; then
+  printf '%s\n' '{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"deny","permissionDecisionReason":"handfest hook requires open stdout (fail closed)"},"verdict":"deny","code":"internal_error","reason":"stdout (fd 1) is closed"}' >&2 || true
+  exit 2
+fi
 
 if ! command -v python3 >/dev/null 2>&1; then
   printf '%s\n' '{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"deny","permissionDecisionReason":"handfest hook requires python3 (fail closed)"},"verdict":"deny","code":"missing_dependency","reason":"python3 not found on PATH"}' >&2 || true
@@ -233,6 +238,8 @@ def parse_decimal(raw: str, code: str, ctx: str, allow_exponent: bool = False) -
     neg = mant_part.startswith("-")
     unsigned = mant_part[1:] if neg else mant_part
     int_digits, frac_digits = unsigned.split(".", 1) if "." in unsigned else (unsigned, "")
+    if not allow_exponent and len(frac_digits) > MAX_DEC_SCALE:
+        raise HookError(code, f"{ctx}: decimal fractional scale exceeds {MAX_DEC_SCALE} '{raw}'")
     digits = (int_digits + frac_digits).lstrip("0")
     if not digits:
         return "0.0"
@@ -544,7 +551,7 @@ def parse_gate_deny(stdout_bytes: bytes) -> tuple[str, str | None] | None:
     return reason_str, rhash
 
 
-def handle_gate_result(proc: subprocess.CompletedProcess) -> None:
+def handle_gate_result(proc: subprocess.CompletedProcess, require_existing_ledger: bool) -> None:
     if proc.returncode == 0:
         try:
             stdout_text = proc.stdout.decode("utf-8", errors="strict")
@@ -568,6 +575,8 @@ def handle_gate_result(proc: subprocess.CompletedProcess) -> None:
 
     stderr_text = proc.stderr.decode("utf-8", errors="replace")
     detail = (stderr_text or stdout_text or f"exit status {proc.returncode}").strip()
+    if require_existing_ledger and "failed to open ledger" in stderr_text:
+        raise HookError("missing_ledger", detail)
     raise HookError("gate_error", detail)
 
 
@@ -592,12 +601,7 @@ def main() -> None:
 
     resource_id, facts = extract_resource_and_facts(tool_name, tool_input, pol)
 
-    if not allow_create_ledger and not os.path.isfile(ledger_path):
-        raise HookError(
-            "missing_ledger",
-            f"ledger file does not exist: '{ledger_path}' (set HANDFEST_ALLOW_CREATE_LEDGER=1 only during initial setup)",
-        )
-
+    require_existing_ledger = not allow_create_ledger
     cmd = [
         handfest_bin, "check",
         f"--ledger={ledger_path}",
@@ -609,12 +613,14 @@ def main() -> None:
         f"--facts={json.dumps(facts, separators=(',', ':'))}",
         f"--now={now_utc}",
     ]
+    if require_existing_ledger:
+        cmd.append("--require-existing-ledger")
     try:
         proc = subprocess.run(cmd, stdin=subprocess.DEVNULL, capture_output=True)
     except OSError as exc:
         raise HookError("gate_error", f"failed to invoke handfest check: {exc}")
 
-    handle_gate_result(proc)
+    handle_gate_result(proc, require_existing_ledger)
 
 
 try:

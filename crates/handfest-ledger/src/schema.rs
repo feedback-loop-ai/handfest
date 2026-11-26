@@ -70,6 +70,15 @@ pub(crate) fn initialize_or_verify_schema(conn: &mut Connection) -> Result<(), L
     initialize_or_verify_schema_with_hook(conn, || Ok(()))
 }
 
+/// Strictly verifies the schema and B-tree integrity of an already-initialized ledger database
+/// inside a single `BEGIN IMMEDIATE ... COMMIT` transaction without ever executing `CREATE TABLE`.
+pub(crate) fn verify_existing_schema(conn: &mut Connection) -> Result<(), LedgerError> {
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    verify_schema_integrity(&tx)?;
+    tx.commit()?;
+    Ok(())
+}
+
 fn initialize_or_verify_schema_with_hook<F>(
     conn: &mut Connection,
     after_first_ddl: F,
@@ -346,5 +355,22 @@ mod tests {
 
         // 2. Subsequent initialization succeeds cleanly on the rolled-back database.
         initialize_or_verify_schema(&mut conn).unwrap();
+    }
+
+    #[test]
+    fn verify_existing_schema_rejects_empty_db_without_initializing_and_accepts_initialized_db() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        let err = verify_existing_schema(&mut conn).unwrap_err();
+        assert!(matches!(err, LedgerError::Integrity(_)));
+        let remaining: i64 = conn
+            .query_row("SELECT count(*) FROM sqlite_master", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            remaining, 0,
+            "verify_existing_schema must never create tables in an empty database"
+        );
+
+        initialize_or_verify_schema(&mut conn).unwrap();
+        verify_existing_schema(&mut conn).unwrap();
     }
 }

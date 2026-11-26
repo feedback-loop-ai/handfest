@@ -97,6 +97,9 @@ enum Commands {
         /// Explicit evaluation UTC timestamp in RFC 3339 format (YYYY-MM-DDTHH:MM:SSZ).
         #[arg(long)]
         now: String,
+        /// Fail closed unless the ledger already exists and has a valid initialized schema.
+        #[arg(long, default_value_t = false)]
+        require_existing_ledger: bool,
     },
     /// Verifies ledger hash-chain integrity and optionally prints an actor's TrackRecord.
     Audit {
@@ -149,6 +152,7 @@ fn run(cli: Cli) -> Result<ExitCode, String> {
             resource_id,
             facts,
             now,
+            require_existing_ledger,
         } => cmd_check(&CheckArgs {
             ledger,
             chain,
@@ -158,6 +162,7 @@ fn run(cli: Cli) -> Result<ExitCode, String> {
             resource_id,
             facts,
             now,
+            require_existing_ledger,
         }),
         Commands::Audit { ledger, actor_key } => cmd_audit(&ledger, actor_key.as_deref()),
     }
@@ -172,6 +177,7 @@ struct CheckArgs {
     resource_id: String,
     facts: String,
     now: String,
+    require_existing_ledger: bool,
 }
 
 fn cmd_fmt(file: &Path) -> Result<ExitCode, String> {
@@ -296,8 +302,12 @@ fn cmd_check(args: &CheckArgs) -> Result<ExitCode, String> {
         resource_id: args.resource_id.clone(),
     };
 
-    let mut ledger = SqliteLedger::open(&args.ledger)
-        .map_err(|err| format!("failed to open ledger '{}': {err}", args.ledger.display()))?;
+    let mut ledger = if args.require_existing_ledger {
+        SqliteLedger::open_existing(&args.ledger)
+    } else {
+        SqliteLedger::open(&args.ledger)
+    }
+    .map_err(|err| format!("failed to open ledger '{}': {err}", args.ledger.display()))?;
     let (verdict, receipt) = ledger
         .evaluate_and_record(&verified, &request, &facts, now)
         .map_err(|err| format!("ledger evaluation failed: {err}"))?;

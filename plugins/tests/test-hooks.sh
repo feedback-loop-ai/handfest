@@ -1,8 +1,10 @@
 #!/usr/bin/env bash
 # Deterministic, zero-network end-to-end tests for plugins/claude-code/hooks/pre-tool-use.sh
 # and syntax/invariant checks for all declarative plugin configuration examples.
+# Requires: bash, python3 (3.11+, standard library including tomllib).
 
 set -euo pipefail
+unset HANDFEST_ALLOW_CREATE_LEDGER
 
 REPO_ROOT="$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd)"
 HOOK="$REPO_ROOT/plugins/claude-code/hooks/pre-tool-use.sh"
@@ -513,14 +515,19 @@ for mcp_rel in ("plugins/claude-code/mcp.example.json", "plugins/dsh/mcp.example
 
 try:
     import tomllib
-except ImportError:
-    tomllib = None
+except ImportError as exc:
+    raise SystemExit("FAIL: Python 3.11+ (stdlib tomllib) is required to validate plugins/codex/config.example.toml") from exc
 
-if tomllib is not None:
-    with open(os.path.join(root, "plugins/codex/config.example.toml"), "rb") as fh:
-        cfg = tomllib.load(fh)
-    assert "mcp_servers" in cfg and "github_handfest" in cfg["mcp_servers"]
-    assert_mcp_args_safe(cfg["mcp_servers"]["github_handfest"]["args"], "plugins/codex/config.example.toml")
+codex_rel = "plugins/codex/config.example.toml"
+with open(os.path.join(root, codex_rel), "r", encoding="utf-8") as fh:
+    codex_raw = fh.read()
+assert "./plugins/" not in codex_raw, f"{codex_rel} must not use workspace-relative ./plugins/ paths"
+cfg = tomllib.loads(codex_raw)
+assert "mcp_servers" in cfg and "github_handfest" in cfg["mcp_servers"]
+assert cfg["mcp_servers"]["github_handfest"].get("command") == "handfest-mcp", (
+    f"{codex_rel} command must be 'handfest-mcp'"
+)
+assert_mcp_args_safe(cfg["mcp_servers"]["github_handfest"]["args"], codex_rel)
 PY_CFG
 pass "All declarative JSON/TOML plugin example configs parsed cleanly and upheld security invariants"
 
@@ -575,9 +582,12 @@ assert_eq "decimal int-15 permit rc" "$HOOK_RC" "0"
 assert_json "decimal int-15 stdout" "$(cat "$TMP_DIR/stdout.txt")" "d['verdict'] == 'permit'"
 assert_json "decimal int-15 formatted" "$(cat "$CAPTURED_FACTS")" "d['resource.amount'] == {'decimal': '15.0'}"
 
-# Zero, trailing zeros beyond 18 and 127 digits (1. + 127 zeros -> 1.0), scale 28, and mixed integer+fraction "12.34"
+# Zero, trailing zeros up to scale 28 in strings, bare JSON number 1. + 127 zeros, scale 28, and mixed "12.34"
+MAX_SCALE_ZEROS="$(python3 -I -c 'print("1." + "0" * 28)')"
+OVER_SCALE_ONE_ZEROS="$(python3 -I -c 'print("1." + "0" * 29)')"
+OVER_SCALE_ZERO_ZEROS="$(python3 -I -c 'print("0." + "0" * 29)')"
 LONG_ZEROS="$(python3 -I -c 'print("1." + "0" * 127)')"
-for amt_json in '0' '"1.0000000000000000000"' '"0.0000000000000000000000000001"' "\"$LONG_ZEROS\"" "$LONG_ZEROS"; do
+for amt_json in '0' '"1.0000000000000000000"' '"0.0000000000000000000000000001"' "\"$MAX_SCALE_ZEROS\"" "$LONG_ZEROS"; do
   HOOK_RC=0
   rm -f "$CAPTURED_FACTS"
   HANDFEST_BIN="$CAPTURE_SHIM" HANDFEST_POLICY_MAP="$PAY_MAP" HANDFEST_LEDGER="$PAY_LEDGER" HANDFEST_CHAIN="$PAY_SIGNED" \
@@ -591,8 +601,8 @@ for amt_json in '0' '"1.0000000000000000000"' '"0.0000000000000000000000000001"'
     assert_json "decimal trailing zeros formatted" "$(cat "$CAPTURED_FACTS")" "d['resource.amount'] == {'decimal': '1.0'}"
   elif [[ "$amt_json" == '"0.0000000000000000000000000001"' ]]; then
     assert_json "decimal scale 28 formatted" "$(cat "$CAPTURED_FACTS")" "d['resource.amount'] == {'decimal': '0.0000000000000000000000000001'}"
-  elif [[ "$amt_json" == *"$LONG_ZEROS"* ]]; then
-    assert_json "decimal long trailing zeros formatted" "$(cat "$CAPTURED_FACTS")" "d['resource.amount'] == {'decimal': '1.0'}"
+  elif [[ "$amt_json" == "\"$MAX_SCALE_ZEROS\"" || "$amt_json" == "$LONG_ZEROS" ]]; then
+    assert_json "decimal trailing zeros formatted" "$(cat "$CAPTURED_FACTS")" "d['resource.amount'] == {'decimal': '1.0'}"
   fi
 done
 
@@ -616,8 +626,8 @@ assert_eq "decimal bare sci quota rc" "$HOOK_RC" "2"
 assert_json "decimal bare sci quota stderr" "$(cat "$TMP_DIR/stderr.txt")" "d['verdict'] == 'deny' and d['code'] == 'mandate_denied'"
 assert_json "decimal bare sci formatted" "$(cat "$CAPTURED_FACTS")" "d['resource.amount'] == {'decimal': '15.0'}"
 
-# Reject quoted scientific notation "1.5e1", pathological bare/quoted exponents, scale 29, i128::MAX+1, and i128::MIN-1
-for bad_amt in '"1.5e1"' '1e1000000' '"1e1000000"' '"0.00000000000000000000000000001"' '"170141183460469231731687303715884105728"' '"-170141183460469231731687303715884105729"'; do
+# Reject quoted scientific notation "1.5e1", pathological bare/quoted exponents, raw fractional scale > 28 (including trailing zeros), i128::MAX+1, and i128::MIN-1
+for bad_amt in '"1.5e1"' '1e1000000' '"1e1000000"' '"0.00000000000000000000000000001"' "\"$OVER_SCALE_ONE_ZEROS\"" "\"$OVER_SCALE_ZERO_ZEROS\"" "\"$LONG_ZEROS\"" '"170141183460469231731687303715884105728"' '"-170141183460469231731687303715884105729"'; do
   HOOK_RC=0
   HANDFEST_POLICY_MAP="$PAY_MAP" HANDFEST_LEDGER="$PAY_LEDGER" HANDFEST_CHAIN="$PAY_SIGNED" \
     "$HOOK" <<<"{\"tool_name\":\"charge_card\",\"tool_input\":{\"currency\":\"USD\",\"approved\":true,\"scheduled_at\":\"2026-11-24T18:30:00Z\",\"amount\":$bad_amt}}" \
@@ -788,7 +798,44 @@ HOOK_RC=0
 printf '%s' '{"hook_event_name":"PreToolUse","tool_name":"Bash","tool_input":{"command":"id"}}' \
   | env PATH="$EMPTY_BIN" "$(command -v bash)" "$HOOK" >/dev/null 2>/dev/full || HOOK_RC=$?
 assert_eq "stderr /dev/full missing python3 rc" "$HOOK_RC" "2"
-pass "stderr OSError/ENOSPC (2>/dev/full) failed closed with exit 2 in both Python and bash fallback"
+
+# Execute the embedded Python directly via python3 -I (without bash rc->2 wrapper) under
+# 2>/dev/full and broken-pipe stderr to prove emit_deny's OSError handler exits 2 directly.
+python3 -I - "$HOOK" <<'PY_DIRECT_STDERR'
+import os, re, subprocess, sys
+hook_path = sys.argv[1]
+with open(hook_path, "r", encoding="utf-8") as fh:
+    hook_src = fh.read()
+m = re.search(r"IFS= read -r -d '' PY_CODE <<'PY' \|\| true\n(.*?)\nPY\n", hook_src, re.DOTALL)
+assert m, "failed to extract embedded PY_CODE from hook"
+py_code = m.group(1)
+payload = b'{"hook_event_name":"PreToolUse","tool_name":"Bash","tool_input":{"command":"id"}}'
+
+with open("/dev/full", "wb") as devfull:
+    p_full = subprocess.run(
+        [sys.executable, "-I", "-c", py_code],
+        input=payload,
+        stdout=subprocess.PIPE,
+        stderr=devfull,
+    )
+assert p_full.returncode == 2, f"direct python3 -I /dev/full expected rc 2, got {p_full.returncode}"
+assert p_full.stdout == b"", f"direct python3 -I /dev/full expected empty stdout, got {p_full.stdout!r}"
+
+r, w = os.pipe()
+os.close(r)
+try:
+    p_pipe = subprocess.run(
+        [sys.executable, "-I", "-c", py_code],
+        input=payload,
+        stdout=subprocess.PIPE,
+        stderr=w,
+    )
+finally:
+    os.close(w)
+assert p_pipe.returncode == 2, f"direct python3 -I broken-pipe stderr expected rc 2, got {p_pipe.returncode}"
+assert p_pipe.stdout == b"", f"direct python3 -I broken-pipe stderr expected empty stdout, got {p_pipe.stdout!r}"
+PY_DIRECT_STDERR
+pass "stderr OSError/ENOSPC (2>/dev/full & broken pipe) exited 2 directly in python3 -I and bash fallback"
 
 # Test 25: Strict UTF-8 decoding, lone UTF-16 surrogates, and recursive nested key checks
 # Place raw 0xff inside an otherwise valid permitted payload/policy so errors="replace" would pass instead of denying
@@ -909,6 +956,27 @@ HANDFEST_LEDGER="$DEL_LEDGER" "$HOOK" <<<"$VALID_PAYLOAD" >"$TMP_DIR/stdout.txt"
 assert_eq "quota-reset call 3 exhausted rc" "$HOOK_RC" "2"
 assert_strict_rfc8259_json_line "quota-reset call 3 exhausted stderr" "$TMP_DIR/stderr.txt" "d['verdict'] == 'deny' and d['code'] == 'mandate_denied' and 'quota' in d['reason'].lower()"
 
+# (a) Truncating exhausted ledger to 0 bytes must fail closed (exit 2) and NOT reset quota or initialize tables
+: > "$DEL_LEDGER"
+HOOK_RC=0
+HANDFEST_LEDGER="$DEL_LEDGER" "$HOOK" <<<"$VALID_PAYLOAD" >"$TMP_DIR/stdout.txt" 2>"$TMP_DIR/stderr.txt" || HOOK_RC=$?
+assert_eq "0-byte truncated ledger rc" "$HOOK_RC" "2"
+assert_strict_rfc8259_json_line "0-byte truncated ledger stderr" "$TMP_DIR/stderr.txt" "d['verdict'] == 'deny' and d['code'] == 'missing_ledger'"
+ZERO_SIZE="$(python3 -I -c 'import os, sys; print(os.path.getsize(sys.argv[1]))' "$DEL_LEDGER")"
+assert_eq "0-byte ledger remained 0 bytes" "$ZERO_SIZE" "0"
+
+# (b) Replacing exhausted ledger with an empty SQLite DB (valid header, no Handfest tables) must fail closed
+#     with exit 2 and NOT initialize fresh tables or reset quota
+rm -f "$DEL_LEDGER"
+python3 -I -c 'import sqlite3, sys; c = sqlite3.connect(sys.argv[1]); c.execute("VACUUM"); c.close()' "$DEL_LEDGER"
+HOOK_RC=0
+HANDFEST_LEDGER="$DEL_LEDGER" "$HOOK" <<<"$VALID_PAYLOAD" >"$TMP_DIR/stdout.txt" 2>"$TMP_DIR/stderr.txt" || HOOK_RC=$?
+assert_eq "empty-schema sqlite ledger rc" "$HOOK_RC" "2"
+assert_strict_rfc8259_json_line "empty-schema sqlite ledger stderr" "$TMP_DIR/stderr.txt" "d['verdict'] == 'deny' and d['code'] == 'missing_ledger'"
+SCHEMA_COUNT="$(python3 -I -c 'import sqlite3, sys; c = sqlite3.connect(sys.argv[1]); print(c.execute("SELECT count(*) FROM sqlite_master").fetchone()[0]); c.close()' "$DEL_LEDGER")"
+assert_eq "empty-schema sqlite remained uninitialized" "$SCHEMA_COUNT" "0"
+
+# (c) Deleting ledger must fail closed (exit 2) and NOT recreate it
 rm -f "$DEL_LEDGER"
 HOOK_RC=0
 HANDFEST_LEDGER="$DEL_LEDGER" "$HOOK" <<<"$VALID_PAYLOAD" >"$TMP_DIR/stdout.txt" 2>"$TMP_DIR/stderr.txt" || HOOK_RC=$?
@@ -918,7 +986,7 @@ if [[ -e "$DEL_LEDGER" ]]; then
   echo "FAIL [deleted ledger recreated]: $DEL_LEDGER must not be recreated after deletion" >&2
   exit 1
 fi
-pass "Missing/deleted HANDFEST_LEDGER failed closed with missing_ledger (exit 2) and blocked quota reset"
+pass "Missing, 0-byte truncated, empty-schema SQLite, and deleted HANDFEST_LEDGER all failed closed (exit 2) and blocked quota reset"
 
 # Test 29: Closed stderr pipe (EPIPE), closed fd 2>&-, stdout >/dev/full, and python3-only PATH (no cat)
 python3 -I - "$HOOK" "$EMPTY_BIN" "$(command -v bash)" <<'PY_EPIPE'
@@ -968,19 +1036,39 @@ PY_ONLY_BIN="$TMP_DIR/py-only-bin"
 mkdir -p "$PY_ONLY_BIN"
 ln -s "$(command -v python3)" "$PY_ONLY_BIN/python3"
 
+# Direct execution of "$HOOK" (no explicit bash wrapper) tests the #!/bin/bash shebang under python3-only PATH
 HOOK_RC=0
 printf '%s' '{"hook_event_name":"PreToolUse","tool_name":"Bash","tool_input":{"command":"id"}}' \
-  | env PATH="$PY_ONLY_BIN" "$(command -v bash)" "$HOOK" >"$TMP_DIR/stdout.txt" 2>"$TMP_DIR/stderr.txt" || HOOK_RC=$?
-assert_eq "py-only PATH deny rc" "$HOOK_RC" "2"
-assert_strict_rfc8259_json_line "py-only PATH deny stderr" "$TMP_DIR/stderr.txt" "d['verdict'] == 'deny' and d['code'] == 'unmapped_tool'"
+  | env PATH="$PY_ONLY_BIN" "$HOOK" >"$TMP_DIR/stdout.txt" 2>"$TMP_DIR/stderr.txt" || HOOK_RC=$?
+assert_eq "py-only PATH direct deny rc" "$HOOK_RC" "2"
+assert_strict_rfc8259_json_line "py-only PATH direct deny stderr" "$TMP_DIR/stderr.txt" "d['verdict'] == 'deny' and d['code'] == 'unmapped_tool'"
 
 PY_ONLY_LEDGER="$TMP_DIR/py-only-ledger.sqlite"
 HOOK_RC=0
 printf '%s' "$VALID_PAYLOAD" \
-  | env PATH="$PY_ONLY_BIN" HANDFEST_LEDGER="$PY_ONLY_LEDGER" HANDFEST_ALLOW_CREATE_LEDGER=1 "$(command -v bash)" "$HOOK" >"$TMP_DIR/stdout.txt" 2>"$TMP_DIR/stderr.txt" || HOOK_RC=$?
-assert_eq "py-only PATH permit rc" "$HOOK_RC" "0"
-assert_strict_rfc8259_json_line "py-only PATH permit stdout" "$TMP_DIR/stdout.txt" "d['verdict'] == 'permit' and d['receipt_hash'].startswith('sha256:')"
-pass "Closed stderr pipe (EPIPE), closed fd 2>&-, stdout >/dev/full, and python3-only PATH all behaved deterministically with single-line JSON"
+  | env PATH="$PY_ONLY_BIN" HANDFEST_LEDGER="$PY_ONLY_LEDGER" HANDFEST_ALLOW_CREATE_LEDGER=1 "$HOOK" >"$TMP_DIR/stdout.txt" 2>"$TMP_DIR/stderr.txt" || HOOK_RC=$?
+assert_eq "py-only PATH direct permit rc" "$HOOK_RC" "0"
+assert_strict_rfc8259_json_line "py-only PATH direct permit stdout" "$TMP_DIR/stdout.txt" "d['verdict'] == 'permit' and d['receipt_hash'].startswith('sha256:')"
+
+# Closed stdout (1>&-) against active LIMIT 2 calls mandate + initialized ledger (1 call used, 1 remaining):
+# MUST exit 2 before invoking handfest check so NO quota is consumed (subsequent normal call still succeeds).
+FD1_LEDGER="$TMP_DIR/fd1-closed-ledger.sqlite"
+HOOK_RC=0
+HANDFEST_LEDGER="$FD1_LEDGER" HANDFEST_ALLOW_CREATE_LEDGER=1 "$HOOK" <<<"$VALID_PAYLOAD" >"$TMP_DIR/stdout.txt" 2>"$TMP_DIR/stderr.txt" || HOOK_RC=$?
+assert_eq "fd1-closed setup call 1 rc" "$HOOK_RC" "0"
+
+HOOK_RC=0
+HANDFEST_LEDGER="$FD1_LEDGER" "$HOOK" <<<"$VALID_PAYLOAD" 1>&- 2>"$TMP_DIR/stderr.txt" || HOOK_RC=$?
+assert_eq "closed stdout 1>&- rc" "$HOOK_RC" "2"
+assert_strict_rfc8259_json_line "closed stdout 1>&- stderr" "$TMP_DIR/stderr.txt" "d['verdict'] == 'deny' and d['code'] == 'internal_error'"
+
+HOOK_RC=0
+HANDFEST_LEDGER="$FD1_LEDGER" "$HOOK" <<<"$VALID_PAYLOAD" >"$TMP_DIR/stdout.txt" 2>"$TMP_DIR/stderr.txt" || HOOK_RC=$?
+assert_eq "fd1-closed subsequent normal call rc" "$HOOK_RC" "0"
+assert_strict_rfc8259_json_line "fd1-closed subsequent normal call stdout" "$TMP_DIR/stdout.txt" "d['verdict'] == 'permit' and d['receipt_hash'].startswith('sha256:')"
+FD1_AUDIT="$("$HANDFEST_BIN" audit --ledger "$FD1_LEDGER" --actor-key "$AGENT_KEY")"
+assert_json "fd1-closed audit confirms zero quota burned" "$FD1_AUDIT" "d['status'] == 'ok' and d['verified_receipts'] == 2 and d['track_record']['permits'] == 2 and d['track_record']['denies'] == 0"
+pass "Closed stderr pipe (EPIPE), closed fd 2>&-, closed stdout 1>&- (zero quota burned), stdout >/dev/full, and direct python3-only PATH all behaved deterministically"
 
 # Test 30: Strict os.environb UTF-8 validation & lone UTF-16 surrogate inside top-level JSON key
 HOOK_RC=0
