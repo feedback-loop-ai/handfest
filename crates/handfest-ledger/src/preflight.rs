@@ -204,29 +204,19 @@ impl ActiveHandleRegistry {
 
     #[cfg(unix)]
     fn maybe_defer_fd(&mut self, key: (u64, u64), file: File) {
-        if !self.has_active_handles() {
-            drop(file);
-            return;
+        if self.has_active_handles() {
+            self.deferred_fds.entry(key).or_default().push(file);
         }
-        self.deferred_fds.entry(key).or_default().push(file);
     }
 
     #[cfg(unix)]
     fn maybe_defer_regular_file(&mut self, file: File) {
         use std::os::unix::fs::MetadataExt;
-        if !self.has_active_handles() {
-            drop(file);
-            return;
+        if self.has_active_handles() {
+            if let Some(fstat) = file.metadata().ok().filter(fs::Metadata::is_file) {
+                self.maybe_defer_fd((fstat.dev(), fstat.ino()), file);
+            }
         }
-        let Ok(fstat) = file.metadata() else {
-            drop(file);
-            return;
-        };
-        if !fstat.is_file() {
-            drop(file);
-            return;
-        }
-        self.maybe_defer_fd((fstat.dev(), fstat.ino()), file);
     }
 
     fn decrement_writer(&mut self) {
@@ -284,15 +274,16 @@ impl Drop for PendingWriterGuard {
 /// RAII registration of any open file-backed [`crate::SqliteLedger`] handle (writable OR read-only)
 /// in this process, keyed by [`FileIdentity`].
 ///
-/// While at least one handle is open on a given inode in this process (`refcount > 0`),
-/// `open_read_only_guarded` skips raw `std::fs::File::open` on the main DB inode so POSIX
-/// `close()` never drops in-process `fcntl` SHARED/RESERVED/EXCLUSIVE locks across hard links or
-/// concurrent readers. On Unix, while ANY writable OR read-only handle is active
-/// (`active_writers > 0 || !counts.is_empty()`), every regular-file `File` opened for header
-/// inspection or rollback-journal probing is retained in `deferred_fds` keyed by `(st_dev, st_ino)`
-/// (reusing the first retained `File` via `SeekFrom::Start(0)` on repeated inspections of the same
-/// live inode, and pushing any additional `File` opened on an occupied key rather than dropping it)
-/// and only closed once BOTH `active_writers == 0` and `counts.is_empty()`.
+/// While `counts[id] > 0`, `open_read_only_guarded` skips raw `File::open` on that inode so POSIX
+/// `close()` never drops in-process `fcntl` locks. On Unix, while any handle is active
+/// (`active_writers > 0 || !counts.is_empty()`), raw header/journal `File` handles are deferred in
+/// `deferred_fds` by `(st_dev, st_ino)` (reusing the first retained `File` via `SeekFrom::Start(0)`
+/// and appending duplicates). When `counts[id]` reaches `0` and `active_writers == 0`, `id`'s entry
+/// is pruned so a long-lived reader never accumulates unrelated deferred fds. When
+/// `active_writers > 0`, `deferred_fds` is intentionally retained until `active_writers == 0 &&
+/// counts.is_empty()`: SQLite's `unixClose` defers closing its own fd into `pUnused` when another
+/// connection shares the inode, so dropping an out-of-band `File` while an ABA-renamed writer may
+/// hold a POSIX `fcntl` lock on that inode would release the writer's lock.
 pub(crate) struct ActiveHandleGuard {
     registry: &'static Mutex<ActiveHandleRegistry>,
     id: FileIdentity,
@@ -302,10 +293,12 @@ pub(crate) struct ActiveHandleGuard {
 impl Drop for ActiveHandleGuard {
     fn drop(&mut self) {
         let mut state = lock_registry(self.registry);
+        let mut last_for_id = false;
         if let Some(count) = state.counts.get_mut(&self.id) {
             *count -= 1;
             if *count == 0 {
                 state.counts.remove(&self.id);
+                last_for_id = true;
             }
         }
         if self.is_writer {
@@ -313,6 +306,12 @@ impl Drop for ActiveHandleGuard {
         } else {
             state.maybe_clear_deferred_fds();
         }
+        #[cfg(unix)]
+        if last_for_id && state.active_writers == 0 {
+            state.deferred_fds.remove(&(self.id.dev, self.id.ino));
+        }
+        #[cfg(not(unix))]
+        let _ = last_for_id;
     }
 }
 

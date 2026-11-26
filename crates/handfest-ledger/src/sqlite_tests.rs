@@ -620,22 +620,24 @@ fn reader_only_deferred_fd_child_helper() {
     assert_eq!(deferred_fd_count(), 0);
 
     let (verified, maybe_rec) = run_audit_tx(&ro1.conn, Some(&req.actor_key), || {
-        // 1. Fresh raw header open on a second DB while active_writers == 0 retains its fd.
+        // 1. Fresh raw header open on a second DB while active_writers == 0 retains its fd while
+        //    ro_b is live, then prunes db_b's entry on drop (counts[db_b] == 0 && active_writers == 0).
         {
             let ro_b = SqliteLedger::open_read_only(&db_b).unwrap();
+            assert_eq!(deferred_fd_count(), 1);
             assert_eq!(ro_b.verify_integrity().unwrap(), 1);
         }
         assert_eq!(active_writer_count(), 0);
-        assert_eq!(deferred_fd_count(), 1);
+        assert_eq!(deferred_fd_count(), 0);
 
-        // 2. Hard-linked journal probe on db_a's own inode while active_writers == 0 must also
+        // 2. Hard-linked journal probe on db_a's own inode while active_writers == 0 must still
         //    retain its fd rather than closing it and dropping ro1's POSIX SHARED lock.
         fs::hard_link(&db_a, &victim_c_journal).unwrap();
         let err = SqliteLedger::open_read_only(&victim_c).unwrap_err();
         assert!(matches!(err, LedgerError::Integrity(_)));
         fs::remove_file(&victim_c_journal).unwrap();
         assert_eq!(active_writer_count(), 0);
-        assert_eq!(deferred_fd_count(), 2);
+        assert_eq!(deferred_fd_count(), 1);
 
         assert_cross_process_exclusive_lock(&db_a, true);
     })
@@ -646,8 +648,8 @@ fn reader_only_deferred_fd_child_helper() {
     assert_eq!(active_writer_count(), 0);
     assert_eq!(
         deferred_fd_count(),
-        2,
-        "deferred_fds must remain retained while ro1 is still open"
+        1,
+        "db_a deferred fd must remain retained while ro1 is still open"
     );
 
     drop(ro1);

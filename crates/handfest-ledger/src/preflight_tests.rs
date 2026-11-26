@@ -545,13 +545,16 @@ fn open_no_follow_read_only_rejects_symlinks_atomically() {
 
 #[cfg(unix)]
 #[test]
-fn reader_only_deferred_fds_retain_with_zero_writers_and_clear_on_reader_drop() {
+fn reader_only_deferred_fds_prune_on_last_inode_drop_and_clear_on_final_reader_drop() {
     static REG: OnceLock<Mutex<ActiveHandleRegistry>> = OnceLock::new();
     let reg = REG.get_or_init(|| Mutex::new(ActiveHandleRegistry::default()));
 
     let dir = TempDir::new().unwrap();
     let db_a = write_valid_header_file(&dir.path().join("ro_only_a.sqlite"));
     let db_b = write_valid_header_file(&dir.path().join("ro_only_b.sqlite"));
+    let bad_c = dir.path().join("ro_only_bad_c.sqlite");
+    fs::write(&bad_c, [0u8; SQLITE_HEADER_LEN]).unwrap();
+    let bad_c = fs::canonicalize(&bad_c).unwrap();
 
     let ((), ro_a) = open_read_only_guarded_in(reg, &db_a, |_| Ok(())).unwrap();
     {
@@ -561,16 +564,27 @@ fn reader_only_deferred_fds_retain_with_zero_writers_and_clear_on_reader_drop() 
         assert!(state.deferred_fds.is_empty());
     }
 
-    // Fresh raw header open on a second DB while active_writers == 0 must defer its fd.
-    let ((), ro_b) = open_read_only_guarded_in(reg, &db_b, |_| Ok(())).unwrap();
+    // Opening db_b while ro_a is active defers db_b's fd; dropping one of two readers on db_b
+    // keeps it (counts[db_b] == 1), and dropping the last reader on db_b prunes it while ro_a lives.
+    let ((), ro_b1) = open_read_only_guarded_in(reg, &db_b, |_| Ok(())).unwrap();
+    let ((), ro_b2) = open_read_only_guarded_in(reg, &db_b, |_| Ok(())).unwrap();
     assert_eq!(reg.lock().unwrap().deferred_fds.len(), 1);
-    drop(ro_b);
+    drop(ro_b1);
+    assert_eq!(reg.lock().unwrap().deferred_fds.len(), 1);
+    drop(ro_b2);
     {
         let state = reg.lock().unwrap();
         assert_eq!(state.active_writers, 0);
         assert_eq!(state.counts.len(), 1);
-        assert_eq!(state.deferred_fds.len(), 1);
+        assert!(state.deferred_fds.is_empty());
     }
+
+    // An uncounted failed raw probe while ro_a is active stays deferred until ro_a drops.
+    assert!(matches!(
+        open_read_only_guarded_in(reg, &bad_c, |_| Ok(())),
+        Err(LedgerError::Integrity(_))
+    ));
+    assert_eq!(reg.lock().unwrap().deferred_fds.len(), 1);
 
     drop(ro_a);
     {

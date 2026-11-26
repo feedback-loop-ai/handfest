@@ -43,6 +43,7 @@ RECEIPT_HASH_RE = re.compile(r"^sha256:[0-9a-f]{64}\Z", re.ASCII)
 I64_MIN, I64_MAX = -(1 << 63), (1 << 63) - 1
 I128_MIN, I128_MAX = -(1 << 127), (1 << 127) - 1
 MAX_DEC_SCALE = 28
+MAX_JSON_DEPTH = 128
 POLICY_KEYS = {"action", "resource_kind", "resource_id_arg", "static_resource_id", "arg_facts", "static_facts"}
 FACT_TYPES = {
     "str": "str", "Str": "str",
@@ -144,17 +145,25 @@ def is_rfc3339_utc(s: str) -> bool:
         return False
 
 
-def reject_surrogates(root, code: str, ctx: str) -> None:
-    stack = [root]
+def validate_json_tree(root, code: str, ctx: str) -> None:
+    stack = [(root, 0)]
     while stack:
-        cur = stack.pop()
+        cur, depth = stack.pop()
         if type(cur) is str:
             if has_surrogate(cur):
                 raise HookError(code, f"{ctx}: lone UTF-16 surrogate in JSON string")
         elif isinstance(cur, dict):
-            stack.extend(cur.values())
+            next_depth = depth + 1
+            if next_depth > MAX_JSON_DEPTH:
+                raise HookError(code, f"{ctx}: JSON nesting depth exceeds {MAX_JSON_DEPTH}")
+            for v in cur.values():
+                stack.append((v, next_depth))
         elif isinstance(cur, list):
-            stack.extend(cur)
+            next_depth = depth + 1
+            if next_depth > MAX_JSON_DEPTH:
+                raise HookError(code, f"{ctx}: JSON nesting depth exceeds {MAX_JSON_DEPTH}")
+            for item in cur:
+                stack.append((item, next_depth))
 
 
 def parse_strict_json(raw: str, code: str, ctx: str):
@@ -186,7 +195,7 @@ def parse_strict_json(raw: str, code: str, ctx: str):
         raise
     except Exception as exc:
         raise HookError(code, f"{ctx}: malformed JSON ({exc})")
-    reject_surrogates(parsed, code, ctx)
+    validate_json_tree(parsed, code, ctx)
     return parsed
 
 

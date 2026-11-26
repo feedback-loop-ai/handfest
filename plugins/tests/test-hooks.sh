@@ -489,43 +489,81 @@ def assert_all_paths_safe(node, loc):
 assert_all_paths_safe(cc_settings, "settings.example.json")
 
 def assert_mcp_args_safe(args, loc):
-    assert "--" in args, f"{loc} must separate upstream server command with '--'"
+    assert isinstance(args, list) and "--" in args, f"{loc} must separate upstream server command with '--'"
     sep_idx = args.index("--")
     proxy_args = args[:sep_idx]
     upstream_args = args[sep_idx + 1:]
     assert upstream_args and all(isinstance(a, str) and a for a in upstream_args), (
         f"{loc} must provide a non-empty upstream command after '--'"
     )
+    singleton_flags = {"--ledger", "--policy-map", "--actor-key"}
     path_flags = {"--chain", "--ledger", "--policy-map"}
-    required_flags = path_flags | {"--actor-key"}
+    allowed_flags = path_flags | {"--actor-key"}
     seen_flags = set()
     i = 0
     while i < len(proxy_args):
         arg = proxy_args[i]
+        assert isinstance(arg, str) and arg, f"{loc} contains non-string or empty proxy arg: {arg!r}"
         assert not arg.startswith("./"), f"{loc} contains relative path {arg}"
         assert ".." not in arg.split("/"), f"{loc} contains '..' traversal in {arg}"
         assert "plugins/policy-map.example.json" not in arg, f"{loc} must not point inside repo plugins/"
-        if arg in path_flags:
-            seen_flags.add(arg)
-            assert i + 1 < len(proxy_args), f"{loc} missing value after {arg}"
-            assert_safe_outside_path(proxy_args[i + 1], f"{loc} {arg}")
-            i += 2
-            continue
-        if arg == "--actor-key":
-            assert "--actor-key" not in seen_flags, f"{loc} duplicates --actor-key"
-            seen_flags.add(arg)
-            assert i + 1 < len(proxy_args), f"{loc} missing value after --actor-key"
-            actor_key = proxy_args[i + 1]
-            assert isinstance(actor_key, str) and actor_key.startswith("ed25519:") and len(actor_key) > len("ed25519:"), (
-                f"{loc} --actor-key must be a non-empty public KeyId (ed25519:...), got {actor_key!r}"
+        if "=" in arg:
+            flag, value = arg.split("=", 1)
+            step = 1
+        else:
+            flag, value = arg, None
+            step = 2
+        assert flag in allowed_flags, f"{loc} unexpected positional token or unknown flag before '--': {arg!r}"
+        if flag in singleton_flags:
+            assert flag not in seen_flags, f"{loc} duplicates singleton flag {flag}"
+        if value is None:
+            assert i + 1 < len(proxy_args), f"{loc} missing value after {flag}"
+            value = proxy_args[i + 1]
+            assert isinstance(value, str), f"{loc} non-string value after {flag}: {value!r}"
+        seen_flags.add(flag)
+        if flag in path_flags:
+            assert_safe_outside_path(value, f"{loc} {flag}")
+        else:
+            assert value.startswith("ed25519:") and len(value) > len("ed25519:"), (
+                f"{loc} --actor-key must be a non-empty public KeyId (ed25519:...), got {value!r}"
             )
-            assert "/" not in actor_key and not actor_key.endswith(".key.json"), (
-                f"{loc} --actor-key must be a public KeyId, not a key file path: {actor_key!r}"
+            assert "/" not in value and not value.endswith(".key.json"), (
+                f"{loc} --actor-key must be a public KeyId, not a key file path: {value!r}"
             )
-            i += 2
-            continue
-        i += 1
-    assert seen_flags == required_flags, f"{loc} must include {sorted(required_flags)}, got {sorted(seen_flags)}"
+        i += step
+    assert seen_flags == allowed_flags, f"{loc} must include {sorted(allowed_flags)}, got {sorted(seen_flags)}"
+
+# Self-test assert_mcp_args_safe invariants (singleton duplicates, --flag=value, positional tokens, multi --chain)
+base_valid = [
+    "--chain=/path/to/handfest-config/mandates/root.signed.json",
+    "--chain", "/path/to/handfest-config/mandates/leaf.signed.json",
+    "--ledger=/path/to/handfest-config/state/handfest-ledger.sqlite",
+    "--actor-key=ed25519:abcd1234",
+    "--policy-map", "/path/to/handfest-config/policy-map.json",
+    "--", "npx", "-y", "@modelcontextprotocol/server-github",
+]
+assert_mcp_args_safe(base_valid, "self-test-valid")
+for bad_label, bad_args in (
+    ("dup-ledger", base_valid[:5] + ["--ledger", "/path/to/handfest-config/state/other.sqlite"] + base_valid[5:]),
+    ("dup-policy-map", base_valid[:5] + ["--policy-map=/path/to/handfest-config/other.json"] + base_valid[5:]),
+    ("dup-actor-key", base_valid[:5] + ["--actor-key", "ed25519:deadbeef"] + base_valid[5:]),
+    ("unexpected-positional", ["stray-positional"] + base_valid),
+    ("unknown-flag", ["--unknown=value"] + base_valid),
+    ("bad-second-chain", base_valid[:2] + ["--chain", root_norm + "/mandate.json"] + base_valid[2:]),
+    ("bad-eq-ledger", [
+        "--chain=/path/to/handfest-config/mandates/root.signed.json",
+        f"--ledger={root_norm}/ledger.sqlite",
+        "--actor-key=ed25519:abcd1234",
+        "--policy-map=/path/to/handfest-config/policy-map.json",
+        "--", "npx",
+    ]),
+):
+    try:
+        assert_mcp_args_safe(bad_args, f"self-test-{bad_label}")
+    except AssertionError:
+        pass
+    else:
+        raise AssertionError(f"assert_mcp_args_safe unexpectedly accepted {bad_label}: {bad_args!r}")
 
 for mcp_rel in ("plugins/claude-code/mcp.example.json", "plugins/dsh/mcp.example.json", "plugins/agy/mcp.example.json"):
     srv = loaded[mcp_rel]["mcpServers"]["github-handfest"]
@@ -1397,5 +1435,68 @@ for poisoned in (None, "", "import sys; sys.exit(0) # HANDFEST_PY_SENTINEL_EOF")
 PY_ULIMIT
 fi
 pass "PY_CODE heredoc hardening (unset + sentinel + SIGXFSZ trap + BASH_COMPAT=5.0 + ulimit -f 0) failed closed (exit 2)"
+
+# Test 32: Enforce MAX_JSON_DEPTH = 128 on stdin payloads and HANDFEST_POLICY_MAP
+DEPTH_LEDGER="$TMP_DIR/depth-ledger.sqlite"
+DEPTH_PM="$TMP_DIR/deep-policy-map.json"
+python3 -I - "$HOOK" "$DEPTH_LEDGER" "$DEPTH_PM" <<'PY_DEPTH'
+import json, os, subprocess, sys
+
+hook, depth_ledger, depth_pm = sys.argv[1], sys.argv[2], sys.argv[3]
+
+def run_case(payload_str: str, extra_env: dict | None = None):
+    env = dict(os.environ)
+    env["HANDFEST_LEDGER"] = depth_ledger
+    if extra_env:
+        env.update(extra_env)
+    return subprocess.run(
+        [hook],
+        input=payload_str.encode("utf-8"),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        env=env,
+    )
+
+# 1. Positive control at exact MAX_JSON_DEPTH = 128: outer {} (1) + tool_input {} (2) + 126 arrays = 128.
+nested_126 = "[" * 126 + "1" + "]" * 126
+ok_payload = (
+    '{"hook_event_name":"PreToolUse","tool_name":"merge_pull_request",'
+    '"tool_input":{"owner":"feedback-loop-ai","repo":"handfest","pullNumber":10,"extra":'
+    + nested_126 + "}}"
+)
+proc_ok = run_case(ok_payload, {"HANDFEST_ALLOW_CREATE_LEDGER": "1"})
+assert proc_ok.returncode == 0, f"depth-128 positive control expected rc 0, got {proc_ok.returncode}; stderr={proc_ok.stderr!r}"
+ok_data = json.loads(proc_ok.stdout.decode("utf-8", errors="strict"))
+assert ok_data.get("verdict") == "permit", f"depth-128 expected permit, got {ok_data!r}"
+
+# 2. Mapped merge_pull_request with extra unmapped argument containing 127 nested arrays (total depth 129)
+#    and 129 nested arrays ("[" * 129 + "1" + "]" * 129) must both deny fail-closed with exit 2.
+for label, n_arrays in (("total-129", 127), ("extra-129", 129), ("extra-2000", 2000)):
+    nested = "[" * n_arrays + "1" + "]" * n_arrays
+    payload = (
+        '{"hook_event_name":"PreToolUse","tool_name":"merge_pull_request",'
+        '"tool_input":{"owner":"feedback-loop-ai","repo":"handfest","pullNumber":10,"extra":'
+        + nested + "}}"
+    )
+    proc = run_case(payload)
+    assert proc.returncode == 2, f"depth ({label}) expected rc 2, got {proc.returncode}; stdout={proc.stdout!r} stderr={proc.stderr!r}"
+    assert proc.stdout == b"", f"depth ({label}) expected empty stdout, got {proc.stdout!r}"
+    deny = json.loads(proc.stderr.decode("utf-8", errors="strict"))
+    assert deny.get("verdict") == "deny" and deny.get("code") == "invalid_input", (
+        f"depth ({label}) expected invalid_input deny, got {deny!r}"
+    )
+
+# 3. HANDFEST_POLICY_MAP with 129 nested arrays must also deny fail-closed with exit 2 (invalid_policy_map).
+with open(depth_pm, "w", encoding="utf-8") as fh:
+    fh.write('{"tools":' + "[" * 129 + "1" + "]" * 129 + "}")
+proc_pm = run_case(ok_payload, {"HANDFEST_POLICY_MAP": depth_pm})
+assert proc_pm.returncode == 2, f"deep policy map expected rc 2, got {proc_pm.returncode}; stderr={proc_pm.stderr!r}"
+assert proc_pm.stdout == b"", f"deep policy map expected empty stdout, got {proc_pm.stdout!r}"
+deny_pm = json.loads(proc_pm.stderr.decode("utf-8", errors="strict"))
+assert deny_pm.get("verdict") == "deny" and deny_pm.get("code") == "invalid_policy_map", (
+    f"deep policy map expected invalid_policy_map deny, got {deny_pm!r}"
+)
+PY_DEPTH
+pass "MAX_JSON_DEPTH=128 enforced on stdin (128 permitted, 129/131/2000 denied) and HANDFEST_POLICY_MAP (exit 2)"
 
 echo "ALL $PASS_COUNT HOOK & PLUGIN TESTS PASSED."

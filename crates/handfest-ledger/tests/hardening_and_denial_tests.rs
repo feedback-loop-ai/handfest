@@ -1389,3 +1389,74 @@ fn dropping_writer_while_reader_holds_shared_lock_preserves_reader_posix_lock() 
     }
     assert_cross_process_lock(&ledger_a, "exclusive", false);
 }
+
+#[cfg(unix)]
+#[test]
+fn open_read_only_sequential_70_ledgers_helper() {
+    use std::collections::HashSet;
+    use std::os::unix::fs::MetadataExt;
+    use std::path::PathBuf;
+
+    let Ok(dir) = std::env::var("HANDFEST_SEQ_RO_DIR") else {
+        return;
+    };
+    let dir = PathBuf::from(dir);
+    let ledger_a = dir.join("ledger_a.sqlite");
+    let mut seen_inodes = HashSet::new();
+    let meta_a = fs::metadata(&ledger_a).unwrap();
+    assert!(seen_inodes.insert((meta_a.dev(), meta_a.ino())));
+
+    let ro_a = SqliteLedger::open_read_only(&ledger_a).unwrap();
+    assert_eq!(ro_a.verify_integrity().unwrap(), 1);
+
+    for i in 0..70 {
+        let db_path = dir.join(format!("db_{i}.sqlite"));
+        let meta = fs::metadata(&db_path).unwrap();
+        assert!(
+            seen_inodes.insert((meta.dev(), meta.ino())),
+            "db_{i} must have a distinct inode"
+        );
+        let ro = SqliteLedger::open_read_only(&db_path)
+            .unwrap_or_else(|err| panic!("sequential open_read_only failed on db_{i}: {err:?}"));
+        assert_eq!(ro.verify_integrity().unwrap(), 1);
+        drop(ro);
+    }
+
+    assert_eq!(ro_a.verify_integrity().unwrap(), 1);
+    drop(ro_a);
+}
+
+#[cfg(unix)]
+#[test]
+fn open_read_only_sequential_audits_prune_deferred_fds_while_reader_open() {
+    let dir = TempDir::new().unwrap();
+    let ledger_a = dir.path().join("ledger_a.sqlite");
+    init_single_permit_ledger(&ledger_a);
+    for i in 0..70 {
+        let db_path = dir.path().join(format!("db_{i}.sqlite"));
+        fs::copy(&ledger_a, &db_path).unwrap();
+    }
+
+    // Run in an isolated child test process so no parallel writer test in this binary can hold
+    // `active_writers > 0` during the 70 sequential read-only opens.
+    let exe = std::env::current_exe().expect("current test exe");
+    let output = std::process::Command::new(&exe)
+        .args([
+            "--exact",
+            "open_read_only_sequential_70_ledgers_helper",
+            "--quiet",
+        ])
+        .env("HANDFEST_SEQ_RO_DIR", dir.path())
+        .output()
+        .expect("spawn sequential read-only audit helper");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "sequential 70-ledger open_read_only helper failed\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(
+        stdout.contains("1 passed"),
+        "sequential 70-ledger helper did not run; stdout:\n{stdout}"
+    );
+}
