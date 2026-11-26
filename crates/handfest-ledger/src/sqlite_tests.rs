@@ -324,7 +324,13 @@ fn hardlink_open_read_only_preserves_writer_lock_and_limit_one_across_processes(
 }
 
 #[cfg(unix)]
-use crate::lock_probe_test_util::assert_cross_process_exclusive_lock;
+fn assert_cross_process_exclusive_lock(db_path: &std::path::Path, expect_locked: bool) {
+    crate::lock_probe_test_util::assert_cross_process_lock(
+        db_path,
+        crate::lock_probe_test_util::LockProbeMode::Exclusive,
+        expect_locked,
+    );
+}
 
 #[cfg(unix)]
 #[test]

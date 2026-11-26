@@ -1,5 +1,6 @@
 #[cfg(unix)]
-mod common;
+#[path = "../src/lock_probe_test_util.rs"]
+mod lock_probe_test_util;
 
 use std::fs;
 
@@ -1117,19 +1118,13 @@ fn open_existing_accepts_valid_initialized_ledger_and_persists_receipts() {
 }
 
 #[cfg(unix)]
-#[test]
-fn open_existing_lock_probe_helper() {
-    common::run_lock_probe_helper();
-}
-
-#[cfg(unix)]
 fn assert_cross_process_lock(db_path: &std::path::Path, mode: &str, expect_locked: bool) {
-    common::assert_cross_process_lock(
-        "open_existing_lock_probe_helper",
-        db_path,
-        mode,
-        expect_locked,
-    );
+    let probe_mode = match mode {
+        "exclusive" => lock_probe_test_util::LockProbeMode::Exclusive,
+        "immediate" => lock_probe_test_util::LockProbeMode::Immediate,
+        other => panic!("unexpected lock probe mode: {other}"),
+    };
+    lock_probe_test_util::assert_cross_process_lock(db_path, probe_mode, expect_locked);
 }
 
 fn init_single_permit_ledger(db_path: &std::path::Path) {

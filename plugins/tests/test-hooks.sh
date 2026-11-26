@@ -8,35 +8,61 @@ unset HANDFEST_ALLOW_CREATE_LEDGER
 
 REPO_ROOT="$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd)"
 HOOK="$REPO_ROOT/plugins/claude-code/hooks/pre-tool-use.sh"
-DEFAULT_HANDFEST_BIN="$REPO_ROOT/target/debug/handfest"
-DEFAULT_HANDFEST_MCP_BIN="$REPO_ROOT/target/debug/handfest-mcp"
-HANDFEST_BIN="${HANDFEST_BIN:-$DEFAULT_HANDFEST_BIN}"
-HANDFEST_MCP_BIN="${HANDFEST_MCP_BIN:-$DEFAULT_HANDFEST_MCP_BIN}"
+TMP_DIR="$(mktemp -d)"
+cleanup() { rm -rf "$TMP_DIR"; }
+trap cleanup EXIT
 
 BUILD_BINS=()
-if [[ "$HANDFEST_BIN" == "$DEFAULT_HANDFEST_BIN" ]]; then
+if [[ -z "${HANDFEST_BIN:-}" ]]; then
   BUILD_BINS+=(--bin handfest)
 fi
-if [[ "$HANDFEST_MCP_BIN" == "$DEFAULT_HANDFEST_MCP_BIN" ]]; then
+if [[ -z "${HANDFEST_MCP_BIN:-}" ]]; then
   BUILD_BINS+=(--bin handfest-mcp)
 fi
 if [[ "${#BUILD_BINS[@]}" -gt 0 ]]; then
   echo "Ensuring up-to-date handfest binaries (${BUILD_BINS[*]})..."
-  (cd "$REPO_ROOT" && cargo build "${BUILD_BINS[@]}" --locked --offline >/dev/null)
+  CARGO_MESSAGES="$TMP_DIR/cargo-build.jsonl"
+  (cd "$REPO_ROOT" && cargo build "${BUILD_BINS[@]}" --locked --offline --message-format=json-render-diagnostics >"$CARGO_MESSAGES")
+  CARGO_BINS_OUT="$(python3 -I - "$CARGO_MESSAGES" <<'PY_CARGO_BINS'
+import json, sys
+
+found = {}
+with open(sys.argv[1], "r", encoding="utf-8") as fh:
+    for line in fh:
+        line = line.strip()
+        if not line:
+            continue
+        msg = json.loads(line)
+        if msg.get("reason") != "compiler-artifact":
+            continue
+        target = msg.get("target") or {}
+        if "bin" in (target.get("kind") or []) and isinstance(msg.get("executable"), str):
+            name = target.get("name")
+            if name in ("handfest", "handfest-mcp"):
+                found[name] = msg["executable"]
+for name, path in found.items():
+    if "\n" in path or "\r" in path:
+        sys.stderr.write(f"FAIL: unexpected newline in cargo binary path for {name}\n")
+        sys.exit(1)
+    print(f"{name}={path}")
+PY_CARGO_BINS
+)"
+  while IFS='=' read -r bin_name bin_path; do
+    case "$bin_name" in
+      handfest) HANDFEST_BIN="$bin_path" ;;
+      handfest-mcp) HANDFEST_MCP_BIN="$bin_path" ;;
+    esac
+  done <<<"$CARGO_BINS_OUT"
 fi
 
-if [[ ! -x "$HANDFEST_BIN" ]]; then
-  echo "FAIL: handfest binary not executable at $HANDFEST_BIN" >&2
+if [[ -z "${HANDFEST_BIN:-}" || ! -x "$HANDFEST_BIN" ]]; then
+  echo "FAIL: handfest binary not executable at ${HANDFEST_BIN:-<unset>}" >&2
   exit 1
 fi
-if [[ ! -x "$HANDFEST_MCP_BIN" ]]; then
-  echo "FAIL: handfest-mcp binary not executable at $HANDFEST_MCP_BIN" >&2
+if [[ -z "${HANDFEST_MCP_BIN:-}" || ! -x "$HANDFEST_MCP_BIN" ]]; then
+  echo "FAIL: handfest-mcp binary not executable at ${HANDFEST_MCP_BIN:-<unset>}" >&2
   exit 1
 fi
-
-TMP_DIR="$(mktemp -d)"
-cleanup() { rm -rf "$TMP_DIR"; }
-trap cleanup EXIT
 
 PASS_COUNT=0
 assert_eq() {
@@ -920,7 +946,11 @@ assert_eq "non-zero deny garbage receipt_hash rc" "$HOOK_RC" "2"
 assert_json "non-zero deny garbage receipt_hash omitted" "$(cat "$TMP_DIR/stderr.txt")" "d['verdict'] == 'deny' and d['code'] == 'mandate_denied' and 'receipt_hash' not in d"
 for fake_err in \
   '{"error":"policy_mapping_failed","code":["unmapped_tool"],"message":"malformed array code"}' \
-  '{"error":"policy_mapping_failed","code":{"nested":"unmapped_tool"},"message":"malformed object code"}'; do
+  '{"error":"policy_mapping_failed","code":{"nested":"unmapped_tool"},"message":"malformed object code"}' \
+  '{"error":"policy_mapping_failed","code":"unmapped_tool","message":123}' \
+  '{"error":"policy_mapping_failed","code":"unmapped_tool","message":["a"]}' \
+  '{"error":"policy_mapping_failed","code":"unmapped_tool","message":""}' \
+  '{"error":"ledger_open_failed","code":"missing_ledger","message":123}'; do
   cat <<FAKE_ERR_EOF >"$FAKE_BIN"
 #!/usr/bin/env bash
 printf '%s\n' '$fake_err' >&2
@@ -929,10 +959,10 @@ FAKE_ERR_EOF
   chmod +x "$FAKE_BIN"
   HOOK_RC=0
   HANDFEST_BIN="$FAKE_BIN" "$HOOK" <<<"$VALID_PAYLOAD" >"$TMP_DIR/stdout.txt" 2>"$TMP_DIR/stderr.txt" || HOOK_RC=$?
-  assert_eq "malformed mapping error code rc" "$HOOK_RC" "2"
-  assert_strict_rfc8259_json_line "malformed mapping error code stderr" "$TMP_DIR/stderr.txt" "d['verdict'] == 'deny' and d['code'] == 'gate_error'"
+  assert_eq "malformed structured stderr error rc" "$HOOK_RC" "2"
+  assert_strict_rfc8259_json_line "malformed structured stderr error stderr" "$TMP_DIR/stderr.txt" "d['verdict'] == 'deny' and d['code'] == 'gate_error'"
 done
-pass "Defense-in-depth rejected exit-0 non-Permit/malformed receipt_hash, stripped garbage receipt_hash on non-zero deny, and classified non-string mapping error codes as gate_error"
+pass "Defense-in-depth rejected exit-0 non-Permit/malformed receipt_hash, stripped garbage receipt_hash on non-zero deny, and classified malformed structured stderr codes/messages as gate_error"
 
 # Test 21: python3 -I isolation blocks malicious ./json.py in CWD and PYTHONPATH
 EVIL_CWD="$TMP_DIR/evil-cwd"

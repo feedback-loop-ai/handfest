@@ -1130,7 +1130,13 @@ fn saturate_registry_for_reader_only_state(
 }
 
 #[cfg(unix)]
-use crate::lock_probe_test_util::assert_cross_process_exclusive_lock as assert_preflight_exclusive_lock;
+fn assert_preflight_exclusive_lock(db_path: &std::path::Path, expect_locked: bool) {
+    crate::lock_probe_test_util::assert_cross_process_lock(
+        db_path,
+        crate::lock_probe_test_util::LockProbeMode::Exclusive,
+        expect_locked,
+    );
+}
 
 #[cfg(unix)]
 #[test]

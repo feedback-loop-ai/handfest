@@ -1,5 +1,6 @@
 #[cfg(unix)]
-mod common;
+#[path = "../src/lock_probe_test_util.rs"]
+mod lock_probe_test_util;
 
 use handfest_core::ast::{parse_rfc3339_utc, Decimal, HandfestAst, KeyId, MandateId, Scalar};
 use handfest_core::cnl::parse_mandate;
@@ -1192,12 +1193,6 @@ fn verify_integrity_rejects_duplicate_sqlite_sequence_rows() {
 
 #[cfg(unix)]
 #[test]
-fn posix_lock_probe_helper() {
-    common::run_lock_probe_helper();
-}
-
-#[cfg(unix)]
-#[test]
 fn open_read_only_preserves_in_process_posix_locks_on_same_inode() {
     let dir = TempDir::new().unwrap();
     let db_path = dir.path().join("posix_lock.sqlite");
@@ -1227,14 +1222,22 @@ fn open_read_only_preserves_in_process_posix_locks_on_same_inode() {
         assert_eq!(rec.unwrap().permits, 1);
     }
 
-    common::assert_cross_process_lock("posix_lock_probe_helper", &db_path, "immediate", true);
+    lock_probe_test_util::assert_cross_process_lock(
+        &db_path,
+        lock_probe_test_util::LockProbeMode::Immediate,
+        true,
+    );
 
     lock_holder.execute_batch("ROLLBACK;").unwrap();
     drop(lock_holder);
     drop(active_writer);
 
     // Sanity check: once the parent releases its lock, the child probe succeeds.
-    common::assert_cross_process_lock("posix_lock_probe_helper", &db_path, "immediate", false);
+    lock_probe_test_util::assert_cross_process_lock(
+        &db_path,
+        lock_probe_test_util::LockProbeMode::Immediate,
+        false,
+    );
 }
 
 #[test]
