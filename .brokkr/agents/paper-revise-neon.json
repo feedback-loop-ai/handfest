@@ -28,7 +28,7 @@
         "mode": "ro"
       },
       {
-        "path": "~/.cache/Tectonic",
+        "path": "~/.cache/tectonic",
         "mode": "rw"
       }
     ]
