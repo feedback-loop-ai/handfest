@@ -30,8 +30,9 @@ pub(crate) const EXISTING_LEDGER_OPEN_FLAGS: OpenFlags =
 /// `PRAGMA synchronous = FULL`) so read-only auditing works natively on `0444` files in `0555`
 /// directories and across concurrent OS processes with zero `-wal`/`-shm` sidecars.
 pub struct SqliteLedger {
-    // Field order matters: `conn` drops before `_handle_guard` so the in-process handle entry
-    // remains registered until SQLite finishes closing the connection and releasing POSIX locks.
+    // Field order matters: `conn` drops before `_handle_guard` so the in-process handle entry,
+    // active-writer count, and any deferred raw header fds remain registered until SQLite finishes
+    // closing the connection and releasing POSIX locks.
     conn: Connection,
     _handle_guard: Option<ActiveHandleGuard>,
 }

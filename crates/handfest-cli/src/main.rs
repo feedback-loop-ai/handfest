@@ -3,7 +3,7 @@
 mod facts;
 
 use std::fs;
-use std::io::Write;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
@@ -14,7 +14,7 @@ use handfest_core::cnl::{parse_mandate, try_render_canonical};
 use handfest_core::gate::ActionRequest;
 use handfest_core::lattice::subsumes;
 use handfest_core::Verdict;
-use handfest_ledger::SqliteLedger;
+use handfest_ledger::{LedgerError, SqliteLedger};
 use serde_json::json;
 
 use crate::facts::parse_facts_arg;
@@ -303,11 +303,17 @@ fn cmd_check(args: &CheckArgs) -> Result<ExitCode, String> {
     };
 
     let mut ledger = if args.require_existing_ledger {
-        SqliteLedger::open_existing(&args.ledger)
+        match SqliteLedger::open_existing(&args.ledger) {
+            Ok(ledger) => ledger,
+            Err(err) => {
+                emit_existing_ledger_open_error(&args.ledger, &err);
+                return Ok(ExitCode::FAILURE);
+            }
+        }
     } else {
         SqliteLedger::open(&args.ledger)
-    }
-    .map_err(|err| format!("failed to open ledger '{}': {err}", args.ledger.display()))?;
+            .map_err(|err| format!("failed to open ledger '{}': {err}", args.ledger.display()))?
+    };
     let (verdict, receipt) = ledger
         .evaluate_and_record(&verified, &request, &facts, now)
         .map_err(|err| format!("ledger evaluation failed: {err}"))?;
@@ -337,6 +343,28 @@ fn cmd_check(args: &CheckArgs) -> Result<ExitCode, String> {
             Ok(ExitCode::FAILURE)
         }
     }
+}
+
+fn classify_existing_ledger_open_error(path: &Path, err: &LedgerError) -> &'static str {
+    match err {
+        LedgerError::Integrity(_) => "invalid_ledger",
+        LedgerError::Storage(_) => match fs::metadata(path) {
+            Err(io_err) if io_err.kind() == io::ErrorKind::NotFound => "missing_ledger",
+            _ => "storage_error",
+        },
+        LedgerError::Json(_) | LedgerError::QuotaAccounting(_) => "storage_error",
+    }
+}
+
+fn emit_existing_ledger_open_error(path: &Path, err: &LedgerError) {
+    let code = classify_existing_ledger_open_error(path, err);
+    let message = format!("failed to open ledger '{}': {err}", path.display());
+    let payload = json!({
+        "error": "ledger_open_failed",
+        "code": code,
+        "message": message,
+    });
+    eprintln!("{payload}");
 }
 
 fn cmd_audit(ledger_path: &Path, actor_key_raw: Option<&str>) -> Result<ExitCode, String> {
@@ -470,4 +498,40 @@ fn write_secret_file(path: &Path, content: &str) -> Result<(), String> {
         .map_err(|err| format!("failed to create '{}': {err}", path.display()))?;
     file.write_all(content.as_bytes())
         .map_err(|err| format!("failed to write '{}': {err}", path.display()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn classify_existing_ledger_open_error_maps_all_variants() {
+        let missing = Path::new("/nonexistent-handfest-ledger-path-for-test.sqlite");
+        let existing = std::env::temp_dir();
+
+        assert_eq!(
+            classify_existing_ledger_open_error(missing, &LedgerError::Integrity("bad".into())),
+            "invalid_ledger"
+        );
+        assert_eq!(
+            classify_existing_ledger_open_error(missing, &LedgerError::Storage("cantopen".into())),
+            "missing_ledger"
+        );
+        assert_eq!(
+            classify_existing_ledger_open_error(&existing, &LedgerError::Storage("isdir".into())),
+            "storage_error"
+        );
+        let json_err = serde_json::from_str::<serde_json::Value>("{").unwrap_err();
+        assert_eq!(
+            classify_existing_ledger_open_error(&existing, &LedgerError::Json(json_err)),
+            "storage_error"
+        );
+        assert_eq!(
+            classify_existing_ledger_open_error(
+                &existing,
+                &LedgerError::QuotaAccounting("overflow".into())
+            ),
+            "storage_error"
+        );
+    }
 }

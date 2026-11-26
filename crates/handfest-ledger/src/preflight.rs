@@ -3,9 +3,9 @@
 
 use std::collections::BTreeMap;
 use std::fs::{self, File};
-use std::io::{self, Read};
+use std::io::{self, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, OnceLock, PoisonError};
+use std::sync::{Mutex, MutexGuard, OnceLock, PoisonError};
 use std::time::{Duration, Instant};
 
 use crate::LedgerError;
@@ -16,6 +16,7 @@ const ROLLBACK_JOURNAL_HDR_LEN: usize = 28;
 const HOT_JOURNAL_RETRY_BUDGET: Duration = Duration::from_millis(500);
 const HOT_JOURNAL_INITIAL_BACKOFF: Duration = Duration::from_millis(2);
 const HOT_JOURNAL_MAX_BACKOFF: Duration = Duration::from_millis(25);
+const MAX_DEFERRED_HEADER_FDS: usize = 64;
 
 /// Process-local file identity for POSIX `fcntl` lock preservation.
 ///
@@ -57,10 +58,62 @@ impl FileIdentity {
     }
 }
 
-static ACTIVE_HANDLES: OnceLock<Mutex<BTreeMap<FileIdentity, usize>>> = OnceLock::new();
+#[derive(Default)]
+struct ActiveHandleRegistry {
+    counts: BTreeMap<FileIdentity, usize>,
+    active_writers: usize,
+    deferred_header_fds: BTreeMap<FileIdentity, File>,
+}
 
-fn active_handles() -> &'static Mutex<BTreeMap<FileIdentity, usize>> {
-    ACTIVE_HANDLES.get_or_init(|| Mutex::new(BTreeMap::new()))
+impl ActiveHandleRegistry {
+    fn decrement_writer(&mut self) {
+        self.active_writers = self.active_writers.saturating_sub(1);
+        if self.active_writers == 0 {
+            self.deferred_header_fds.clear();
+        }
+    }
+}
+
+static ACTIVE_HANDLES: OnceLock<Mutex<ActiveHandleRegistry>> = OnceLock::new();
+
+fn active_handles() -> &'static Mutex<ActiveHandleRegistry> {
+    ACTIVE_HANDLES.get_or_init(|| Mutex::new(ActiveHandleRegistry::default()))
+}
+
+struct PendingWriterGuard {
+    registry: &'static Mutex<ActiveHandleRegistry>,
+    state: MutexGuard<'static, ActiveHandleRegistry>,
+    committed: bool,
+}
+
+impl PendingWriterGuard {
+    fn acquire(registry: &'static Mutex<ActiveHandleRegistry>) -> Self {
+        let mut state = registry.lock().unwrap_or_else(PoisonError::into_inner);
+        state.active_writers += 1;
+        Self {
+            registry,
+            state,
+            committed: false,
+        }
+    }
+
+    fn commit(mut self, id: FileIdentity) -> ActiveHandleGuard {
+        *self.state.counts.entry(id.clone()).or_insert(0) += 1;
+        self.committed = true;
+        ActiveHandleGuard {
+            registry: self.registry,
+            id,
+            is_writer: true,
+        }
+    }
+}
+
+impl Drop for PendingWriterGuard {
+    fn drop(&mut self) {
+        if !self.committed {
+            self.state.decrement_writer();
+        }
+    }
 }
 
 /// RAII registration of any open file-backed [`crate::SqliteLedger`] handle (writable OR read-only)
@@ -69,19 +122,26 @@ fn active_handles() -> &'static Mutex<BTreeMap<FileIdentity, usize>> {
 /// While at least one handle is open on a given inode in this process (`refcount > 0`),
 /// `open_read_only_guarded` skips raw `std::fs::File::open` on the main DB inode so POSIX
 /// `close()` never drops in-process `fcntl` SHARED/RESERVED/EXCLUSIVE locks across hard links or
-/// concurrent readers.
-pub(crate) struct ActiveHandleGuard(FileIdentity);
+/// concurrent readers. While any writable handle is active (`active_writers > 0`), any raw header
+/// inspection fd opened for an unindexed inode (e.g. after concurrent rename/ABA) is retained in
+/// `deferred_header_fds` and only closed once `active_writers` drops to `0`.
+pub(crate) struct ActiveHandleGuard {
+    registry: &'static Mutex<ActiveHandleRegistry>,
+    id: FileIdentity,
+    is_writer: bool,
+}
 
 impl Drop for ActiveHandleGuard {
     fn drop(&mut self) {
-        let mut map = active_handles()
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
-        if let Some(count) = map.get_mut(&self.0) {
+        let mut state = self.registry.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(count) = state.counts.get_mut(&self.id) {
             *count -= 1;
             if *count == 0 {
-                map.remove(&self.0);
+                state.counts.remove(&self.id);
             }
+        }
+        if self.is_writer {
+            state.decrement_writer();
         }
     }
 }
@@ -91,15 +151,15 @@ pub(crate) fn active_handle_count(canonical: &Path) -> usize {
     let Ok(id) = FileIdentity::from_path(canonical) else {
         return 0;
     };
-    let map = active_handles()
+    let state = active_handles()
         .lock()
         .unwrap_or_else(PoisonError::into_inner);
-    map.get(&id).copied().unwrap_or(0)
+    state.counts.get(&id).copied().unwrap_or(0)
 }
 
 /// Opens a writable ledger connection while holding the process-local active-handle registry lock
-/// so its [`ActiveHandleGuard`] is registered atomically before any concurrent `open_read_only`
-/// call in this process can inspect the raw file header.
+/// so `active_writers` is incremented before `open_conn` runs and its [`ActiveHandleGuard`] is
+/// registered atomically before any concurrent `open_read_only` call can inspect a raw header.
 pub(crate) fn open_writable_guarded<T, F>(
     path: &Path,
     open_conn: F,
@@ -107,9 +167,18 @@ pub(crate) fn open_writable_guarded<T, F>(
 where
     F: FnOnce() -> Result<T, LedgerError>,
 {
-    let mut map = active_handles()
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner);
+    open_writable_guarded_in(active_handles(), path, open_conn)
+}
+
+fn open_writable_guarded_in<T, F>(
+    registry: &'static Mutex<ActiveHandleRegistry>,
+    path: &Path,
+    open_conn: F,
+) -> Result<(T, ActiveHandleGuard), LedgerError>
+where
+    F: FnOnce() -> Result<T, LedgerError>,
+{
+    let pending = PendingWriterGuard::acquire(registry);
     let conn = open_conn()?;
     let canonical = fs::canonicalize(path).map_err(|err| {
         LedgerError::Storage(format!(
@@ -123,8 +192,8 @@ where
             canonical.display()
         ))
     })?;
-    *map.entry(id.clone()).or_insert(0) += 1;
-    Ok((conn, ActiveHandleGuard(id)))
+    let guard = pending.commit(id);
+    Ok((conn, guard))
 }
 
 /// Validates read-only sidecars and opens a read-only ledger connection while holding the
@@ -140,21 +209,37 @@ pub(crate) fn open_read_only_guarded<T, F>(
 where
     F: FnOnce(&Path) -> Result<T, LedgerError>,
 {
+    open_read_only_guarded_in(active_handles(), canonical, open_conn)
+}
+
+fn open_read_only_guarded_in<T, F>(
+    registry: &'static Mutex<ActiveHandleRegistry>,
+    canonical: &Path,
+    open_conn: F,
+) -> Result<(T, ActiveHandleGuard), LedgerError>
+where
+    F: FnOnce(&Path) -> Result<T, LedgerError>,
+{
     stat_read_only_regular_file(canonical)?;
     check_wal_sidecar(&append_suffix(canonical, "-wal"))?;
     check_rollback_journal_sidecar(&append_suffix(canonical, "-journal"))?;
 
-    let mut map = active_handles()
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner);
+    let mut state = registry.lock().unwrap_or_else(PoisonError::into_inner);
     let meta = stat_read_only_regular_file(canonical)?;
     let id = FileIdentity::from_metadata(canonical, &meta);
-    if map.get(&id).copied().unwrap_or(0) == 0 {
-        inspect_sqlite_header(canonical)?;
+    if state.counts.get(&id).copied().unwrap_or(0) == 0 {
+        inspect_sqlite_header_locked(&mut state, canonical, &id)?;
     }
     let conn = open_conn(canonical)?;
-    *map.entry(id.clone()).or_insert(0) += 1;
-    Ok((conn, ActiveHandleGuard(id)))
+    *state.counts.entry(id.clone()).or_insert(0) += 1;
+    Ok((
+        conn,
+        ActiveHandleGuard {
+            registry,
+            id,
+            is_writer: false,
+        },
+    ))
 }
 
 fn stat_read_only_regular_file(canonical: &Path) -> Result<fs::Metadata, LedgerError> {
@@ -180,10 +265,46 @@ fn stat_read_only_regular_file(canonical: &Path) -> Result<fs::Metadata, LedgerE
     Ok(meta)
 }
 
+fn inspect_sqlite_header_locked(
+    state: &mut ActiveHandleRegistry,
+    canonical: &Path,
+    id: &FileIdentity,
+) -> Result<(), LedgerError> {
+    if state.active_writers == 0 {
+        return inspect_sqlite_header(canonical);
+    }
+    if let Some(existing) = state.deferred_header_fds.get_mut(id) {
+        return inspect_sqlite_header_from_file(existing, canonical);
+    }
+    if state.deferred_header_fds.len() >= MAX_DEFERRED_HEADER_FDS {
+        return Err(LedgerError::Storage(format!(
+            "deferred read-only header fd cap ({MAX_DEFERRED_HEADER_FDS}) reached while writable ledger handles are active"
+        )));
+    }
+    let file = File::open(canonical).map_err(|err| {
+        LedgerError::Integrity(format!(
+            "failed to open read-only ledger '{}': {err}",
+            canonical.display()
+        ))
+    })?;
+    let entry = state.deferred_header_fds.entry(id.clone()).or_insert(file);
+    inspect_sqlite_header_from_file(entry, canonical)
+}
+
 fn inspect_sqlite_header(canonical: &Path) -> Result<(), LedgerError> {
     let mut file = File::open(canonical).map_err(|err| {
         LedgerError::Integrity(format!(
             "failed to open read-only ledger '{}': {err}",
+            canonical.display()
+        ))
+    })?;
+    inspect_sqlite_header_from_file(&mut file, canonical)
+}
+
+fn inspect_sqlite_header_from_file(file: &mut File, canonical: &Path) -> Result<(), LedgerError> {
+    file.seek(SeekFrom::Start(0)).map_err(|err| {
+        LedgerError::Integrity(format!(
+            "failed to seek read-only ledger '{}': {err}",
             canonical.display()
         ))
     })?;
@@ -466,5 +587,119 @@ mod tests {
             check_rollback_journal_sidecar_with_budget(&stuck, Duration::from_millis(15)),
             Err(LedgerError::Integrity(_))
         ));
+    }
+
+    fn write_valid_header_file(path: &Path) -> PathBuf {
+        let mut fake_sqlite = [0u8; SQLITE_HEADER_LEN];
+        fake_sqlite[..SQLITE_HEADER_MAGIC.len()].copy_from_slice(SQLITE_HEADER_MAGIC);
+        fake_sqlite[18] = 1;
+        fake_sqlite[19] = 1;
+        fs::write(path, fake_sqlite).unwrap();
+        fs::canonicalize(path).unwrap()
+    }
+
+    #[test]
+    fn deferred_header_fds_handle_aba_rename_dedup_error_retention_and_cleanup() {
+        static REG: OnceLock<Mutex<ActiveHandleRegistry>> = OnceLock::new();
+        let reg = REG.get_or_init(|| Mutex::new(ActiveHandleRegistry::default()));
+
+        let dir = TempDir::new().unwrap();
+        let orig = dir.path().join("orig.sqlite");
+        let moved = dir.path().join("moved.sqlite");
+        write_valid_header_file(&orig);
+
+        let ((), writer_guard) = open_writable_guarded_in(reg, &orig, || {
+            fs::rename(&orig, &moved).unwrap();
+            write_valid_header_file(&orig);
+            Ok(())
+        })
+        .unwrap();
+        {
+            let state = reg.lock().unwrap();
+            assert_eq!(state.active_writers, 1);
+            assert!(state.deferred_header_fds.is_empty());
+        }
+
+        let canonical_moved = fs::canonicalize(&moved).unwrap();
+        let ((), ro1) = open_read_only_guarded_in(reg, &canonical_moved, |_| Ok(())).unwrap();
+        assert_eq!(reg.lock().unwrap().deferred_header_fds.len(), 1);
+        drop(ro1);
+
+        let ((), ro2) = open_read_only_guarded_in(reg, &canonical_moved, |_| Ok(())).unwrap();
+        assert_eq!(reg.lock().unwrap().deferred_header_fds.len(), 1);
+        drop(ro2);
+
+        let bad_magic = dir.path().join("bad_magic_deferred.sqlite");
+        fs::write(&bad_magic, [0u8; SQLITE_HEADER_LEN]).unwrap();
+        let canonical_bad = fs::canonicalize(&bad_magic).unwrap();
+        assert!(matches!(
+            open_read_only_guarded_in(reg, &canonical_bad, |_| Ok(())),
+            Err(LedgerError::Integrity(_))
+        ));
+        assert_eq!(reg.lock().unwrap().deferred_header_fds.len(), 2);
+
+        drop(writer_guard);
+        {
+            let state = reg.lock().unwrap();
+            assert_eq!(state.active_writers, 0);
+            assert!(state.deferred_header_fds.is_empty());
+        }
+    }
+
+    #[test]
+    fn open_writable_guarded_error_and_deferred_fd_cap_fail_closed() {
+        static REG: OnceLock<Mutex<ActiveHandleRegistry>> = OnceLock::new();
+        let reg = REG.get_or_init(|| Mutex::new(ActiveHandleRegistry::default()));
+
+        let dir = TempDir::new().unwrap();
+        let writer_path = write_valid_header_file(&dir.path().join("writer.sqlite"));
+        let missing_path = dir.path().join("does_not_exist.sqlite");
+
+        let err: Result<((), ActiveHandleGuard), LedgerError> =
+            open_writable_guarded_in(reg, &writer_path, || {
+                Err(LedgerError::Storage("simulated open failure".into()))
+            });
+        assert!(matches!(err, Err(LedgerError::Storage(_))));
+        assert_eq!(reg.lock().unwrap().active_writers, 0);
+
+        let err = open_writable_guarded_in(reg, &missing_path, || Ok(()));
+        assert!(matches!(err, Err(LedgerError::Storage(_))));
+        assert_eq!(reg.lock().unwrap().active_writers, 0);
+
+        let ((), writer_guard) = open_writable_guarded_in(reg, &writer_path, || Ok(())).unwrap();
+        let mut first_ro = None;
+        for idx in 0..MAX_DEFERRED_HEADER_FDS {
+            let fp = write_valid_header_file(&dir.path().join(format!("ro_{idx}.sqlite")));
+            let ((), ro) = open_read_only_guarded_in(reg, &fp, |_| Ok(())).unwrap();
+            drop(ro);
+            if idx == 0 {
+                first_ro = Some(fp);
+            }
+        }
+        assert_eq!(
+            reg.lock().unwrap().deferred_header_fds.len(),
+            MAX_DEFERRED_HEADER_FDS
+        );
+
+        let ((), ro_reuse) =
+            open_read_only_guarded_in(reg, first_ro.as_ref().unwrap(), |_| Ok(())).unwrap();
+        drop(ro_reuse);
+        assert_eq!(
+            reg.lock().unwrap().deferred_header_fds.len(),
+            MAX_DEFERRED_HEADER_FDS
+        );
+
+        let extra = write_valid_header_file(&dir.path().join("ro_overflow.sqlite"));
+        assert!(matches!(
+            open_read_only_guarded_in(reg, &extra, |_| Ok(())),
+            Err(LedgerError::Storage(_))
+        ));
+
+        drop(writer_guard);
+        assert_eq!(reg.lock().unwrap().active_writers, 0);
+        assert!(reg.lock().unwrap().deferred_header_fds.is_empty());
+        let ((), ro_extra) = open_read_only_guarded_in(reg, &extra, |_| Ok(())).unwrap();
+        drop(ro_extra);
+        assert!(reg.lock().unwrap().deferred_header_fds.is_empty());
     }
 }

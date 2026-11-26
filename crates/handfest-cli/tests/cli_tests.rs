@@ -840,22 +840,46 @@ fn assert_failed_without_stdout(out: &Output, label: &str) {
     );
 }
 
+fn assert_existing_ledger_open_error(out: &Output, expected_code: &str, label: &str) {
+    assert_failed_without_stdout(out, label);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let parsed: Value = serde_json::from_str(stderr.trim()).unwrap_or_else(|err| {
+        panic!(
+            "{label}: expected structured JSON on stderr, got parse error {err}; stderr={stderr}"
+        )
+    });
+    assert_eq!(
+        parsed["error"], "ledger_open_failed",
+        "{label}: unexpected error field in {parsed}"
+    );
+    assert_eq!(
+        parsed["code"], expected_code,
+        "{label}: unexpected code field in {parsed}"
+    );
+    assert!(
+        parsed["message"]
+            .as_str()
+            .is_some_and(|msg| !msg.is_empty()),
+        "{label}: expected non-empty message string in {parsed}"
+    );
+}
+
 #[test]
 fn check_require_existing_ledger_rejects_missing_zero_byte_and_empty_schema() {
     let dir = TempDir::new().unwrap();
     let (signed_path, agent_key) = setup_merge_mandate_fixture(dir.path());
 
-    // 1. Missing ledger fails closed without creating the file.
+    // 1. Missing ledger fails closed with `missing_ledger` without creating the file.
     let missing = dir.path().join("missing.sqlite");
     let out = run_check_on_ledger(&signed_path, &agent_key, &missing, true);
-    assert_failed_without_stdout(&out, "missing ledger");
+    assert_existing_ledger_open_error(&out, "missing_ledger", "missing ledger");
     assert!(!missing.exists(), "missing ledger must not be created");
 
-    // 2. 0-byte ledger fails closed without initializing tables.
+    // 2. 0-byte ledger fails closed with `invalid_ledger` without initializing tables.
     let zero_byte = dir.path().join("zero.sqlite");
     fs::write(&zero_byte, b"").unwrap();
     let out = run_check_on_ledger(&signed_path, &agent_key, &zero_byte, true);
-    assert_failed_without_stdout(&out, "0-byte ledger");
+    assert_existing_ledger_open_error(&out, "invalid_ledger", "0-byte ledger");
     assert_eq!(
         fs::metadata(&zero_byte).unwrap().len(),
         0,
@@ -864,12 +888,12 @@ fn check_require_existing_ledger_rejects_missing_zero_byte_and_empty_schema() {
     let zero_audit = run_raw(&["audit", "--ledger", path_str(&zero_byte)]);
     assert_failed_without_stdout(&zero_audit, "audit 0-byte ledger");
 
-    // 3. Empty-schema SQLite DB fails closed without creating the receipts table.
+    // 3. Empty-schema SQLite DB fails closed with `invalid_ledger` without creating tables.
     let empty_schema = dir.path().join("empty_schema.sqlite");
     let empty_bytes = minimal_empty_sqlite_db_bytes();
     fs::write(&empty_schema, &empty_bytes).unwrap();
     let out = run_check_on_ledger(&signed_path, &agent_key, &empty_schema, true);
-    assert_failed_without_stdout(&out, "empty-schema SQLite DB");
+    assert_existing_ledger_open_error(&out, "invalid_ledger", "empty-schema SQLite DB");
     let after_bytes = fs::read(&empty_schema).unwrap();
     assert_eq!(
         after_bytes, empty_bytes,
@@ -883,6 +907,18 @@ fn check_require_existing_ledger_rejects_missing_zero_byte_and_empty_schema() {
     );
     let empty_audit = run_raw(&["audit", "--ledger", path_str(&empty_schema)]);
     assert_failed_without_stdout(&empty_audit, "audit empty-schema SQLite DB");
+
+    // 4. Corrupt non-SQLite file fails closed with `invalid_ledger` without modification.
+    let corrupt = dir.path().join("corrupt.sqlite");
+    let garbage = b"not a valid sqlite database header at all!";
+    fs::write(&corrupt, garbage).unwrap();
+    let out = run_check_on_ledger(&signed_path, &agent_key, &corrupt, true);
+    assert_existing_ledger_open_error(&out, "invalid_ledger", "corrupt non-SQLite ledger");
+    assert_eq!(fs::read(&corrupt).unwrap(), garbage);
+
+    // 5. Existing non-openable directory path fails closed with `storage_error`.
+    let out = run_check_on_ledger(&signed_path, &agent_key, dir.path(), true);
+    assert_existing_ledger_open_error(&out, "storage_error", "directory path as ledger");
 }
 
 #[test]
@@ -927,16 +963,20 @@ fn check_require_existing_ledger_accepts_initialized_ledger_and_prevents_quota_r
     // Exhausted quota must NOT reset when ledger is truncated, replaced with an empty schema, or deleted.
     fs::write(&ledger, b"").unwrap();
     let trunc_out = run_check_on_ledger(&signed_path, &agent_key, &ledger, true);
-    assert_failed_without_stdout(&trunc_out, "truncated exhausted ledger");
+    assert_existing_ledger_open_error(&trunc_out, "invalid_ledger", "truncated exhausted ledger");
     assert_eq!(fs::metadata(&ledger).unwrap().len(), 0);
 
     fs::write(&ledger, &empty_bytes).unwrap();
     let empty_out = run_check_on_ledger(&signed_path, &agent_key, &ledger, true);
-    assert_failed_without_stdout(&empty_out, "empty-schema replacement of exhausted ledger");
+    assert_existing_ledger_open_error(
+        &empty_out,
+        "invalid_ledger",
+        "empty-schema replacement of exhausted ledger",
+    );
     assert_eq!(fs::read(&ledger).unwrap(), empty_bytes);
 
     fs::remove_file(&ledger).unwrap();
     let deleted_out = run_check_on_ledger(&signed_path, &agent_key, &ledger, true);
-    assert_failed_without_stdout(&deleted_out, "deleted exhausted ledger");
+    assert_existing_ledger_open_error(&deleted_out, "missing_ledger", "deleted exhausted ledger");
     assert!(!ledger.exists());
 }
