@@ -459,3 +459,65 @@ fn existing_ledger_open_flags_forbid_create_and_fail_on_missing_path() {
         "EXISTING_LEDGER_OPEN_FLAGS must never create a missing database file"
     );
 }
+
+#[cfg(unix)]
+#[test]
+fn audit_snapshot_shared_lock_survives_unrelated_writer_drop_with_deferred_fd() {
+    use std::process::Command;
+
+    let dir = TempDir::new().unwrap();
+    let ledger_a = dir.path().join("audit_a.sqlite");
+    let ledger_b = dir.path().join("writer_b.sqlite");
+    let victim_c = dir.path().join("victim_c.sqlite");
+    let victim_c_journal = dir.path().join("victim_c.sqlite-journal");
+    let (chain, req, facts, now) = sample_chain_and_req();
+
+    for path in [&ledger_a, &ledger_b, &victim_c] {
+        let mut w = SqliteLedger::open(path).unwrap();
+        w.evaluate_and_record(&chain, &req, &facts, now).unwrap();
+    }
+
+    let ro1 = SqliteLedger::open_read_only(&ledger_a).unwrap();
+    let exe = std::env::current_exe().expect("current test exe");
+
+    let (verified, maybe_rec) = run_audit_tx(&ro1.conn, Some(&req.actor_key), || {
+        {
+            let _writer_b = SqliteLedger::open_existing(&ledger_b).unwrap();
+            fs::hard_link(&ledger_a, &victim_c_journal).unwrap();
+            let err = SqliteLedger::open_read_only(&victim_c).unwrap_err();
+            assert!(matches!(err, LedgerError::Integrity(_)));
+            fs::remove_file(&victim_c_journal).unwrap();
+        }
+        let locked = Command::new(&exe)
+            .args([
+                "--exact",
+                "sqlite::tests::ro_snapshot_exclusive_probe_helper",
+                "--quiet",
+            ])
+            .env("HANDFEST_RO_SNAPSHOT_DB", &ledger_a)
+            .env("HANDFEST_RO_SNAPSHOT_EXPECT_LOCKED", "1")
+            .status()
+            .expect("spawn locked probe");
+        assert!(
+            locked.success(),
+            "dropping writer B while ro1 held audit_snapshot SHARED lock dropped ro1's POSIX lock!"
+        );
+    })
+    .unwrap();
+
+    assert_eq!(verified, 1);
+    assert_eq!(maybe_rec.unwrap().total_decisions, 1);
+    drop(ro1);
+
+    let unlocked = Command::new(&exe)
+        .args([
+            "--exact",
+            "sqlite::tests::ro_snapshot_exclusive_probe_helper",
+            "--quiet",
+        ])
+        .env("HANDFEST_RO_SNAPSHOT_DB", &ledger_a)
+        .env("HANDFEST_RO_SNAPSHOT_EXPECT_LOCKED", "0")
+        .status()
+        .expect("spawn unlocked probe");
+    assert!(unlocked.success());
+}

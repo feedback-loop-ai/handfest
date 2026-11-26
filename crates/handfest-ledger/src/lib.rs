@@ -22,6 +22,7 @@ use crate::codec::key_id_serde;
 /// Errors returned by [`ReceiptLedger`] implementations.
 #[derive(Debug)]
 pub enum LedgerError {
+    NotFound(String),
     Storage(String),
     Json(serde_json::Error),
     Integrity(String),
@@ -31,6 +32,7 @@ pub enum LedgerError {
 impl fmt::Display for LedgerError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::NotFound(msg) => write!(f, "ledger not found: {msg}"),
             Self::Storage(msg) => write!(f, "ledger storage error: {msg}"),
             Self::Json(err) => write!(f, "json serialization error: {err}"),
             Self::Integrity(msg) => write!(f, "ledger integrity error: {msg}"),
@@ -43,7 +45,10 @@ impl std::error::Error for LedgerError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Json(err) => Some(err),
-            Self::Storage(_) | Self::Integrity(_) | Self::QuotaAccounting(_) => None,
+            Self::NotFound(_)
+            | Self::Storage(_)
+            | Self::Integrity(_)
+            | Self::QuotaAccounting(_) => None,
         }
     }
 }

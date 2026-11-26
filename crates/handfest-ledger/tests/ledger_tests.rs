@@ -1574,6 +1574,9 @@ fn receipt_ledger_trait_polymorphic_dyn_and_generic() {
     assert!(json_err.source().is_some());
 
     // Verify LedgerError Display + Error::source across variants.
+    let nf_err = LedgerError::NotFound("missing".to_string());
+    assert!(nf_err.to_string().contains("ledger not found"));
+    assert!(nf_err.source().is_none());
     let int_err = LedgerError::Integrity("bad".to_string());
     assert!(int_err.to_string().contains("ledger integrity error"));
     assert!(int_err.source().is_none());

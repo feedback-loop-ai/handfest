@@ -626,8 +626,8 @@ assert_eq "decimal bare sci quota rc" "$HOOK_RC" "2"
 assert_json "decimal bare sci quota stderr" "$(cat "$TMP_DIR/stderr.txt")" "d['verdict'] == 'deny' and d['code'] == 'mandate_denied'"
 assert_json "decimal bare sci formatted" "$(cat "$CAPTURED_FACTS")" "d['resource.amount'] == {'decimal': '15.0'}"
 
-# Reject integer-like typed decimal strings without '.', quoted scientific notation "1.5e1", pathological exponents, raw fractional scale > 28, i128::MAX+1, and i128::MIN-1
-for bad_amt in '"1"' '"-1"' '"0"' '"1.5e1"' '1e1000000' '"1e1000000"' '"0.00000000000000000000000000001"' "\"$OVER_SCALE_ONE_ZEROS\"" "\"$OVER_SCALE_ZERO_ZEROS\"" "\"$LONG_ZEROS\"" '"170141183460469231731687303715884105728.0"' '"-170141183460469231731687303715884105729.0"'; do
+# Reject integer-like typed decimal strings without '.', leading-zero decimals ("00.5"), quoted scientific notation "1.5e1", pathological exponents, raw fractional scale > 28, i128::MAX+1, and i128::MIN-1
+for bad_amt in '"1"' '"-1"' '"0"' '"00.5"' '"-00.5"' '"01.5"' '"1.5e1"' '1e1000000' '"1e1000000"' '"0.00000000000000000000000000001"' "\"$OVER_SCALE_ONE_ZEROS\"" "\"$OVER_SCALE_ZERO_ZEROS\"" "\"$LONG_ZEROS\"" '"170141183460469231731687303715884105728.0"' '"-170141183460469231731687303715884105729.0"'; do
   HOOK_RC=0
   HANDFEST_POLICY_MAP="$PAY_MAP" HANDFEST_LEDGER="$PAY_LEDGER" HANDFEST_CHAIN="$PAY_SIGNED" \
     "$HOOK" <<<"{\"tool_name\":\"charge_card\",\"tool_input\":{\"currency\":\"USD\",\"approved\":true,\"scheduled_at\":\"2026-11-24T18:30:00Z\",\"amount\":$bad_amt}}" \
@@ -996,7 +996,31 @@ if [[ -e "$DEL_LEDGER" ]]; then
   echo "FAIL [deleted ledger recreated]: $DEL_LEDGER must not be recreated after deletion" >&2
   exit 1
 fi
-pass "Missing, 0-byte truncated, empty-schema SQLite, and deleted HANDFEST_LEDGER all failed closed (exit 2) and blocked quota reset"
+
+# (e) Hook-to-CLI --require-existing-ledger TOCTOU boundary: unlink ledger AFTER pre-tool-use.sh
+#     passes its os.path.exists precheck and BEFORE exec'ing the real handfest binary.
+TOCTOU_LEDGER="$TMP_DIR/toctou-ledger.sqlite"
+HOOK_RC=0
+HANDFEST_LEDGER="$TOCTOU_LEDGER" HANDFEST_ALLOW_CREATE_LEDGER=1 "$HOOK" <<<"$VALID_PAYLOAD" >"$TMP_DIR/stdout.txt" 2>"$TMP_DIR/stderr.txt" || HOOK_RC=$?
+assert_eq "toctou setup permit rc" "$HOOK_RC" "0"
+TOCTOU_WRAPPER="$TMP_DIR/toctou-unlink-handfest.sh"
+cat <<TOCTOU_EOF >"$TOCTOU_WRAPPER"
+#!/usr/bin/env bash
+set -euo pipefail
+rm -f "\$HANDFEST_LEDGER"
+exec "$HANDFEST_BIN" "\$@"
+TOCTOU_EOF
+chmod +x "$TOCTOU_WRAPPER"
+HOOK_RC=0
+HANDFEST_BIN="$TOCTOU_WRAPPER" HANDFEST_LEDGER="$TOCTOU_LEDGER" "$HOOK" <<<"$VALID_PAYLOAD" >"$TMP_DIR/stdout.txt" 2>"$TMP_DIR/stderr.txt" || HOOK_RC=$?
+assert_eq "hook-to-cli toctou rc" "$HOOK_RC" "2"
+assert_eq "hook-to-cli toctou stdout empty" "$(cat "$TMP_DIR/stdout.txt")" ""
+assert_strict_rfc8259_json_line "hook-to-cli toctou stderr" "$TMP_DIR/stderr.txt" "d['verdict'] == 'deny' and d['code'] == 'gate_error' and 'missing_ledger' in d['reason']"
+if [[ -e "$TOCTOU_LEDGER" ]]; then
+  echo "FAIL [toctou ledger recreated]: $TOCTOU_LEDGER must not be recreated by handfest check" >&2
+  exit 1
+fi
+pass "Missing, 0-byte truncated, empty-schema SQLite, deleted, and hook-to-CLI TOCTOU HANDFEST_LEDGER all failed closed (exit 2) and blocked quota reset"
 
 # Test 29: Closed stderr pipe (EPIPE), closed fd 2>&-, stdout >/dev/full, and python3-only PATH (no cat)
 python3 -I - "$HOOK" "$EMPTY_BIN" "$(command -v bash)" <<'PY_EPIPE'

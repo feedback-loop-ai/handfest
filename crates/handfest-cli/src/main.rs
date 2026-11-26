@@ -3,7 +3,7 @@
 mod facts;
 
 use std::fs;
-use std::io::{self, Write};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
@@ -345,19 +345,18 @@ fn cmd_check(args: &CheckArgs) -> Result<ExitCode, String> {
     }
 }
 
-fn classify_existing_ledger_open_error(path: &Path, err: &LedgerError) -> &'static str {
+fn classify_existing_ledger_open_error(err: &LedgerError) -> &'static str {
     match err {
+        LedgerError::NotFound(_) => "missing_ledger",
         LedgerError::Integrity(_) => "invalid_ledger",
-        LedgerError::Storage(_) => match fs::metadata(path) {
-            Err(io_err) if io_err.kind() == io::ErrorKind::NotFound => "missing_ledger",
-            _ => "storage_error",
-        },
-        LedgerError::Json(_) | LedgerError::QuotaAccounting(_) => "storage_error",
+        LedgerError::Storage(_) | LedgerError::Json(_) | LedgerError::QuotaAccounting(_) => {
+            "storage_error"
+        }
     }
 }
 
 fn emit_existing_ledger_open_error(path: &Path, err: &LedgerError) {
-    let code = classify_existing_ledger_open_error(path, err);
+    let code = classify_existing_ledger_open_error(err);
     let message = format!("failed to open ledger '{}': {err}", path.display());
     let payload = json!({
         "error": "ledger_open_failed",
@@ -506,31 +505,25 @@ mod tests {
 
     #[test]
     fn classify_existing_ledger_open_error_maps_all_variants() {
-        let missing = Path::new("/nonexistent-handfest-ledger-path-for-test.sqlite");
-        let existing = std::env::temp_dir();
-
         assert_eq!(
-            classify_existing_ledger_open_error(missing, &LedgerError::Integrity("bad".into())),
-            "invalid_ledger"
-        );
-        assert_eq!(
-            classify_existing_ledger_open_error(missing, &LedgerError::Storage("cantopen".into())),
+            classify_existing_ledger_open_error(&LedgerError::NotFound("missing".into())),
             "missing_ledger"
         );
         assert_eq!(
-            classify_existing_ledger_open_error(&existing, &LedgerError::Storage("isdir".into())),
+            classify_existing_ledger_open_error(&LedgerError::Integrity("bad".into())),
+            "invalid_ledger"
+        );
+        assert_eq!(
+            classify_existing_ledger_open_error(&LedgerError::Storage("cantopen".into())),
             "storage_error"
         );
         let json_err = serde_json::from_str::<serde_json::Value>("{").unwrap_err();
         assert_eq!(
-            classify_existing_ledger_open_error(&existing, &LedgerError::Json(json_err)),
+            classify_existing_ledger_open_error(&LedgerError::Json(json_err)),
             "storage_error"
         );
         assert_eq!(
-            classify_existing_ledger_open_error(
-                &existing,
-                &LedgerError::QuotaAccounting("overflow".into())
-            ),
+            classify_existing_ledger_open_error(&LedgerError::QuotaAccounting("overflow".into())),
             "storage_error"
         );
     }

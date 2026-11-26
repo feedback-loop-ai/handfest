@@ -1005,11 +1005,11 @@ fn corrupt_database_page_header_and_page_size_bytes_map_to_integrity_error() {
 fn open_existing_rejects_missing_truncated_non_sqlite_and_empty_schema() {
     let dir = TempDir::new().unwrap();
 
-    // 1. Missing file fails without creating a file.
+    // 1. Missing file fails with typed LedgerError::NotFound without creating a file.
     let missing = dir.path().join("does_not_exist.sqlite");
     assert!(matches!(
         SqliteLedger::open_existing(&missing),
-        Err(LedgerError::Storage(_))
+        Err(LedgerError::NotFound(_))
     ));
     assert!(
         !missing.exists(),
@@ -1243,11 +1243,20 @@ fn open_read_only_on_renamed_ledger_preserves_writer_posix_lock() {
         writer_tx.execute_batch("BEGIN IMMEDIATE;").unwrap();
 
         fs::rename(&db_path, &renamed_direct).unwrap();
-        let ro = SqliteLedger::open_read_only(&renamed_direct).unwrap();
-        assert_eq!(ro.verify_integrity().unwrap(), 1);
-        drop(ro);
+        // Replace the original path with a distinct initialized ledger inode while the original
+        // inode still holds `BEGIN IMMEDIATE` at `renamed_direct`.
+        init_single_permit_ledger(&db_path);
+
+        let ro_moved = SqliteLedger::open_read_only(&renamed_direct).unwrap();
+        assert_eq!(ro_moved.verify_integrity().unwrap(), 1);
+        drop(ro_moved);
+
+        let ro_replaced = SqliteLedger::open_read_only(&db_path).unwrap();
+        assert_eq!(ro_replaced.verify_integrity().unwrap(), 1);
+        drop(ro_replaced);
 
         assert_cross_process_lock(&renamed_direct, "exclusive", true);
+        assert_cross_process_lock(&renamed_direct, "immediate", true);
         writer_tx.execute_batch("ROLLBACK;").unwrap();
     }
     assert_cross_process_lock(&renamed_direct, "exclusive", false);
@@ -1276,4 +1285,107 @@ fn open_read_only_on_renamed_ledger_preserves_writer_posix_lock() {
         writer_tx.execute_batch("ROLLBACK;").unwrap();
     }
     assert_cross_process_lock(&renamed_target, "exclusive", false);
+}
+
+#[cfg(unix)]
+#[test]
+fn open_read_only_rejects_symlink_and_hardlink_sidecars_and_preserves_writer_posix_lock() {
+    use std::os::unix::fs::symlink;
+
+    let dir = TempDir::new().unwrap();
+    let active_db = dir.path().join("active_writer.sqlite");
+    let victim_db = dir.path().join("victim.sqlite");
+    let victim_journal = dir.path().join("victim.sqlite-journal");
+    let victim_wal = dir.path().join("victim.sqlite-wal");
+    init_single_permit_ledger(&active_db);
+    init_single_permit_ledger(&victim_db);
+
+    {
+        let _writer = SqliteLedger::open_existing(&active_db).unwrap();
+        let writer_tx = Connection::open(&active_db).unwrap();
+        writer_tx.execute_batch("BEGIN IMMEDIATE;").unwrap();
+
+        // 1. Symlinked `-journal` pointing to active ledger fails closed without opening it.
+        symlink(&active_db, &victim_journal).unwrap();
+        let sym_j_err = SqliteLedger::open_read_only(&victim_db).unwrap_err();
+        assert!(
+            matches!(&sym_j_err, LedgerError::Integrity(msg) if msg.contains("symlink")),
+            "expected symlink journal Integrity error, got: {sym_j_err:?}"
+        );
+        assert_cross_process_lock(&active_db, "exclusive", true);
+        assert_cross_process_lock(&active_db, "immediate", true);
+        fs::remove_file(&victim_journal).unwrap();
+
+        // 2. Symlinked `-wal` pointing to active ledger fails closed without following it.
+        symlink(&active_db, &victim_wal).unwrap();
+        let sym_w_err = SqliteLedger::open_read_only(&victim_db).unwrap_err();
+        assert!(
+            matches!(&sym_w_err, LedgerError::Integrity(msg) if msg.contains("symlink")),
+            "expected symlink WAL Integrity error, got: {sym_w_err:?}"
+        );
+        assert_cross_process_lock(&active_db, "exclusive", true);
+        fs::remove_file(&victim_wal).unwrap();
+
+        // 3. Hard-linked `-journal` pointing to active ledger fails closed AND defers its raw fd
+        //    so `close()` never drops the active writer's POSIX `fcntl` lock.
+        fs::hard_link(&active_db, &victim_journal).unwrap();
+        let hl_err = SqliteLedger::open_read_only(&victim_db).unwrap_err();
+        assert!(
+            matches!(hl_err, LedgerError::Integrity(_)),
+            "expected hard-linked hot-journal Integrity error, got: {hl_err:?}"
+        );
+        assert_cross_process_lock(&active_db, "exclusive", true);
+        assert_cross_process_lock(&active_db, "immediate", true);
+        fs::remove_file(&victim_journal).unwrap();
+
+        writer_tx.execute_batch("ROLLBACK;").unwrap();
+    }
+    assert_cross_process_lock(&active_db, "exclusive", false);
+}
+
+#[cfg(unix)]
+#[test]
+fn dropping_writer_while_reader_holds_shared_lock_preserves_reader_posix_lock() {
+    use rusqlite::OpenFlags;
+
+    let dir = TempDir::new().unwrap();
+    let ledger_a = dir.path().join("reader_a.sqlite");
+    let ledger_b = dir.path().join("writer_b.sqlite");
+    let victim_c = dir.path().join("victim_c.sqlite");
+    let victim_c_journal = dir.path().join("victim_c.sqlite-journal");
+    init_single_permit_ledger(&ledger_a);
+    init_single_permit_ledger(&ledger_b);
+    init_single_permit_ledger(&victim_c);
+
+    {
+        let ro1 = SqliteLedger::open_read_only(&ledger_a).unwrap();
+        assert_eq!(ro1.audit_snapshot(None).unwrap().0, 1);
+
+        // Hold an active POSIX SHARED lock on ledger A (same lock acquired by `audit_snapshot`).
+        let ro_shared_tx =
+            Connection::open_with_flags(&ledger_a, OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+        ro_shared_tx
+            .execute_batch("BEGIN DEFERRED; SELECT count(*) FROM receipts;")
+            .unwrap();
+        assert_cross_process_lock(&ledger_a, "exclusive", true);
+
+        // Open writer B, trigger a deferred raw fd referencing ledger A's inode via hard-linked
+        // journal sidecar, then drop writer B while ro1 is STILL active.
+        {
+            let _writer_b = SqliteLedger::open_existing(&ledger_b).unwrap();
+            fs::hard_link(&ledger_a, &victim_c_journal).unwrap();
+            let err = SqliteLedger::open_read_only(&victim_c).unwrap_err();
+            assert!(matches!(err, LedgerError::Integrity(_)));
+            fs::remove_file(&victim_c_journal).unwrap();
+        }
+
+        // Dropping writer B while ro1 is still open MUST NOT close deferred_fds or drop ro1's
+        // POSIX SHARED lock on ledger A.
+        assert_cross_process_lock(&ledger_a, "exclusive", true);
+
+        ro_shared_tx.execute_batch("ROLLBACK;").unwrap();
+        drop(ro_shared_tx);
+        drop(ro1);
+    }
+    assert_cross_process_lock(&ledger_a, "exclusive", false);
 }

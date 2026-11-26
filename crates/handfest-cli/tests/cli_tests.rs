@@ -828,7 +828,12 @@ fn run_check_on_ledger(
 }
 
 fn assert_failed_without_stdout(out: &Output, label: &str) {
-    assert!(!out.status.success(), "{label}: expected non-zero exit");
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "{label}: expected exit code 1, got: {:?}",
+        out.status
+    );
     assert!(
         out.stdout.is_empty(),
         "{label}: expected empty stdout on open failure, got: {}",
@@ -919,6 +924,10 @@ fn check_require_existing_ledger_rejects_missing_zero_byte_and_empty_schema() {
     // 5. Existing non-openable directory path fails closed with `storage_error`.
     let out = run_check_on_ledger(&signed_path, &agent_key, dir.path(), true);
     assert_existing_ledger_open_error(&out, "storage_error", "directory path as ledger");
+
+    // 6. `:memory:` with `--require-existing-ledger` fails closed with `storage_error` (NOT `missing_ledger`).
+    let out = run_check_on_ledger(&signed_path, &agent_key, Path::new(":memory:"), true);
+    assert_existing_ledger_open_error(&out, "storage_error", ":memory: ledger");
 }
 
 #[test]
@@ -943,7 +952,11 @@ fn check_require_existing_ledger_accepts_initialized_ledger_and_prevents_quota_r
 
     // Third call exhausts LIMIT 2 calls and yields a structured deny verdict on stdout.
     let third_out = run_check_on_ledger(&signed_path, &agent_key, &ledger, true);
-    assert!(!third_out.status.success(), "third call must be denied");
+    assert_eq!(
+        third_out.status.code(),
+        Some(1),
+        "third call must be denied with exit 1"
+    );
     let third_json: Value = serde_json::from_slice(&third_out.stdout).unwrap();
     assert_eq!(third_json["verdict"], "deny");
 

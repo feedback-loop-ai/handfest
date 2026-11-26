@@ -66,7 +66,8 @@ impl SqliteLedger {
         let path = path.as_ref();
         validate_file_path(path, "SqliteLedger::open_existing")?;
         let (conn, handle_guard) = open_writable_guarded(path, || {
-            Connection::open_with_flags(path, EXISTING_LEDGER_OPEN_FLAGS).map_err(LedgerError::from)
+            Connection::open_with_flags(path, EXISTING_LEDGER_OPEN_FLAGS)
+                .map_err(|err| map_open_existing_error(path, err))
         })?;
         Self::init(conn, Some(handle_guard), "delete", false)
     }
@@ -300,6 +301,28 @@ fn load_latest_receipt_hash(tx: &Transaction<'_>) -> Result<Option<MandateId>, L
             .map(Some)
             .map_err(|err| LedgerError::Integrity(format!("corrupt latest receipt_hash: {err}"))),
     }
+}
+
+fn map_open_existing_error(path: &Path, err: rusqlite::Error) -> LedgerError {
+    if matches!(
+        err,
+        rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error {
+                code: rusqlite::ErrorCode::CannotOpen,
+                ..
+            },
+            _,
+        )
+    ) {
+        if matches!(
+            fs::metadata(path),
+            Err(io_err) if io_err.kind() == std::io::ErrorKind::NotFound
+        ) {
+            return LedgerError::NotFound(err.to_string());
+        }
+        return LedgerError::Storage(err.to_string());
+    }
+    LedgerError::from(err)
 }
 
 fn validate_file_path(path: &Path, caller: &str) -> Result<(), LedgerError> {
