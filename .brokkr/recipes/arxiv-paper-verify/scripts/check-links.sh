@@ -113,8 +113,15 @@ for key, info in sorted(entries.items()):
                 errors.append(f"{key}: EU ELI {url} Cellar SPARQL lookup failed: {exc}")
                 entry_check["verifications"].append({"kind": "eu_eli_cellar", "eli": rel, "status": 0})
         else:
-            code, final_url, _ = fetch(url)
-            entry_check["verifications"].append({"kind": "url", "url": url, "status": code, "final_url": final_url})
+            code, final_url, body = fetch(url)
+            tm = re.search(r"<title[^>]*>(.*?)</title>", body, re.I | re.S)
+            page_title = re.sub(r"\s+", " ", tm.group(1)).strip()[:200] if tm else ""
+            overlap = len(norm_words(f.get("title", "")) & norm_words(page_title)) / max(1, len(norm_words(f.get("title", "")))) if page_title else None
+            ver = {"kind": "url", "url": url, "status": code, "final_url": final_url}
+            if page_title:
+                ver["page_title"] = page_title
+                ver["title_overlap"] = round(overlap, 2)
+            entry_check["verifications"].append(ver)
             if code not in (200, 301, 302, 303, 307, 308, 403):
                 errors.append(f"{key}: URL {url} unreachable (HTTP {code})")
             elif code == 403 and not (doi or eprint):
