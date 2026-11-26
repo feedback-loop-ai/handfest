@@ -2,7 +2,7 @@
 
 LaTeX source and compiled PDF of
 
-> *Executable Ricardian Mandates: Deterministic, Multi-Anchor Authority Vesting for Autonomous AI Agents*
+> *Executable Ricardian Mandates: Deterministic Delegation of Authority to Autonomous AI Agents*
 > Valentin Yanakiev
 
 intended for arXiv (`cs.CR`, cross-listed `cs.AI`). The paper describes the code at commit `344df89`, the last commit that touches `crates/`.
@@ -21,7 +21,7 @@ The PDF in this directory is built with [Tectonic](https://tectonic-typesetting.
 tectonic -X compile docs/paper/handfest-ricardian-mandates.tex
 ```
 
-Any TeX Live installation works as well. The manuscript uses `geometry`, `inputenc`, `fontenc`, `lmodern`, `microtype`, `amsmath`, `amssymb`, `amsthm`, `booktabs`, `array`, `enumitem`, `xcolor`, `listings`, `tikz`, `natbib` (with `plainnat.bst`), `url`, `hyperref` and `doi`, and no custom class:
+Any TeX Live installation works as well. The manuscript uses `geometry`, `inputenc`, `fontenc`, `lmodern`, `amsmath`, `amssymb`, `amsthm`, `booktabs`, `array`, `enumitem`, `xcolor`, `listings`, `tikz`, `natbib` (with `plainnat.bst`), `url`, `hyperref` and `doi`, and no custom class:
 
 ```bash
 cd docs/paper
@@ -42,7 +42,7 @@ tar -czf handfest-arxiv-source.tar.gz \
   handfest-ricardian-mandates.tex handfest-ricardian-mandates.bbl references.bib
 ```
 
-Check the log of that build for undefined references and overfull boxes before uploading. The manuscript carries an AI assistance disclosure, as arXiv's policy on generative AI tools requires.
+The manuscript loads no engine-specific packages, so the pdfLaTeX build should break lines as the Tectonic build does. Check the log of that build for undefined references and overfull boxes before uploading all the same. The manuscript carries an AI assistance disclosure, as arXiv's policy on generative AI tools requires.
 
 ## Checking the code the paper describes
 

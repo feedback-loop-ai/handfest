@@ -65,7 +65,7 @@ From Old Norse *handfæstning* — the written charter a ruler signed before tak
              | Verdict::Permit                                 | Verdict::Deny { reason }
              v                                                 v
   +-------------------------+                       +---------------------------------------+
-  | Forward to Upstream MCP |                       |  handfest-ledger (SQLite, WAL mode)   |
+  | Forward to Upstream MCP |                       |  handfest-ledger (SQLite, rollback)   |
   | (GitHub, Cloud, Bank,   |                       |  - Single IMMEDIATE transaction:      |
   |  Filesystem, etc.)      |                       |    * Atomic chain-wide quota update   |
   +-------------------------+                       |    * Append hash-chained Receipt      |
