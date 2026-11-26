@@ -47,10 +47,10 @@ if undef:
 
 severe_overfull = []
 for m in re.finditer(r"Overfull \\hbox \(([0-9.]+)pt too wide\)[^\n]*", log_text):
-    if float(m.group(1)) > 10.0:
+    if float(m.group(1)) > 0.5:
         severe_overfull.append(m.group(0))
 if severe_overfull:
-    errors.append(f"severe Overfull \\hbox (>10pt): {severe_overfull[:10]}")
+    errors.append(f"Overfull \\hbox (>0.5pt margin overflow): {severe_overfull[:15]}")
 
 report = {
     "pdf_bytes": pdf_path.stat().st_size if pdf_path.is_file() else 0,
