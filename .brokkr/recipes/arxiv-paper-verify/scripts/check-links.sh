@@ -88,13 +88,37 @@ for key, info in sorted(entries.items()):
                 errors.append(f"{key}: arXiv {eprint} title mismatch (bib='{f.get('title','')}' vs arxiv='{ax_title}')")
 
     if url:
-        code, final_url, _ = fetch(url)
-        entry_check["verifications"].append({"kind": "url", "url": url, "status": code, "final_url": final_url})
-        if code not in (200, 301, 302, 303, 307, 308, 403):
-            # 403 is flagged as warning only if DOI/arXiv already verified; if no DOI/arXiv, fail closed!
-            errors.append(f"{key}: URL {url} unreachable (HTTP {code})")
-        elif code == 403 and not (doi or eprint):
-            errors.append(f"{key}: URL {url} returned HTTP 403 with no DOI/arXiv verification")
+        eli_m = re.match(r"^https?://data\.europa\.eu/eli/(.+)$", url)
+        if eli_m:
+            rel = eli_m.group(1).strip("/")
+            q = (
+                "PREFIX cdm: <http://publications.europa.eu/ontology/cdm#> "
+                "SELECT ?title WHERE { ?work cdm:resource_legal_eli ?eli . "
+                f'FILTER(STR(?eli) = "{rel}" || STR(?eli) = "http://data.europa.eu/eli/{rel}") '
+                "?expr cdm:expression_belongs_to_work ?work ; "
+                "cdm:expression_uses_language <http://publications.europa.eu/resource/authority/language/ENG> ; "
+                "cdm:expression_title ?title . } LIMIT 1"
+            )
+            sparql_url = "https://publications.europa.eu/webapi/rdf/sparql?query=" + urllib.parse.quote(q)
+            req = urllib.request.Request(sparql_url, headers={"Accept": "application/sparql-results+json", "User-Agent": UA})
+            try:
+                with urllib.request.urlopen(req, timeout=20) as resp:
+                    rows = json.loads(resp.read().decode("utf-8", errors="replace")).get("results", {}).get("bindings", [])
+                eli_title = rows[0]["title"]["value"] if rows else ""
+                overlap = len(norm_words(f.get("title", "")) & norm_words(eli_title)) / max(1, len(norm_words(f.get("title", ""))))
+                entry_check["verifications"].append({"kind": "eu_eli_cellar", "eli": rel, "status": 200, "cellar_title": eli_title[:160], "title_overlap": round(overlap, 2)})
+                if not eli_title or overlap < 0.5:
+                    errors.append(f"{key}: EU ELI {url} title mismatch via Cellar (bib='{f.get('title','')}' vs cellar='{eli_title[:120]}')")
+            except Exception as exc:
+                errors.append(f"{key}: EU ELI {url} Cellar SPARQL lookup failed: {exc}")
+                entry_check["verifications"].append({"kind": "eu_eli_cellar", "eli": rel, "status": 0})
+        else:
+            code, final_url, _ = fetch(url)
+            entry_check["verifications"].append({"kind": "url", "url": url, "status": code, "final_url": final_url})
+            if code not in (200, 301, 302, 303, 307, 308, 403):
+                errors.append(f"{key}: URL {url} unreachable (HTTP {code})")
+            elif code == 403 and not (doi or eprint):
+                errors.append(f"{key}: URL {url} returned HTTP 403 with no DOI/arXiv verification")
 
     checks.append(entry_check)
 
