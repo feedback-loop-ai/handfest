@@ -473,11 +473,24 @@ fn handfest_mcp_emits_chain_invalid_for_broken_attenuation() {
 }
 
 #[test]
-fn tool_policy_map_from_file_public_api_loads_valid_and_rejects_missing_file() {
+fn load_policy_map_file_loads_valid_rejects_invalid_policy_and_reports_io_error() {
+    use std::io::Write;
+
     let dir = tempfile::TempDir::new().unwrap();
-    let policy_path = dir.path().join("policy.json");
-    std::fs::write(
-        &policy_path,
+    let write_new = |name: &str, contents: &str| {
+        let path = dir.path().join(name);
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .expect("create new fixture file inside private temp dir");
+        file.write_all(contents.as_bytes())
+            .expect("write fixture file");
+        path
+    };
+
+    let policy_path = write_new(
+        "policy.json",
         r#"{
             "tools": {
                 "merge_pr": {
@@ -487,10 +500,9 @@ fn tool_policy_map_from_file_public_api_loads_valid_and_rejects_missing_file() {
                 }
             }
         }"#,
-    )
-    .unwrap();
+    );
 
-    let loaded = handfest_mcp::ToolPolicyMap::from_file(&policy_path).unwrap();
+    let loaded = handfest_mcp::mapping::load_policy_map_file(&policy_path).unwrap();
     assert_eq!(loaded.tools.len(), 1);
     loaded.validate().unwrap();
     assert_eq!(
@@ -509,9 +521,28 @@ fn tool_policy_map_from_file_public_api_loads_valid_and_rejects_missing_file() {
     let compiled: handfest_mcp::CompiledPolicyMap = loaded.compile().unwrap();
     assert!(compiled.policy_map().get("merge_pr").is_some());
 
+    let invalid_path = write_new(
+        "both_resource_ids.json",
+        r#"{
+            "tools": {
+                "merge_pr": {
+                    "action": "git.pr.merge",
+                    "resource_kind": "repo",
+                    "resource_id_arg": "repo",
+                    "static_resource_id": "acme/handfest"
+                }
+            }
+        }"#,
+    );
+    assert!(matches!(
+        handfest_mcp::mapping::load_policy_map_file(&invalid_path),
+        Err(handfest_mcp::MappingError::InvalidPolicy(ref msg))
+            if msg.contains("cannot declare both resource_id_arg and static_resource_id")
+    ));
+
     let missing_path = dir.path().join("missing.json");
     assert!(matches!(
-        handfest_mcp::ToolPolicyMap::from_file(&missing_path),
+        handfest_mcp::mapping::load_policy_map_file(&missing_path),
         Err(handfest_mcp::MappingError::Io(ref msg)) if msg.contains("failed to read")
     ));
 }

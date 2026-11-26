@@ -455,16 +455,6 @@ impl ToolPolicyMap {
         Ok(map)
     }
 
-    /// Loads and validates a [`ToolPolicyMap`] from a JSON file on disk.
-    #[cfg(feature = "std")]
-    pub fn from_file(path: impl AsRef<std::path::Path>) -> Result<Self, MappingError> {
-        let path_ref = path.as_ref();
-        let raw = std::fs::read_to_string(path_ref).map_err(|err| {
-            MappingError::Io(format!("failed to read '{}': {err}", path_ref.display()))
-        })?;
-        Self::from_json_str(&raw)
-    }
-
     /// Validates every tool policy and seals pre-compiled static [`VerifiedFacts`] into a
     /// [`CompiledPolicyMap`].
     pub fn compile(self) -> Result<CompiledPolicyMap, MappingError> {

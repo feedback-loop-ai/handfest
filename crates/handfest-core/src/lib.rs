@@ -1,8 +1,7 @@
-#![cfg_attr(not(feature = "std"), no_std)]
+#![no_std]
 //! Pure, deterministic core for Executable Ricardian Mandates (`HANDFEST v1`).
 //!
-//! By default (`#![no_std]` + `alloc`), `handfest-core` performs no I/O, no clock reads, and no
-//! randomness. The optional `std` feature adds convenience file loading (`ToolPolicyMap::from_file`).
+//! `handfest-core` performs no I/O, no clock reads, and no randomness.
 
 extern crate alloc;
 
