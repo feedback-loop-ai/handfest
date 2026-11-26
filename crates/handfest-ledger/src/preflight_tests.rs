@@ -635,19 +635,39 @@ fn post_open_non_file_guards_and_nonblock_fifo_reject_without_blocking() {
 
     // 3. Writerless FIFO: O_NONBLOCK ensures open returns immediately (no deadlock under mutex)
     //    and post-open !meta.is_file() rejects it cleanly in both header and journal helpers.
+    //    Run inside a child thread with a bounded deadline so mutating UNIX_O_NONBLOCK to Some(0)
+    //    or omitting it fails cleanly with a timeout panic instead of hanging forever.
     let fifo = dir.path().join("writerless.fifo");
     let mkfifo_status = Command::new("mkfifo").arg(&fifo).status().unwrap();
     assert!(mkfifo_status.success(), "mkfifo must succeed");
 
-    let hdr_fifo_err = inspect_sqlite_header_locked(&mut reg, &fifo).unwrap_err();
+    let fifo_for_thread = fifo.clone();
+    let (tx, rx) = std::sync::mpsc::channel();
+    let handle = std::thread::spawn(move || {
+        let mut thread_reg = ActiveHandleRegistry {
+            active_writers: 1,
+            ..Default::default()
+        };
+        let hdr_fifo_res = inspect_sqlite_header_locked(&mut thread_reg, &fifo_for_thread);
+        let deferred_empty = thread_reg.deferred_fds.is_empty();
+        let mut fifo_file = open_no_follow_read_only(&fifo_for_thread).unwrap();
+        let jrnl_fifo_res = read_rollback_journal_from_file(&mut fifo_file, &fifo_for_thread);
+        let _ = tx.send((hdr_fifo_res, deferred_empty, jrnl_fifo_res));
+    });
+
+    let (hdr_fifo_res, deferred_empty, jrnl_fifo_res) = rx
+        .recv_timeout(std::time::Duration::from_secs(2))
+        .expect("writerless FIFO probe timed out after 2s (missing O_NONBLOCK?)");
+    handle.join().unwrap();
+
+    let hdr_fifo_err = hdr_fifo_res.unwrap_err();
     assert!(
         matches!(&hdr_fifo_err, LedgerError::Integrity(m) if m.contains("not a regular file")),
         "expected not a regular file error on writerless FIFO, got: {hdr_fifo_err:?}"
     );
-    assert!(reg.deferred_fds.is_empty());
+    assert!(deferred_empty);
 
-    let mut fifo_file = open_no_follow_read_only(&fifo).unwrap();
-    let jrnl_fifo_err = read_rollback_journal_from_file(&mut fifo_file, &fifo).unwrap_err();
+    let jrnl_fifo_err = jrnl_fifo_res.unwrap_err();
     assert!(
         matches!(&jrnl_fifo_err, LedgerError::Integrity(m) if m.contains("invalid non-file")),
         "expected invalid non-file error on writerless FIFO journal, got: {jrnl_fifo_err:?}"

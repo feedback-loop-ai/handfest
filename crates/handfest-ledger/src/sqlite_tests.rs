@@ -1073,3 +1073,44 @@ fn open_existing_maps_symlink_cycle_and_0000_ledger_to_storage_not_not_found() {
         "existing 0o000 ledger must map to LedgerError::Storage, got: {mode000_err:?}"
     );
 }
+
+#[cfg(unix)]
+#[test]
+fn open_existing_maps_permission_denied_parent_dir_to_storage_not_not_found() {
+    use std::os::unix::fs::PermissionsExt;
+
+    struct RestoreDirMode(std::path::PathBuf);
+    impl Drop for RestoreDirMode {
+        fn drop(&mut self) {
+            let _ = fs::set_permissions(&self.0, fs::Permissions::from_mode(0o700));
+        }
+    }
+
+    let dir = TempDir::new().unwrap();
+    let restricted_dir = dir.path().join("restricted_dir");
+    fs::create_dir(&restricted_dir).unwrap();
+    let db_path = restricted_dir.join("ledger.sqlite");
+    let (chain, req, facts, now) = sample_chain_and_req();
+    {
+        let mut init = SqliteLedger::open(&db_path).unwrap();
+        init.evaluate_and_record(&chain, &req, &facts, now).unwrap();
+    }
+
+    let _restore = RestoreDirMode(restricted_dir.clone());
+    fs::set_permissions(&restricted_dir, fs::Permissions::from_mode(0o000)).unwrap();
+    match fs::metadata(&db_path) {
+        // Root / CAP_DAC_OVERRIDE bypasses 0o000 directory permissions.
+        Ok(_) => return,
+        Err(err) => assert_eq!(
+            err.kind(),
+            std::io::ErrorKind::PermissionDenied,
+            "expected PermissionDenied probing ledger inside 0o000 parent dir, got: {err:?}"
+        ),
+    }
+
+    let err = SqliteLedger::open_existing(&db_path).unwrap_err();
+    assert!(
+        matches!(err, LedgerError::Storage(_)),
+        "ledger inside 0o000 parent dir must map to LedgerError::Storage, got: {err:?}"
+    );
+}

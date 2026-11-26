@@ -851,7 +851,7 @@ import os, re, subprocess, sys
 hook_path = sys.argv[1]
 with open(hook_path, "r", encoding="utf-8") as fh:
     hook_src = fh.read()
-m = re.search(r"IFS= read -r -d '' PY_CODE <<'PY' \|\| true\n(.*?)\nPY\n", hook_src, re.DOTALL)
+m = re.search(r"IFS= read -r -d '' PY_CODE[^\n]*<<'PY'[^\n]*\n(.*?)\nPY\n", hook_src, re.DOTALL)
 assert m, "failed to extract embedded PY_CODE from hook"
 py_code = m.group(1)
 payload = b'{"hook_event_name":"PreToolUse","tool_name":"Bash","tool_input":{"command":"id"}}'
@@ -1043,7 +1043,7 @@ if [[ -e "$DEL_LEDGER" ]]; then
 fi
 
 # (e) Hook-to-CLI --require-existing-ledger TOCTOU boundary: unlink ledger AFTER pre-tool-use.sh
-#     passes its os.path.exists precheck and BEFORE exec'ing the real handfest binary.
+#     passes its os.stat precheck and BEFORE exec'ing the real handfest binary.
 TOCTOU_LEDGER="$TMP_DIR/toctou-ledger.sqlite"
 HOOK_RC=0
 HANDFEST_LEDGER="$TOCTOU_LEDGER" HANDFEST_ALLOW_CREATE_LEDGER=1 "$HOOK" <<<"$VALID_PAYLOAD" >"$TMP_DIR/stdout.txt" 2>"$TMP_DIR/stderr.txt" || HOOK_RC=$?
@@ -1065,7 +1065,18 @@ if [[ -e "$TOCTOU_LEDGER" ]]; then
   echo "FAIL [toctou ledger recreated]: $TOCTOU_LEDGER must not be recreated by handfest check" >&2
   exit 1
 fi
-pass "Missing, 0-byte truncated, empty-schema SQLite, deleted, and hook-to-CLI TOCTOU HANDFEST_LEDGER all failed closed (exit 2) and blocked quota reset"
+# (f) 2-symlink cycle (ELOOP) must fall through to `handfest check --require-existing-ledger`
+#     and fail closed with gate_error (NOT missing_ledger).
+LOOP_A="$TMP_DIR/loop_a.sqlite"
+LOOP_B="$TMP_DIR/loop_b.sqlite"
+ln -s "$LOOP_B" "$LOOP_A"
+ln -s "$LOOP_A" "$LOOP_B"
+HOOK_RC=0
+HANDFEST_LEDGER="$LOOP_A" "$HOOK" <<<"$VALID_PAYLOAD" >"$TMP_DIR/stdout.txt" 2>"$TMP_DIR/stderr.txt" || HOOK_RC=$?
+assert_eq "symlink cycle ledger rc" "$HOOK_RC" "2"
+assert_eq "symlink cycle ledger stdout empty" "$(cat "$TMP_DIR/stdout.txt")" ""
+assert_strict_rfc8259_json_line "symlink cycle ledger stderr" "$TMP_DIR/stderr.txt" "d['verdict'] == 'deny' and d['code'] == 'gate_error'"
+pass "Missing, 0-byte truncated, empty-schema SQLite, deleted, hook-to-CLI TOCTOU, and symlink-cycle HANDFEST_LEDGER all failed closed (exit 2) and blocked quota reset"
 
 # Test 29: Closed stderr pipe (EPIPE), closed fd 2>&-, stdout >/dev/full, and python3-only PATH (no cat)
 python3 -I - "$HOOK" "$EMPTY_BIN" "$(command -v bash)" <<'PY_EPIPE'
@@ -1206,11 +1217,11 @@ REDIR_FAIL_HOOK="$TMP_DIR/redir-fail-hook.sh"
 python3 -I - "$HOOK" "$REDIR_FAIL_HOOK" "$TMP_DIR/does-not-exist-heredoc" <<'PY_REDIR_FAIL'
 import pathlib, sys
 src = pathlib.Path(sys.argv[1]).read_text(encoding="utf-8")
-start = "IFS= read -r -d '' PY_CODE <<'PY' || true\n"
+start = "IFS= read -r -d '' PY_CODE"
 end = "# HANDFEST_PY_SENTINEL_EOF\nPY\n"
 s_idx = src.index(start)
 e_idx = src.index(end, s_idx) + len(end)
-mutated = src[:s_idx] + f"IFS= read -r -d '' PY_CODE < '{sys.argv[3]}' || true\n" + src[e_idx:]
+mutated = src[:s_idx] + f"IFS= read -r -d '' PY_CODE 2>/dev/null < '{sys.argv[3]}' || true\n" + src[e_idx:]
 pathlib.Path(sys.argv[2]).write_text(mutated, encoding="utf-8")
 PY_REDIR_FAIL
 chmod +x "$REDIR_FAIL_HOOK"
@@ -1220,18 +1231,21 @@ printf '%s' "$DENY_PAYLOAD" \
   | env PY_CODE="import sys; sys.exit(0) # HANDFEST_PY_SENTINEL_EOF" "$REDIR_FAIL_HOOK" >"$TMP_DIR/stdout.txt" 2>"$TMP_DIR/stderr.txt" || HOOK_RC=$?
 assert_eq "redirection failure with poisoned PY_CODE rc" "$HOOK_RC" "2"
 assert_eq "redirection failure with poisoned PY_CODE stdout" "$(cat "$TMP_DIR/stdout.txt")" ""
-tail -n 1 "$TMP_DIR/stderr.txt" >"$TMP_DIR/stderr_last.txt"
-assert_strict_rfc8259_json_line "redirection failure with poisoned PY_CODE stderr" "$TMP_DIR/stderr_last.txt" "d['verdict'] == 'deny' and d['code'] == 'internal_error' and 'validator' in d['reason']"
+assert_strict_rfc8259_json_line "redirection failure with poisoned PY_CODE stderr" "$TMP_DIR/stderr.txt" "d['verdict'] == 'deny' and d['code'] == 'internal_error' and 'validator' in d['reason']"
 
-# Test inherited PY_CODE under ulimit -f 0 (RLIMIT_FSIZE=0) when supported, capturing via pipes
-# so stderr capture itself does not hit file-size limit.
+# Test inherited PY_CODE, SIGXFSZ trapping (file-backed stderr), and BASH_COMPAT=5.0 heredoc
+# temp-file failure (clean single JSON deny on pipe-backed stderr) under RLIMIT_FSIZE=(0, 0).
 if ( ulimit -f 0 ) 2>/dev/null; then
-  python3 -I - "$HOOK" "$DENY_PAYLOAD" <<'PY_ULIMIT'
+  python3 -I - "$HOOK" "$DENY_PAYLOAD" "$EMPTY_BIN" "$TMP_DIR/fsize-stderr.txt" <<'PY_ULIMIT'
 import json, os, resource, subprocess, sys
-hook, payload = sys.argv[1], sys.argv[2].encode("utf-8")
+hook, payload, empty_bin, stderr_file = sys.argv[1], sys.argv[2].encode("utf-8"), sys.argv[3], sys.argv[4]
 
 def set_fsize_zero():
     resource.setrlimit(resource.RLIMIT_FSIZE, (0, 0))
+
+def set_fsize_zero_and_close_stdout():
+    resource.setrlimit(resource.RLIMIT_FSIZE, (0, 0))
+    os.close(1)
 
 for poisoned in ("", "import sys; sys.exit(0)", "import sys; sys.exit(0) # HANDFEST_PY_SENTINEL_EOF"):
     env = dict(os.environ)
@@ -1246,15 +1260,73 @@ for poisoned in ("", "import sys; sys.exit(0)", "import sys; sys.exit(0) # HANDF
     )
     assert proc.returncode == 2, f"ulimit -f 0 expected rc 2 for PY_CODE={poisoned!r}, got {proc.returncode}; stderr={proc.stderr!r}"
     assert proc.stdout == b"", f"ulimit -f 0 expected empty stdout, got {proc.stdout!r}"
-    lines = proc.stderr.decode("utf-8", errors="strict").splitlines()
-    assert len(lines) >= 1, f"ulimit -f 0 expected JSON deny line on stderr, got {proc.stderr!r}"
-    # If bash wrote a redirection error before the sentinel JSON, the final line is our strict deny JSON.
-    data = json.loads(lines[-1])
+    text = proc.stderr.decode("utf-8", errors="strict")
+    lines = text.splitlines()
+    assert len(lines) == 1, f"ulimit -f 0 expected single JSON deny line on stderr, got {proc.stderr!r}"
+    data = json.loads(text)
     assert data.get("verdict") == "deny" and data.get("code") in ("unmapped_tool", "internal_error"), (
         f"unexpected deny payload under ulimit -f 0: {data!r}"
     )
+
+# 1. File-backed stderr under RLIMIT_FSIZE=(0, 0) on bash-level fail-closed paths:
+#    trap '' XFSZ prevents SIGXFSZ (-25 / 153) termination so the hook still exits 2.
+for label, extra_env, preexec in (
+    ("PATH=/empty", {"PATH": empty_bin}, set_fsize_zero),
+    ("closed stdout 1>&-", {}, set_fsize_zero_and_close_stdout),
+    ("BASH_COMPAT=5.0", {"BASH_COMPAT": "5.0"}, set_fsize_zero),
+):
+    env = dict(os.environ)
+    env.update(extra_env)
+    with open(stderr_file, "wb") as err_f:
+        proc = subprocess.run(
+            [hook],
+            input=payload,
+            stdout=subprocess.PIPE,
+            stderr=err_f,
+            env=env,
+            preexec_fn=preexec,
+        )
+    assert proc.returncode == 2, (
+        f"RLIMIT_FSIZE=0 file-backed stderr ({label}) expected rc 2 (never SIGXFSZ -25), got {proc.returncode}"
+    )
+    assert proc.stdout == b"", f"RLIMIT_FSIZE=0 ({label}) expected empty stdout, got {proc.stdout!r}"
+
+# 2. BASH_COMPAT=5.0 forces temp-file heredocs on Bash 5.1+: under RLIMIT_FSIZE=(0, 0) with
+#    pipe-backed stderr, heredoc creation fails and the ENTIRE stderr must be a single clean
+#    structured JSON denial object (zero leading Bash error prose).
+for poisoned in (None, "", "import sys; sys.exit(0) # HANDFEST_PY_SENTINEL_EOF"):
+    env = dict(os.environ)
+    env["BASH_COMPAT"] = "5.0"
+    if poisoned is None:
+        env.pop("PY_CODE", None)
+    else:
+        env["PY_CODE"] = poisoned
+    proc = subprocess.run(
+        [hook],
+        input=payload,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        env=env,
+        preexec_fn=set_fsize_zero,
+    )
+    assert proc.returncode == 2, (
+        f"BASH_COMPAT=5.0 + RLIMIT_FSIZE=0 expected rc 2 for PY_CODE={poisoned!r}, got {proc.returncode}; stderr={proc.stderr!r}"
+    )
+    assert proc.stdout == b"", f"BASH_COMPAT=5.0 + RLIMIT_FSIZE=0 expected empty stdout, got {proc.stdout!r}"
+    text = proc.stderr.decode("utf-8", errors="strict")
+    lines = text.splitlines()
+    assert len(lines) == 1, (
+        f"BASH_COMPAT=5.0 + RLIMIT_FSIZE=0 expected clean single JSON line without Bash prose, got {proc.stderr!r}"
+    )
+    data = json.loads(text)
+    assert (
+        data.get("verdict") == "deny"
+        and data.get("code") == "internal_error"
+        and "validator" in data.get("reason", "")
+        and data.get("hookSpecificOutput", {}).get("permissionDecision") == "deny"
+    ), f"unexpected deny payload under BASH_COMPAT=5.0 + RLIMIT_FSIZE=0: {data!r}"
 PY_ULIMIT
 fi
-pass "PY_CODE heredoc hardening (unset + sentinel + env inheritance + ulimit -f 0) failed closed (exit 2)"
+pass "PY_CODE heredoc hardening (unset + sentinel + SIGXFSZ trap + BASH_COMPAT=5.0 + ulimit -f 0) failed closed (exit 2)"
 
 echo "ALL $PASS_COUNT HOOK & PLUGIN TESTS PASSED."

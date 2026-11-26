@@ -18,7 +18,7 @@
 #   0  ONLY when `handfest check` returns Permit with a valid sha256 receipt_hash
 #   2  All denials, unmapped tools, malformed inputs, and config/runtime errors (fail closed)
 
-trap '' PIPE
+trap '' PIPE XFSZ 2>/dev/null || trap '' PIPE
 set -euo pipefail
 
 if ! { : 3>&1; } 2>/dev/null; then
@@ -32,8 +32,8 @@ if ! command -v python3 >/dev/null 2>&1; then
 fi
 
 unset PY_CODE
-IFS= read -r -d '' PY_CODE <<'PY' || true
-import datetime, json, os, re, shutil, subprocess, unicodedata
+IFS= read -r -d '' PY_CODE 2>/dev/null <<'PY' || true
+import datetime, errno, json, os, re, shutil, subprocess, unicodedata
 
 IDENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_-]*\Z", re.ASCII)
 RFC3339_RE = re.compile(r"^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})Z\Z", re.ASCII)
@@ -612,11 +612,17 @@ def main() -> None:
     resource_id, facts = extract_resource_and_facts(tool_name, tool_input, pol)
 
     require_existing_ledger = not allow_create_ledger
-    if require_existing_ledger and not os.path.exists(ledger_path):
-        raise HookError(
-            "missing_ledger",
-            f"HANDFEST_LEDGER '{ledger_path}' does not exist; initialize it first or set HANDFEST_ALLOW_CREATE_LEDGER=1",
-        )
+    if require_existing_ledger:
+        try:
+            os.stat(ledger_path)
+        except FileNotFoundError as exc:
+            if exc.errno == errno.ENOENT:
+                raise HookError(
+                    "missing_ledger",
+                    f"HANDFEST_LEDGER '{ledger_path}' does not exist; initialize it first or set HANDFEST_ALLOW_CREATE_LEDGER=1",
+                )
+        except OSError:
+            pass
     cmd = [
         handfest_bin, "check",
         f"--ledger={ledger_path}",
