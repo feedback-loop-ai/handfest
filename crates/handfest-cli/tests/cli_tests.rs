@@ -743,3 +743,624 @@ fn keygen_overwriting_world_readable_file_enforces_0600() {
         "overwritten secret key file must have 0o600 permissions, got {mode:#o}"
     );
 }
+
+fn minimal_empty_sqlite_db_bytes() -> Vec<u8> {
+    // Valid 4096-byte single-page SQLite 3 rollback-journal database with empty sqlite_master.
+    let mut page = vec![0u8; 4096];
+    page[0..16].copy_from_slice(b"SQLite format 3\0");
+    page[16..18].copy_from_slice(&4096u16.to_be_bytes());
+    page[18] = 1; // legacy rollback write version
+    page[19] = 1; // legacy rollback read version
+    page[21] = 64;
+    page[22] = 32;
+    page[23] = 32;
+    page[24..28].copy_from_slice(&1u32.to_be_bytes()); // file change counter
+    page[28..32].copy_from_slice(&1u32.to_be_bytes()); // database size = 1 page
+    page[40..44].copy_from_slice(&1u32.to_be_bytes()); // schema cookie
+    page[56..60].copy_from_slice(&1u32.to_be_bytes()); // text encoding = UTF-8
+    page[92..96].copy_from_slice(&1u32.to_be_bytes()); // version-valid-for
+    page[96..100].copy_from_slice(&3_045_000u32.to_be_bytes());
+    page[100] = 0x0d; // leaf table B-tree page (0 cells)
+    page[105..107].copy_from_slice(&4096u16.to_be_bytes()); // start of cell content area
+    page
+}
+
+fn setup_merge_mandate_fixture(dir: &Path) -> (PathBuf, String) {
+    let (root_key_path, root_key) = keygen_to(dir, "root.key.json");
+    let (_agent_key_path, agent_key) = keygen_to(dir, "agent.key.json");
+
+    let mandate_path = dir.join("root.hf");
+    fs::write(
+        &mandate_path,
+        format!(
+            concat!(
+                "HANDFEST v1\n",
+                "FROM human \"valentin\" (key: {root_key})\n",
+                "TO agent \"brokkr:agent\" (key: {agent_key})\n",
+                "DELEGATION max 0 hops\n",
+                "ALLOW git.pr.merge\n",
+                "ON repo \"feedback-loop-ai/*\"\n",
+                "LIMIT 2 calls\n",
+            ),
+            root_key = root_key,
+            agent_key = agent_key
+        ),
+    )
+    .unwrap();
+    let signed_path = dir.join("root.signed.json");
+    sign_to(
+        &mandate_path,
+        &root_key_path,
+        "2026-11-24T00:00:00Z",
+        "2026-11-26T00:00:00Z",
+        &signed_path,
+    );
+    (signed_path, agent_key)
+}
+
+fn run_check_on_ledger(
+    signed_path: &Path,
+    agent_key: &str,
+    ledger: &Path,
+    require_existing: bool,
+) -> Output {
+    let mut args = vec![
+        "check",
+        "--ledger",
+        path_str(ledger),
+        "--chain",
+        path_str(signed_path),
+        "--actor-key",
+        agent_key,
+        "--action",
+        "git.pr.merge",
+        "--resource-kind",
+        "repo",
+        "--resource-id",
+        "feedback-loop-ai/handfest",
+        "--now",
+        "2026-11-24T12:00:00Z",
+    ];
+    if require_existing {
+        args.push("--require-existing-ledger");
+    }
+    run_raw(&args)
+}
+
+fn assert_failed_without_stdout(out: &Output, label: &str) {
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "{label}: expected exit code 1, got: {:?}",
+        out.status
+    );
+    assert!(
+        out.stdout.is_empty(),
+        "{label}: expected empty stdout on open failure, got: {}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    assert!(
+        !out.stderr.is_empty(),
+        "{label}: expected non-empty stderr on failure"
+    );
+}
+
+fn assert_existing_ledger_open_error(out: &Output, expected_code: &str, label: &str) {
+    assert_failed_without_stdout(out, label);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let parsed: Value = serde_json::from_str(stderr.trim()).unwrap_or_else(|err| {
+        panic!(
+            "{label}: expected structured JSON on stderr, got parse error {err}; stderr={stderr}"
+        )
+    });
+    assert_eq!(
+        parsed["error"], "ledger_open_failed",
+        "{label}: unexpected error field in {parsed}"
+    );
+    assert_eq!(
+        parsed["code"], expected_code,
+        "{label}: unexpected code field in {parsed}"
+    );
+    assert!(
+        parsed["message"]
+            .as_str()
+            .is_some_and(|msg| !msg.is_empty()),
+        "{label}: expected non-empty message string in {parsed}"
+    );
+}
+
+#[test]
+fn check_require_existing_ledger_rejects_missing_zero_byte_and_empty_schema() {
+    let dir = TempDir::new().unwrap();
+    let (signed_path, agent_key) = setup_merge_mandate_fixture(dir.path());
+
+    // 1. Missing ledger fails closed with `missing_ledger` without creating the file.
+    let missing = dir.path().join("missing.sqlite");
+    let out = run_check_on_ledger(&signed_path, &agent_key, &missing, true);
+    assert_existing_ledger_open_error(&out, "missing_ledger", "missing ledger");
+    assert!(!missing.exists(), "missing ledger must not be created");
+
+    // 2. 0-byte ledger fails closed with `invalid_ledger` without initializing tables.
+    let zero_byte = dir.path().join("zero.sqlite");
+    fs::write(&zero_byte, b"").unwrap();
+    let out = run_check_on_ledger(&signed_path, &agent_key, &zero_byte, true);
+    assert_existing_ledger_open_error(&out, "invalid_ledger", "0-byte ledger");
+    assert_eq!(
+        fs::metadata(&zero_byte).unwrap().len(),
+        0,
+        "0-byte ledger must remain 0 bytes"
+    );
+    let zero_audit = run_raw(&["audit", "--ledger", path_str(&zero_byte)]);
+    assert_failed_without_stdout(&zero_audit, "audit 0-byte ledger");
+
+    // 3. Empty-schema SQLite DB fails closed with `invalid_ledger` without creating tables.
+    let empty_schema = dir.path().join("empty_schema.sqlite");
+    let empty_bytes = minimal_empty_sqlite_db_bytes();
+    fs::write(&empty_schema, &empty_bytes).unwrap();
+    let out = run_check_on_ledger(&signed_path, &agent_key, &empty_schema, true);
+    assert_existing_ledger_open_error(&out, "invalid_ledger", "empty-schema SQLite DB");
+    let after_bytes = fs::read(&empty_schema).unwrap();
+    assert_eq!(
+        after_bytes, empty_bytes,
+        "empty-schema SQLite DB must not be modified or initialized"
+    );
+    assert!(
+        !after_bytes
+            .windows(b"receipts".len())
+            .any(|w| w == b"receipts"),
+        "empty-schema SQLite DB must still have no receipts table"
+    );
+    let empty_audit = run_raw(&["audit", "--ledger", path_str(&empty_schema)]);
+    assert_failed_without_stdout(&empty_audit, "audit empty-schema SQLite DB");
+
+    // 4. Corrupt non-SQLite file fails closed with `invalid_ledger` without modification.
+    let corrupt = dir.path().join("corrupt.sqlite");
+    let garbage = b"not a valid sqlite database header at all!";
+    fs::write(&corrupt, garbage).unwrap();
+    let out = run_check_on_ledger(&signed_path, &agent_key, &corrupt, true);
+    assert_existing_ledger_open_error(&out, "invalid_ledger", "corrupt non-SQLite ledger");
+    assert_eq!(fs::read(&corrupt).unwrap(), garbage);
+
+    // 5. Existing directory path fails closed with exit 1 and `storage_error` (NOT `missing_ledger`).
+    let out = run_check_on_ledger(&signed_path, &agent_key, dir.path(), true);
+    assert_existing_ledger_open_error(&out, "storage_error", "directory path as ledger");
+
+    // 6. `:memory:` with `--require-existing-ledger` fails closed with `storage_error` (NOT `missing_ledger`).
+    let out = run_check_on_ledger(&signed_path, &agent_key, Path::new(":memory:"), true);
+    assert_existing_ledger_open_error(&out, "storage_error", ":memory: ledger");
+}
+
+#[test]
+fn check_require_existing_ledger_accepts_initialized_ledger_and_prevents_quota_reset() {
+    let dir = TempDir::new().unwrap();
+    let (signed_path, agent_key) = setup_merge_mandate_fixture(dir.path());
+    let ledger = dir.path().join("ledger.sqlite");
+    let empty_bytes = minimal_empty_sqlite_db_bytes();
+    fs::write(&ledger, &empty_bytes).unwrap();
+
+    // Without --require-existing-ledger, an empty-schema SQLite DB initializes cleanly,
+    // and subsequent --require-existing-ledger checks succeed up to LIMIT 2 calls.
+    let init_out = run_check_on_ledger(&signed_path, &agent_key, &ledger, false);
+    assert!(init_out.status.success(), "initial check must succeed");
+    let init_json: Value = serde_json::from_slice(&init_out.stdout).unwrap();
+    assert_eq!(init_json["verdict"], "permit");
+
+    let second_out = run_check_on_ledger(&signed_path, &agent_key, &ledger, true);
+    assert!(second_out.status.success(), "second check must succeed");
+    let second_json: Value = serde_json::from_slice(&second_out.stdout).unwrap();
+    assert_eq!(second_json["verdict"], "permit");
+
+    // Third call exhausts LIMIT 2 calls and yields a structured deny verdict on stdout.
+    let third_out = run_check_on_ledger(&signed_path, &agent_key, &ledger, true);
+    assert_eq!(
+        third_out.status.code(),
+        Some(1),
+        "third call must be denied with exit 1"
+    );
+    let third_json: Value = serde_json::from_slice(&third_out.stdout).unwrap();
+    assert_eq!(third_json["verdict"], "deny");
+
+    let audit_out = run_ok(&[
+        "audit",
+        "--ledger",
+        path_str(&ledger),
+        "--actor-key",
+        &agent_key,
+    ]);
+    let audit_json: Value = serde_json::from_str(&audit_out).unwrap();
+    assert_eq!(audit_json["status"], "ok");
+    assert_eq!(audit_json["verified_receipts"], 3);
+    assert_eq!(audit_json["track_record"]["permits"], 2);
+    assert_eq!(audit_json["track_record"]["denies"], 1);
+
+    // Exhausted quota must NOT reset when ledger is truncated, replaced with an empty schema, or deleted.
+    fs::write(&ledger, b"").unwrap();
+    let trunc_out = run_check_on_ledger(&signed_path, &agent_key, &ledger, true);
+    assert_existing_ledger_open_error(&trunc_out, "invalid_ledger", "truncated exhausted ledger");
+    assert_eq!(fs::metadata(&ledger).unwrap().len(), 0);
+
+    fs::write(&ledger, &empty_bytes).unwrap();
+    let empty_out = run_check_on_ledger(&signed_path, &agent_key, &ledger, true);
+    assert_existing_ledger_open_error(
+        &empty_out,
+        "invalid_ledger",
+        "empty-schema replacement of exhausted ledger",
+    );
+    assert_eq!(fs::read(&ledger).unwrap(), empty_bytes);
+
+    fs::remove_file(&ledger).unwrap();
+    let deleted_out = run_check_on_ledger(&signed_path, &agent_key, &ledger, true);
+    assert_existing_ledger_open_error(&deleted_out, "missing_ledger", "deleted exhausted ledger");
+    assert!(!ledger.exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn check_require_existing_ledger_rejects_readonly_0444_ledger_with_storage_error() {
+    use std::os::unix::fs::PermissionsExt;
+
+    struct RestoreMode(std::path::PathBuf);
+    impl Drop for RestoreMode {
+        fn drop(&mut self) {
+            let _ = fs::set_permissions(&self.0, fs::Permissions::from_mode(0o644));
+        }
+    }
+
+    let dir = TempDir::new().unwrap();
+    let (signed_path, agent_key) = setup_merge_mandate_fixture(dir.path());
+    let ledger = dir.path().join("readonly_ledger.sqlite");
+
+    // Initialize a valid ledger cleanly first.
+    let init_out = run_check_on_ledger(&signed_path, &agent_key, &ledger, false);
+    assert!(init_out.status.success(), "initial check must succeed");
+
+    // Make the ledger read-only (0444): SQLite silently falls back to read-only open unless
+    // rejected via `is_readonly`, so `check --require-existing-ledger` must fail closed at open
+    // time with exit 1 and `"code": "storage_error"`.
+    let _restore = RestoreMode(ledger.clone());
+    fs::set_permissions(&ledger, fs::Permissions::from_mode(0o444)).unwrap();
+    if fs::OpenOptions::new().write(true).open(&ledger).is_ok() {
+        return;
+    }
+
+    let out = run_check_on_ledger(&signed_path, &agent_key, &ledger, true);
+    assert_existing_ledger_open_error(&out, "storage_error", "read-only 0444 ledger");
+}
+
+#[cfg(unix)]
+#[test]
+fn check_require_existing_ledger_maps_symlink_cycle_and_0000_ledger_to_storage_error() {
+    use std::os::unix::fs::{symlink, PermissionsExt};
+
+    struct RestoreMode(std::path::PathBuf);
+    impl Drop for RestoreMode {
+        fn drop(&mut self) {
+            let _ = fs::set_permissions(&self.0, fs::Permissions::from_mode(0o644));
+        }
+    }
+
+    let dir = TempDir::new().unwrap();
+    let (signed_path, agent_key) = setup_merge_mandate_fixture(dir.path());
+
+    // 1. 2-symlink cycle (ELOOP) must fail with `storage_error`, NOT `missing_ledger`.
+    let loop_a = dir.path().join("cli_cycle_a.sqlite");
+    let loop_b = dir.path().join("cli_cycle_b.sqlite");
+    symlink(&loop_b, &loop_a).unwrap();
+    symlink(&loop_a, &loop_b).unwrap();
+    let cycle_out = run_check_on_ledger(&signed_path, &agent_key, &loop_a, true);
+    assert_existing_ledger_open_error(&cycle_out, "storage_error", "2-symlink cycle ledger");
+
+    // 2. Existing 0o000 ledger must fail with `storage_error`, NOT `missing_ledger`
+    //    (skip when running as root / with CAP_DAC_OVERRIDE).
+    let ledger = dir.path().join("mode_0000_ledger.sqlite");
+    let init_out = run_check_on_ledger(&signed_path, &agent_key, &ledger, false);
+    assert!(init_out.status.success(), "initial check must succeed");
+
+    let _restore = RestoreMode(ledger.clone());
+    fs::set_permissions(&ledger, fs::Permissions::from_mode(0o000)).unwrap();
+    if fs::File::open(&ledger).is_ok() || fs::OpenOptions::new().write(true).open(&ledger).is_ok() {
+        return;
+    }
+
+    let mode000_out = run_check_on_ledger(&signed_path, &agent_key, &ledger, true);
+    assert_existing_ledger_open_error(&mode000_out, "storage_error", "0o000 existing ledger");
+}
+
+fn run_policy_map_check(
+    ledger: &Path,
+    signed_path: &Path,
+    agent_key: &str,
+    policy_path: &Path,
+    tool_name: &str,
+    tool_input: &str,
+    stdin_payload: Option<&[u8]>,
+) -> std::process::Output {
+    use std::io::Write;
+    use std::process::Stdio;
+
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_handfest"));
+    cmd.args([
+        "check",
+        "--ledger",
+        ledger.to_str().unwrap(),
+        "--chain",
+        signed_path.to_str().unwrap(),
+        "--actor-key",
+        agent_key,
+        "--policy-map",
+        policy_path.to_str().unwrap(),
+        "--tool-name",
+        tool_name,
+        "--tool-input",
+        tool_input,
+        "--now",
+        "2026-11-24T18:30:00Z",
+    ]);
+    if let Some(bytes) = stdin_payload {
+        let mut child = cmd
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child.stdin.take().unwrap().write_all(bytes).unwrap();
+        child.wait_with_output().unwrap()
+    } else {
+        cmd.output().unwrap()
+    }
+}
+
+#[test]
+fn check_policy_map_mode_shares_mcp_codec_and_emits_typed_mapping_errors() {
+    let dir = TempDir::new().unwrap();
+    let (signed_path, agent_key) = setup_merge_mandate_fixture(dir.path());
+    let ledger = dir.path().join("policy_mode.sqlite");
+    let policy_path = dir.path().join("policy.json");
+    fs::write(
+        &policy_path,
+        r#"{
+  "tools": {
+    "unused\ntool": {
+      "action": "git.pr.merge",
+      "resource_kind": "repo",
+      "resource_id_arg": "repo"
+    },
+    "merge_pull_request": {
+      "action": "git.pr.merge",
+      "resource_kind": "repo",
+      "resource_id_arg": "repo",
+      "arg_facts": {
+        "owner": { "field": "resource.owner", "type": "str" },
+        "pullNumber": { "field": "resource.pr", "type": "int" }
+      },
+      "static_facts": {
+        "resource.environment": { "str": "staging" }
+      }
+    }
+  }
+}"#,
+    )
+    .unwrap();
+
+    // 1. Valid stdin tool-input permits and records receipt (with unused \n tool in map).
+    let ok_out = run_policy_map_check(
+        &ledger,
+        &signed_path,
+        &agent_key,
+        &policy_path,
+        "merge_pull_request",
+        "-",
+        Some(br#"{"owner":"feedback-loop-ai","repo":"feedback-loop-ai/handfest","pullNumber":42}"#),
+    );
+    assert!(
+        ok_out.status.success(),
+        "policy-map check failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&ok_out.stdout),
+        String::from_utf8_lossy(&ok_out.stderr)
+    );
+    let ok_json: serde_json::Value = serde_json::from_slice(&ok_out.stdout).unwrap();
+    assert_eq!(ok_json["verdict"], "permit");
+
+    // 2. Unmapped tool fails closed with structured policy_mapping_failed / unmapped_tool.
+    let unmapped = run_policy_map_check(
+        &ledger,
+        &signed_path,
+        &agent_key,
+        &policy_path,
+        "Bash",
+        "{}",
+        None,
+    );
+    assert!(!unmapped.status.success());
+    let err_json: serde_json::Value = serde_json::from_slice(&unmapped.stderr).unwrap();
+    assert_eq!(err_json["error"], "policy_mapping_failed");
+    assert_eq!(err_json["code"], "unmapped_tool");
+
+    // 3. Invalid argument (-0 for int) fails closed with invalid_argument.
+    let bad_arg = run_policy_map_check(
+        &ledger,
+        &signed_path,
+        &agent_key,
+        &policy_path,
+        "merge_pull_request",
+        r#"{"owner":"feedback-loop-ai","repo":"handfest","pullNumber":-0}"#,
+        None,
+    );
+    assert!(!bad_arg.status.success());
+    let bad_arg_json: serde_json::Value = serde_json::from_slice(&bad_arg.stderr).unwrap();
+    assert_eq!(bad_arg_json["error"], "policy_mapping_failed");
+    assert_eq!(bad_arg_json["code"], "invalid_argument");
+
+    // 4. Invalid policy map (empty tool name) fails closed with invalid_policy_map.
+    let empty_tool_policy = dir.path().join("empty_tool.json");
+    fs::write(
+        &empty_tool_policy,
+        r#"{"tools":{"":{"action":"git.pr.merge","resource_kind":"repo","resource_id_arg":"repo"}}}"#,
+    )
+    .unwrap();
+    let bad_pol = run_policy_map_check(
+        &ledger,
+        &signed_path,
+        &agent_key,
+        &empty_tool_policy,
+        "merge_pull_request",
+        "{}",
+        None,
+    );
+    assert!(!bad_pol.status.success());
+    let bad_pol_json: serde_json::Value = serde_json::from_slice(&bad_pol.stderr).unwrap();
+    assert_eq!(bad_pol_json["error"], "policy_mapping_failed");
+    assert_eq!(bad_pol_json["code"], "invalid_policy_map");
+}
+
+#[test]
+fn check_missing_policy_map_file_emits_invalid_policy_map() {
+    let dir = TempDir::new().unwrap();
+    let (signed_path, agent_key) = setup_merge_mandate_fixture(dir.path());
+    let ledger = dir.path().join("missing_policy.sqlite");
+    let missing_policy = dir.path().join("does_not_exist.json");
+
+    let out = run_policy_map_check(
+        &ledger,
+        &signed_path,
+        &agent_key,
+        &missing_policy,
+        "merge_pull_request",
+        "{}",
+        None,
+    );
+    assert!(!out.status.success());
+    let err_json: serde_json::Value = serde_json::from_slice(&out.stderr).unwrap();
+    assert_eq!(err_json["error"], "policy_mapping_failed");
+    assert_eq!(err_json["code"], "invalid_policy_map");
+    assert!(
+        err_json["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("failed to read"),
+        "expected I/O read failure detail, got: {err_json}"
+    );
+}
+
+#[test]
+fn check_rejects_conflicting_policy_map_and_facts_flags() {
+    let dir = TempDir::new().unwrap();
+    let (signed_path, agent_key) = setup_merge_mandate_fixture(dir.path());
+    let ledger = dir.path().join("conflict_flags.sqlite");
+    let policy_path = dir.path().join("policy.json");
+    fs::write(
+        &policy_path,
+        r#"{
+  "tools": {
+    "merge_pull_request": {
+      "action": "git.pr.merge",
+      "resource_kind": "repo",
+      "resource_id_arg": "repo",
+      "static_facts": { "resource.environment": { "str": "staging" } }
+    }
+  }
+}"#,
+    )
+    .unwrap();
+
+    let out = Command::new(env!("CARGO_BIN_EXE_handfest"))
+        .args([
+            "check",
+            "--ledger",
+            ledger.to_str().unwrap(),
+            "--chain",
+            signed_path.to_str().unwrap(),
+            "--actor-key",
+            &agent_key,
+            "--policy-map",
+            policy_path.to_str().unwrap(),
+            "--tool-name",
+            "merge_pull_request",
+            "--tool-input",
+            r#"{"repo":"feedback-loop-ai/handfest"}"#,
+            "--facts",
+            r#"{"resource.environment":"staging"}"#,
+            "--now",
+            "2026-11-24T18:30:00Z",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(
+        !out.status.success(),
+        "passing both --policy-map and --facts must fail closed; stdout={} stderr={}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("--facts") && stderr.contains("--policy-map"),
+        "expected clap conflict diagnostic naming --facts and --policy-map, got: {stderr}"
+    );
+    assert!(
+        !ledger.exists(),
+        "conflicting CLI flags must fail before opening/creating the ledger"
+    );
+}
+
+#[test]
+fn check_policy_map_rejects_invalid_utf8_stdin_before_opening_ledger() {
+    let dir = TempDir::new().unwrap();
+    let (signed_path, agent_key) = setup_merge_mandate_fixture(dir.path());
+    let ledger = dir.path().join("bad_utf8_stdin.sqlite");
+    let policy_path = dir.path().join("policy.json");
+    fs::write(
+        &policy_path,
+        r#"{
+  "tools": {
+    "merge_pull_request": {
+      "action": "git.pr.merge",
+      "resource_kind": "repo",
+      "resource_id_arg": "repo",
+      "static_facts": { "resource.environment": { "str": "staging" } }
+    }
+  }
+}"#,
+    )
+    .unwrap();
+
+    // Test both bare invalid UTF-8 bytes ([0xff, 0xfe]) and invalid UTF-8 embedded inside an
+    // otherwise valid JSON object so lossy UTF-8 decoding cannot mask the error as JSON syntax.
+    let payloads: [&[u8]; 2] = [
+        &[0xff, 0xfe],
+        b"{\"repo\":\"feedback-loop-ai/handfest\xff\xfe\"}",
+    ];
+    for raw_bytes in payloads {
+        let out = run_policy_map_check(
+            &ledger,
+            &signed_path,
+            &agent_key,
+            &policy_path,
+            "merge_pull_request",
+            "-",
+            Some(raw_bytes),
+        );
+
+        assert_eq!(
+            out.status.code(),
+            Some(1),
+            "invalid UTF-8 stdin must exit 1; stdout={} stderr={}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let err_json: serde_json::Value = serde_json::from_slice(&out.stderr)
+            .expect("invalid UTF-8 stdin must emit structured JSON on stderr");
+        assert_eq!(err_json["error"], "policy_mapping_failed");
+        assert_eq!(err_json["code"], "invalid_input");
+        assert!(
+            err_json["message"]
+                .as_str()
+                .is_some_and(|m| m.contains("UTF-8")),
+            "expected UTF-8 refusal message, got: {err_json}"
+        );
+        assert!(
+            !ledger.exists(),
+            "invalid UTF-8 stdin must fail closed before opening/creating the ledger"
+        );
+    }
+}

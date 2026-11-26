@@ -12,6 +12,7 @@ pub mod gate;
 mod gate_errors;
 pub mod json_num;
 pub mod lattice;
+pub mod policy;
 
 use alloc::string::String;
 

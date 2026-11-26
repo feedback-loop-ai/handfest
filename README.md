@@ -117,6 +117,7 @@ LIMIT 5 calls
 * [`crates/handfest-ledger`](crates/handfest-ledger) — Hash-chained SQLite receipt persistence, atomic chain-wide quota tracking, read-only integrity audit, and actor `TrackRecord` queries.
 * [`crates/handfest-cli`](crates/handfest-cli) — Reference CLI (`handfest fmt`, `keygen`, `sign`, `verify`, `check`, `audit`).
 * [`specs/`](specs/) — Formal `HANDFEST v1` grammar (`grammar.ebnf`) and architecture specification.
+* [`plugins/`](plugins/) — Thin declarative harness integrations (`Claude Code`, `Codex`, `dsh`, `agy`) and deterministic `PreToolUse` hook.
 
 ## Concept & Literature: Executable Ricardian Mandates
 

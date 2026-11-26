@@ -7,8 +7,7 @@ use std::time::Duration;
 
 use handfest_core::ast::{KeyId, MandateId};
 use handfest_core::gate::{
-    evaluate_predicate_if_known, verify_chain_runtime, ActionRequest, VerifiedFacts,
-    VerifiedMandate,
+    evaluate_predicate_if_known, verify_chain_runtime, ActionRequest, VerifiedMandate,
 };
 use handfest_core::Verdict;
 pub use handfest_ledger::ReceiptLedger;
@@ -24,7 +23,7 @@ use crate::framing::{
     validate_optional_meta, write_denied_response, write_jsonrpc_error, write_raw_line, JsonRpcId,
     JSONRPC_INTERNAL_ERROR,
 };
-use crate::mapping::{denial_resource_id, ToolPolicyMap};
+use crate::mapping::{denial_resource_id, CompiledPolicyMap, ToolPolicyMap};
 use crate::session::{DispatchCtx, PendingKind};
 
 /// Default maximum JSON-RPC line length in bytes (1 MiB).
@@ -41,8 +40,7 @@ pub struct McpProxy<C: Clock, L: ReceiptLedger = SqliteLedger> {
     pub(crate) verified_chain: Vec<VerifiedMandate>,
     pub(crate) chain_ids: Vec<MandateId>,
     pub(crate) actor_key: KeyId,
-    pub(crate) policy_map: ToolPolicyMap,
-    pub(crate) static_facts_by_tool: BTreeMap<String, VerifiedFacts>,
+    pub(crate) policy_map: CompiledPolicyMap,
     pub(crate) ledger: L,
     pub(crate) clock: C,
     pub(crate) max_line_bytes: usize,
@@ -54,7 +52,7 @@ impl<C: Clock, L: ReceiptLedger> fmt::Debug for McpProxy<C, L> {
         f.debug_struct("McpProxy")
             .field("chain_len", &self.verified_chain.len())
             .field("actor_key", &self.actor_key)
-            .field("mapped_tools", &self.policy_map.tools.len())
+            .field("mapped_tools", &self.policy_map.policy_map().tools.len())
             .field("max_line_bytes", &self.max_line_bytes)
             .field("shutdown_timeout", &self.shutdown_timeout)
             .finish_non_exhaustive()
@@ -74,14 +72,12 @@ impl<C: Clock, L: ReceiptLedger> McpProxy<C, L> {
         actor_key
             .validate()
             .map_err(|err| ProxyError::InvalidChain(format!("invalid actor_key: {err}")))?;
-        policy_map.validate()?;
-        let static_facts_by_tool = policy_map.compile_static_facts()?;
+        let policy_map = policy_map.compile()?;
         Ok(Self {
             verified_chain,
             chain_ids,
             actor_key,
             policy_map,
-            static_facts_by_tool,
             ledger,
             clock,
             max_line_bytes: DEFAULT_MAX_LINE_BYTES,
@@ -146,29 +142,28 @@ impl<C: Clock, L: ReceiptLedger> McpProxy<C, L> {
             }
         };
 
-        let (request, facts) = match self.policy_map.map_call_exact_prevalidated(
-            &self.actor_key,
-            tool_name,
-            arguments,
-            self.static_facts_by_tool.get(tool_name),
-        ) {
-            Ok(mapped) => mapped,
-            Err(err) => {
-                let denial_req = build_mapping_denial_request(
-                    &self.actor_key,
-                    &self.policy_map,
-                    tool_name,
-                    arguments,
-                );
-                return self.record_denial_and_respond(
-                    &req_id,
-                    &denial_req,
-                    now,
-                    err.to_string(),
-                    ctx.client_out,
-                );
-            }
-        };
+        let (request, facts) =
+            match self
+                .policy_map
+                .map_call_exact(&self.actor_key, tool_name, arguments)
+            {
+                Ok(mapped) => mapped,
+                Err(err) => {
+                    let denial_req = build_mapping_denial_request(
+                        &self.actor_key,
+                        self.policy_map.policy_map(),
+                        tool_name,
+                        arguments,
+                    );
+                    return self.record_denial_and_respond(
+                        &req_id,
+                        &denial_req,
+                        now,
+                        err.to_string(),
+                        ctx.client_out,
+                    );
+                }
+            };
 
         self.ensure_upstream_alive(&req_id, ctx)?;
 
@@ -303,10 +298,10 @@ impl<C: Clock, L: ReceiptLedger> McpProxy<C, L> {
     }
 
     fn is_tool_permitted(&self, tool_name: &str, evaluated_at: i64) -> bool {
-        let Some(policy) = self.policy_map.get(tool_name) else {
+        let Some(policy) = self.policy_map.policy_map().get(tool_name) else {
             return false;
         };
-        let Some(static_facts) = self.static_facts_by_tool.get(tool_name) else {
+        let Some(static_facts) = self.policy_map.static_facts_for(tool_name) else {
             return false;
         };
         self.verified_chain.iter().all(|vm| {
@@ -362,7 +357,8 @@ fn validate_tools_list_result_fields(
         result_obj,
         &["tools", "nextCursor", "_meta"],
         "upstream tools/list result",
-    )?;
+    )
+    .map_err(|err| err.to_string())?;
     if let Some(cursor) = result_obj.get("nextCursor") {
         if cursor.as_str().is_none() {
             return Err(
@@ -413,7 +409,8 @@ fn extract_tool_call_params(
     let Some(params) = obj.get("params").and_then(ExactJson::as_object) else {
         return Err("tools/call params must be a JSON object".to_string());
     };
-    reject_unknown_keys(params, &["name", "arguments", "_meta"], "tools/call params")?;
+    reject_unknown_keys(params, &["name", "arguments", "_meta"], "tools/call params")
+        .map_err(|err| err.to_string())?;
     validate_optional_meta(params, "tools/call params._meta")?;
     let Some(name) = params.get("name").and_then(ExactJson::as_str) else {
         return Err("tools/call params.name must be a string".to_string());

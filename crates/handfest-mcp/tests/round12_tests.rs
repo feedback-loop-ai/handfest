@@ -471,3 +471,246 @@ fn handfest_mcp_emits_chain_invalid_for_broken_attenuation() {
         "expected hop 0 -> 1 action-widening detail for ops.*, got: {msg}"
     );
 }
+
+#[test]
+fn load_policy_map_file_loads_valid_rejects_invalid_policy_and_reports_io_error() {
+    use std::io::Write;
+
+    let dir = tempfile::TempDir::new().unwrap();
+    let write_new = |name: &str, contents: &str| {
+        let path = dir.path().join(name);
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .expect("create new fixture file inside private temp dir");
+        file.write_all(contents.as_bytes())
+            .expect("write fixture file");
+        path
+    };
+
+    let policy_path = write_new(
+        "policy.json",
+        r#"{
+            "tools": {
+                "merge_pr": {
+                    "action": "git.pr.merge",
+                    "resource_kind": "repo",
+                    "resource_id_arg": "repo"
+                }
+            }
+        }"#,
+    );
+
+    let loaded = handfest_mcp::mapping::load_policy_map_file(&policy_path).unwrap();
+    assert_eq!(loaded.tools.len(), 1);
+    loaded.validate().unwrap();
+    assert_eq!(
+        loaded.get("merge_pr").map(|p| p.action.as_str()),
+        Some("git.pr.merge")
+    );
+    let encoded = serde_json::to_string(&loaded).unwrap();
+    let decoded: handfest_mcp::ToolPolicyMap = serde_json::from_str(&encoded).unwrap();
+    assert_eq!(decoded, loaded);
+    let dup_err = serde_json::from_str::<handfest_mcp::ToolPolicyMap>(
+        r#"{"tools":{"a":{"action":"x.y","resource_kind":"r","static_resource_id":"1"},"a":{"action":"x.z","resource_kind":"r","static_resource_id":"2"}}}"#,
+    )
+    .unwrap_err();
+    assert!(dup_err.to_string().contains("duplicate key"));
+
+    let compiled: handfest_mcp::CompiledPolicyMap = loaded.compile().unwrap();
+    assert!(compiled.policy_map().get("merge_pr").is_some());
+
+    let invalid_path = write_new(
+        "both_resource_ids.json",
+        r#"{
+            "tools": {
+                "merge_pr": {
+                    "action": "git.pr.merge",
+                    "resource_kind": "repo",
+                    "resource_id_arg": "repo",
+                    "static_resource_id": "acme/handfest"
+                }
+            }
+        }"#,
+    );
+    assert!(matches!(
+        handfest_mcp::mapping::load_policy_map_file(&invalid_path),
+        Err(handfest_mcp::MappingError::InvalidPolicy(ref msg))
+            if msg.contains("cannot declare both resource_id_arg and static_resource_id")
+    ));
+
+    let missing_path = dir.path().join("missing.json");
+    assert!(matches!(
+        handfest_mcp::mapping::load_policy_map_file(&missing_path),
+        Err(handfest_mcp::MappingError::Io(ref msg)) if msg.contains("failed to read")
+    ));
+}
+
+#[test]
+fn compiled_policy_map_borrows_mcp_tool_policy_map_and_supports_map_call_exact() {
+    use handfest_core::ast::{Decimal, KeyId, Scalar};
+
+    let policy_json = r#"{
+        "tools": {
+            "merge_pr": {
+                "action": "git.pr.merge",
+                "resource_kind": "repo",
+                "resource_id_arg": "repo",
+                "arg_facts": {
+                    "amount": { "field": "resource.amount", "type": "decimal" }
+                },
+                "static_facts": {
+                    "env": { "str": "prod" }
+                }
+            }
+        }
+    }"#;
+    let loaded = handfest_mcp::ToolPolicyMap::from_json_str(policy_json).unwrap();
+    let compiled: handfest_mcp::CompiledPolicyMap = loaded.clone().compile().unwrap();
+
+    // Direct type identity: CompiledPolicyMap::policy_map() borrows &handfest_mcp::ToolPolicyMap,
+    // and StaticFactValue is exported at both mapping and crate roots as TypedScalar.
+    let m: &handfest_mcp::ToolPolicyMap = compiled.policy_map();
+    assert_eq!(m, &loaded);
+    let expected_static: handfest_mcp::mapping::StaticFactValue =
+        handfest_mcp::StaticFactValue::Str("prod".to_string());
+    assert_eq!(
+        m.get("merge_pr").and_then(|p| p.static_facts.get("env")),
+        Some(&expected_static)
+    );
+    assert_eq!(
+        m.get("merge_pr").map(|p| p.action.as_str()),
+        Some("git.pr.merge")
+    );
+
+    let actor =
+        KeyId::parse("ed25519:1111111111111111111111111111111111111111111111111111111111111111")
+            .unwrap();
+    let raw_args = r#"{"repo":"acme/handfest","amount":12.3450000000000001}"#;
+    let exact_args = parse_exact_json(raw_args).unwrap();
+
+    let (req_exact, facts_exact) =
+        handfest_mcp::ToolPolicyMap::map_call_exact(m, &actor, "merge_pr", Some(&exact_args))
+            .unwrap();
+    assert_eq!(req_exact.actor_key, actor);
+    assert_eq!(req_exact.action, "git.pr.merge");
+    assert_eq!(req_exact.resource_kind, "repo");
+    assert_eq!(req_exact.resource_id, "acme/handfest");
+    assert_eq!(
+        facts_exact.get("resource.amount"),
+        Some(&Scalar::Decimal(
+            Decimal::parse("12.3450000000000001").unwrap()
+        ))
+    );
+    assert_eq!(
+        facts_exact.get("env"),
+        Some(&Scalar::Str("prod".to_string()))
+    );
+
+    // Zero-clone map_call_json on the borrowed map must produce identical request and facts.
+    let (req_json, facts_json) = m.map_call_json(&actor, "merge_pr", Some(raw_args)).unwrap();
+    assert_eq!(req_json, req_exact);
+    assert_eq!(facts_json, facts_exact);
+
+    // Negative fail-closed checks on map_call_exact.
+    assert!(matches!(
+        handfest_mcp::ToolPolicyMap::map_call_exact(m, &actor, "unknown_tool", Some(&exact_args)),
+        Err(handfest_mcp::MappingError::UnmappedTool(ref name)) if name == "unknown_tool"
+    ));
+    let missing_repo = parse_exact_json(r#"{"amount":12.34}"#).unwrap();
+    assert!(matches!(
+        handfest_mcp::ToolPolicyMap::map_call_exact(m, &actor, "merge_pr", Some(&missing_repo)),
+        Err(handfest_mcp::MappingError::MissingResourceId { ref tool, ref arg })
+            if tool == "merge_pr" && arg == "repo"
+    ));
+}
+
+#[test]
+fn map_call_json_does_not_clone_full_policy_map() {
+    use handfest_core::ast::KeyId;
+    use std::collections::BTreeMap;
+    use std::hint::black_box;
+
+    let mut tools = BTreeMap::new();
+    tools.insert(
+        "merge_pr".to_string(),
+        handfest_mcp::ToolPolicy {
+            action: "git.pr.merge".to_string(),
+            resource_kind: "repo".to_string(),
+            resource_id_arg: Some("repo".to_string()),
+            static_resource_id: None,
+            arg_facts: BTreeMap::new(),
+            static_facts: BTreeMap::from([(
+                "env".to_string(),
+                handfest_mcp::mapping::StaticFactValue::Str("prod".to_string()),
+            )]),
+        },
+    );
+
+    // Add 2,000 unrelated rules carrying 4 KiB static payloads (~8 MiB total) so cloning the full
+    // map is ~100x heavier than mapping a single call.
+    let filler = "x".repeat(4096);
+    for idx in 0..2_000 {
+        tools.insert(
+            format!("unrelated_tool_{idx:04}"),
+            handfest_mcp::ToolPolicy {
+                action: "noop.run".to_string(),
+                resource_kind: "item".to_string(),
+                resource_id_arg: None,
+                static_resource_id: Some(format!("item-{idx}")),
+                arg_facts: BTreeMap::new(),
+                static_facts: BTreeMap::from([(
+                    "blob".to_string(),
+                    handfest_mcp::mapping::StaticFactValue::Str(filler.clone()),
+                )]),
+            },
+        );
+    }
+
+    let large_map = handfest_mcp::ToolPolicyMap { tools };
+    let actor =
+        KeyId::parse("ed25519:1111111111111111111111111111111111111111111111111111111111111111")
+            .unwrap();
+    let raw_args = r#"{"repo":"acme/handfest"}"#;
+
+    // Warm up allocator and verify correctness once before timing.
+    let (req, _) = large_map
+        .map_call_json(&actor, "merge_pr", Some(raw_args))
+        .unwrap();
+    assert_eq!(req.resource_id, "acme/handfest");
+    drop(black_box(large_map.clone()));
+
+    // Take the minimum of 3 rounds to ignore transient OS scheduling jitter. If map_call_json
+    // regressed to cloning the entire map, 16 calls would perform 16 full clones (~8x slower than
+    // 2 full clones) and fail this self-calibrating bound on any hardware.
+    let min_two_clones = (0..3)
+        .map(|_| {
+            let start = Instant::now();
+            for _ in 0..2 {
+                drop(black_box(large_map.clone()));
+            }
+            start.elapsed()
+        })
+        .min()
+        .unwrap();
+
+    let min_sixteen_maps = (0..3)
+        .map(|_| {
+            let start = Instant::now();
+            for _ in 0..16 {
+                let res = large_map
+                    .map_call_json(&actor, "merge_pr", Some(raw_args))
+                    .unwrap();
+                black_box(res);
+            }
+            start.elapsed()
+        })
+        .min()
+        .unwrap();
+
+    assert!(
+        min_sixteen_maps < min_two_clones,
+        "16 map_call_json calls ({min_sixteen_maps:?}) must be faster than 2 full ToolPolicyMap clones ({min_two_clones:?}); indicates map_call_json cloned the whole map"
+    );
+}

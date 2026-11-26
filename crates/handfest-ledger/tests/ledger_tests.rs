@@ -1,3 +1,7 @@
+#[cfg(unix)]
+#[path = "../src/lock_probe_test_util.rs"]
+mod lock_probe_test_util;
+
 use handfest_core::ast::{parse_rfc3339_utc, Decimal, HandfestAst, KeyId, MandateId, Scalar};
 use handfest_core::cnl::parse_mandate;
 use handfest_core::gate::{ActionRequest, VerifiedAnchorProof, VerifiedFacts, VerifiedMandate};
@@ -1189,30 +1193,7 @@ fn verify_integrity_rejects_duplicate_sqlite_sequence_rows() {
 
 #[cfg(unix)]
 #[test]
-fn posix_lock_probe_helper() {
-    let Ok(db_path) = std::env::var("HANDFEST_LOCK_PROBE_DB") else {
-        return;
-    };
-    let conn = Connection::open(&db_path).expect("probe open db");
-    conn.busy_timeout(std::time::Duration::ZERO)
-        .expect("probe busy_timeout");
-    let res = conn.execute_batch("BEGIN IMMEDIATE; ROLLBACK;");
-    let expect_locked = std::env::var("HANDFEST_LOCK_PROBE_EXPECT_LOCKED").as_deref() == Ok("1");
-    if expect_locked {
-        assert!(
-            res.is_err(),
-            "expected parent POSIX lock to remain held, but child acquired BEGIN IMMEDIATE"
-        );
-    } else {
-        res.expect("expected child to acquire BEGIN IMMEDIATE after parent released lock");
-    }
-}
-
-#[cfg(unix)]
-#[test]
 fn open_read_only_preserves_in_process_posix_locks_on_same_inode() {
-    use std::process::Command;
-
     let dir = TempDir::new().unwrap();
     let db_path = dir.path().join("posix_lock.sqlite");
 
@@ -1241,16 +1222,10 @@ fn open_read_only_preserves_in_process_posix_locks_on_same_inode() {
         assert_eq!(rec.unwrap().permits, 1);
     }
 
-    let exe = std::env::current_exe().expect("current test executable");
-    let locked_status = Command::new(&exe)
-        .args(["--exact", "posix_lock_probe_helper", "--quiet"])
-        .env("HANDFEST_LOCK_PROBE_DB", &db_path)
-        .env("HANDFEST_LOCK_PROBE_EXPECT_LOCKED", "1")
-        .status()
-        .expect("spawn posix_lock_probe_helper");
-    assert!(
-        locked_status.success(),
-        "open_read_only dropped another in-process SQLite connection's POSIX lock!"
+    lock_probe_test_util::assert_cross_process_lock(
+        &db_path,
+        lock_probe_test_util::LockProbeMode::Immediate,
+        true,
     );
 
     lock_holder.execute_batch("ROLLBACK;").unwrap();
@@ -1258,15 +1233,10 @@ fn open_read_only_preserves_in_process_posix_locks_on_same_inode() {
     drop(active_writer);
 
     // Sanity check: once the parent releases its lock, the child probe succeeds.
-    let unlocked_status = Command::new(&exe)
-        .args(["--exact", "posix_lock_probe_helper", "--quiet"])
-        .env("HANDFEST_LOCK_PROBE_DB", &db_path)
-        .env("HANDFEST_LOCK_PROBE_EXPECT_LOCKED", "0")
-        .status()
-        .expect("spawn unlocked posix_lock_probe_helper");
-    assert!(
-        unlocked_status.success(),
-        "expected child probe to succeed after lock release"
+    lock_probe_test_util::assert_cross_process_lock(
+        &db_path,
+        lock_probe_test_util::LockProbeMode::Immediate,
+        false,
     );
 }
 
@@ -1574,6 +1544,9 @@ fn receipt_ledger_trait_polymorphic_dyn_and_generic() {
     assert!(json_err.source().is_some());
 
     // Verify LedgerError Display + Error::source across variants.
+    let nf_err = LedgerError::NotFound("missing".to_string());
+    assert!(nf_err.to_string().contains("ledger not found"));
+    assert!(nf_err.source().is_none());
     let int_err = LedgerError::Integrity("bad".to_string());
     assert!(int_err.to_string().contains("ledger integrity error"));
     assert!(int_err.source().is_none());

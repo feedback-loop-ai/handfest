@@ -1,0 +1,18 @@
+# Codex MCP server configuration wrapping an upstream MCP server via `handfest-mcp`.
+# Copy this stanza into `~/.codex/config.toml` (or `.codex/config.toml`) and replace paths/key IDs.
+#
+# Security invariant:
+#   - Only the agent's PUBLIC KeyId (`ed25519:<hex>`) and signed mandate chain are passed here.
+#   - The human principal's private signing key NEVER enters Codex config or workspace.
+#   - Store the policy map, signed mandates, and ledger strictly outside the agent-writable workspace.
+
+[mcp_servers.github_handfest]
+command = "handfest-mcp"
+args = [
+  "--chain", "/path/to/handfest-config/mandates/root.signed.json",
+  "--ledger", "/path/to/handfest-config/state/handfest-ledger.sqlite",
+  "--actor-key", "ed25519:<agent-public-key-hex>",
+  "--policy-map", "/path/to/handfest-config/policy-map.json",
+  "--",
+  "npx", "-y", "@modelcontextprotocol/server-github"
+]

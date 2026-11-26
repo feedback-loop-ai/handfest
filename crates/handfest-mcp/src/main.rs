@@ -16,7 +16,6 @@ use handfest_core::exact_json::write_json_string;
 use handfest_ledger::SqliteLedger;
 use handfest_mcp::{
     verify_mandate_chain_with, Clock, FixedClock, MappingError, McpProxy, ProxyError, SystemClock,
-    ToolPolicyMap,
 };
 
 const CHILD_EXIT_GRACE_POLLS: usize = 20;
@@ -248,12 +247,13 @@ fn build_proxy(cli: &Cli) -> Result<McpProxy<RuntimeClock, SqliteLedger>, Startu
         StartupError::CliArgs(format!("invalid --actor-key '{}': {err}", cli.actor_key))
     })?;
 
-    let policy_map = ToolPolicyMap::from_file(&cli.policy_map).map_err(|err| match err {
-        MappingError::Io(msg) => {
-            StartupError::PolicyIo(format!("failed to load --policy-map: {msg}"))
-        }
-        other => StartupError::PolicyInvalid(format!("failed to load --policy-map: {other}")),
-    })?;
+    let policy_map =
+        handfest_mcp::mapping::load_policy_map_file(&cli.policy_map).map_err(|err| match err {
+            MappingError::Io(msg) => {
+                StartupError::PolicyIo(format!("failed to load --policy-map: {msg}"))
+            }
+            other => StartupError::PolicyInvalid(format!("failed to load --policy-map: {other}")),
+        })?;
 
     let clock = match &cli.now {
         Some(raw) => {

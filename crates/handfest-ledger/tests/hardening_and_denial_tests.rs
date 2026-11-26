@@ -1,3 +1,7 @@
+#[cfg(unix)]
+#[path = "../src/lock_probe_test_util.rs"]
+mod lock_probe_test_util;
+
 use std::fs;
 
 use handfest_core::ast::{
@@ -998,5 +1002,696 @@ fn corrupt_database_page_header_and_page_size_bytes_map_to_integrity_error() {
     assert!(
         matches!(rw_err, LedgerError::Integrity(_)),
         "writable open on corrupt page-size bytes must return LedgerError::Integrity, got: {rw_err:?}"
+    );
+}
+
+#[test]
+fn open_existing_rejects_missing_truncated_non_sqlite_and_empty_schema() {
+    let dir = TempDir::new().unwrap();
+
+    // 1. Missing file fails with typed LedgerError::NotFound without creating a file.
+    let missing = dir.path().join("does_not_exist.sqlite");
+    assert!(matches!(
+        SqliteLedger::open_existing(&missing),
+        Err(LedgerError::NotFound(_))
+    ));
+    assert!(
+        !missing.exists(),
+        "open_existing must never create a missing ledger file"
+    );
+
+    // 2. Empty / ':memory:' / 'file:' URI paths fail closed.
+    for bad in ["", ":memory:", "file:test.sqlite?mode=memory"] {
+        assert!(matches!(
+            SqliteLedger::open_existing(bad),
+            Err(LedgerError::Storage(_))
+        ));
+    }
+
+    // 3. 0-byte and <100-byte truncated files fail without initializing tables.
+    let zero_byte = dir.path().join("zero_byte.sqlite");
+    fs::write(&zero_byte, b"").unwrap();
+    assert!(matches!(
+        SqliteLedger::open_existing(&zero_byte),
+        Err(LedgerError::Integrity(_))
+    ));
+    assert_eq!(fs::metadata(&zero_byte).unwrap().len(), 0);
+
+    let short_file = dir.path().join("short.sqlite");
+    fs::write(&short_file, b"SQLite format 3\0short").unwrap();
+    assert!(matches!(
+        SqliteLedger::open_existing(&short_file),
+        Err(LedgerError::Integrity(_))
+    ));
+    assert_eq!(fs::read(&short_file).unwrap(), b"SQLite format 3\0short");
+
+    // 4. Non-SQLite >=100-byte file and directory paths fail closed.
+    let non_sqlite = dir.path().join("not_sqlite.bin");
+    let garbage = vec![b'X'; 256];
+    fs::write(&non_sqlite, &garbage).unwrap();
+    assert!(matches!(
+        SqliteLedger::open_existing(&non_sqlite),
+        Err(LedgerError::Integrity(_))
+    ));
+    assert_eq!(fs::read(&non_sqlite).unwrap(), garbage);
+    assert!(matches!(
+        SqliteLedger::open_existing(dir.path()),
+        Err(LedgerError::Storage(_))
+    ));
+
+    // 5. Empty-schema SQLite DB (valid header, 0 rows in sqlite_master) fails without DDL.
+    let empty_sqlite = dir.path().join("empty_schema.sqlite");
+    {
+        let raw = Connection::open(&empty_sqlite).unwrap();
+        raw.execute_batch("VACUUM;").unwrap();
+    }
+    assert!(fs::metadata(&empty_sqlite).unwrap().len() >= 100);
+    assert!(matches!(
+        SqliteLedger::open_existing(&empty_sqlite),
+        Err(LedgerError::Integrity(_))
+    ));
+    let raw = Connection::open(&empty_sqlite).unwrap();
+    let table_count: i64 = raw
+        .query_row("SELECT count(*) FROM sqlite_master", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(
+        table_count, 0,
+        "open_existing must never create tables in an empty-schema SQLite DB"
+    );
+}
+
+#[test]
+fn open_existing_accepts_valid_initialized_ledger_and_persists_receipts() {
+    let dir = TempDir::new().unwrap();
+    let (vm, req, facts) = sum_and_calls_mandate();
+    let valid = dir.path().join("valid_initialized.sqlite");
+
+    {
+        let mut init_ledger = SqliteLedger::open(&valid).unwrap();
+        let (v1, _) = init_ledger
+            .evaluate_and_record(
+                std::slice::from_ref(&vm),
+                &req,
+                &facts,
+                ts("2026-11-24T18:00:00Z"),
+            )
+            .unwrap();
+        assert_eq!(v1, Verdict::Permit);
+    }
+
+    let mut existing = SqliteLedger::open_existing(&valid).unwrap();
+    assert_eq!(existing.verify_integrity().unwrap(), 1);
+    let (v2, _) = existing
+        .evaluate_and_record(
+            std::slice::from_ref(&vm),
+            &req,
+            &facts,
+            ts("2026-11-24T18:01:00Z"),
+        )
+        .unwrap();
+    assert_eq!(v2, Verdict::Permit);
+    assert_eq!(existing.verify_integrity().unwrap(), 2);
+
+    // Second open_existing while first handle is open exercises the refcount > 0 path cleanly.
+    let existing2 = SqliteLedger::open_existing(&valid).unwrap();
+    assert_eq!(existing2.verify_integrity().unwrap(), 2);
+}
+
+#[cfg(unix)]
+fn assert_cross_process_lock(db_path: &std::path::Path, mode: &str, expect_locked: bool) {
+    let probe_mode = match mode {
+        "exclusive" => lock_probe_test_util::LockProbeMode::Exclusive,
+        "immediate" => lock_probe_test_util::LockProbeMode::Immediate,
+        other => panic!("unexpected lock probe mode: {other}"),
+    };
+    lock_probe_test_util::assert_cross_process_lock(db_path, probe_mode, expect_locked);
+}
+
+fn init_single_permit_ledger(db_path: &std::path::Path) {
+    let (vm, req, facts) = sum_and_calls_mandate();
+    let mut init = SqliteLedger::open(db_path).unwrap();
+    let (v, _) = init
+        .evaluate_and_record(
+            std::slice::from_ref(&vm),
+            &req,
+            &facts,
+            ts("2026-11-24T18:00:00Z"),
+        )
+        .unwrap();
+    assert_eq!(v, Verdict::Permit);
+}
+
+#[test]
+fn open_existing_preserves_active_sqlite_transaction_locks() {
+    use std::sync::mpsc;
+
+    let dir = TempDir::new().unwrap();
+    let db_path = dir.path().join("locked_existing.sqlite");
+    init_single_permit_ledger(&db_path);
+
+    // Parent acquires BEGIN IMMEDIATE, signals worker, and waits for worker to signal AFTER
+    // `SqliteLedger::open_existing(&db_path)` has actually completed before probing cross-process.
+    let writer_tx = Connection::open(&db_path).unwrap();
+    writer_tx.execute_batch("BEGIN IMMEDIATE;").unwrap();
+
+    let (go_tx, go_rx) = mpsc::channel();
+    let (done_tx, done_rx) = mpsc::channel();
+    let thread_path = db_path.clone();
+    let handle = std::thread::spawn(move || {
+        go_rx.recv().unwrap();
+        let res = SqliteLedger::open_existing(&thread_path).map(|_| ());
+        done_tx.send(res).unwrap();
+    });
+    go_tx.send(()).unwrap();
+
+    let worker_res = done_rx
+        .recv()
+        .expect("worker must signal after open_existing completes");
+    assert!(
+        matches!(worker_res, Err(LedgerError::Storage(_))),
+        "open_existing while BEGIN IMMEDIATE is held must fail with busy storage error, got: {worker_res:?}"
+    );
+    handle.join().unwrap();
+
+    #[cfg(unix)]
+    {
+        assert_cross_process_lock(&db_path, "exclusive", true);
+        assert_cross_process_lock(&db_path, "immediate", true);
+    }
+
+    writer_tx.execute_batch("ROLLBACK;").unwrap();
+    drop(writer_tx);
+
+    #[cfg(unix)]
+    assert_cross_process_lock(&db_path, "exclusive", false);
+    let reopened = SqliteLedger::open_existing(&db_path).unwrap();
+    assert_eq!(reopened.verify_integrity().unwrap(), 1);
+}
+
+#[cfg(unix)]
+#[test]
+fn open_read_only_on_renamed_ledger_preserves_writer_posix_lock() {
+    let dir = TempDir::new().unwrap();
+
+    // 1. Direct rename of a writable ledger opened via `open_existing` + active `BEGIN IMMEDIATE`.
+    let db_path = dir.path().join("rename_direct.sqlite");
+    let renamed_direct = dir.path().join("rename_direct_moved.sqlite");
+    init_single_permit_ledger(&db_path);
+    {
+        let _writer = SqliteLedger::open_existing(&db_path).unwrap();
+        let writer_tx = Connection::open(&db_path).unwrap();
+        writer_tx.execute_batch("BEGIN IMMEDIATE;").unwrap();
+
+        fs::rename(&db_path, &renamed_direct).unwrap();
+        // Replace the original path with a distinct initialized ledger inode while the original
+        // inode still holds `BEGIN IMMEDIATE` at `renamed_direct`.
+        init_single_permit_ledger(&db_path);
+
+        let ro_moved = SqliteLedger::open_read_only(&renamed_direct).unwrap();
+        assert_eq!(ro_moved.verify_integrity().unwrap(), 1);
+        drop(ro_moved);
+
+        let ro_replaced = SqliteLedger::open_read_only(&db_path).unwrap();
+        assert_eq!(ro_replaced.verify_integrity().unwrap(), 1);
+        drop(ro_replaced);
+
+        assert_cross_process_lock(&renamed_direct, "exclusive", true);
+        assert_cross_process_lock(&renamed_direct, "immediate", true);
+        writer_tx.execute_batch("ROLLBACK;").unwrap();
+    }
+    assert_cross_process_lock(&renamed_direct, "exclusive", false);
+
+    // 2. ABA / unindexed-inode rename: active `open_existing` writer keeps `active_writers > 0`
+    //    while `target_db`'s inode has `refcount == 0`, forcing `open_read_only` to execute
+    //    `inspect_sqlite_header` and retain the raw header fd instead of closing it.
+    let active_writer_db = dir.path().join("active_writer.sqlite");
+    let target_db = dir.path().join("rename_aba_target.sqlite");
+    let renamed_target = dir.path().join("rename_aba_moved.sqlite");
+    init_single_permit_ledger(&active_writer_db);
+    init_single_permit_ledger(&target_db);
+    {
+        let _active_writer = SqliteLedger::open_existing(&active_writer_db).unwrap();
+        let writer_tx = Connection::open(&target_db).unwrap();
+        writer_tx.execute_batch("BEGIN IMMEDIATE;").unwrap();
+
+        fs::rename(&target_db, &renamed_target).unwrap();
+        for _ in 0..2 {
+            let ro = SqliteLedger::open_read_only(&renamed_target).unwrap();
+            assert_eq!(ro.verify_integrity().unwrap(), 1);
+            drop(ro);
+        }
+
+        assert_cross_process_lock(&renamed_target, "exclusive", true);
+        writer_tx.execute_batch("ROLLBACK;").unwrap();
+    }
+    assert_cross_process_lock(&renamed_target, "exclusive", false);
+}
+
+#[cfg(unix)]
+#[test]
+fn open_read_only_rejects_symlink_and_hardlink_sidecars_and_preserves_writer_posix_lock() {
+    use std::os::unix::fs::symlink;
+
+    let dir = TempDir::new().unwrap();
+    let active_db = dir.path().join("active_writer.sqlite");
+    let victim_db = dir.path().join("victim.sqlite");
+    let victim_journal = dir.path().join("victim.sqlite-journal");
+    let victim_wal = dir.path().join("victim.sqlite-wal");
+    init_single_permit_ledger(&active_db);
+    init_single_permit_ledger(&victim_db);
+
+    {
+        let _writer = SqliteLedger::open_existing(&active_db).unwrap();
+        let writer_tx = Connection::open(&active_db).unwrap();
+        writer_tx.execute_batch("BEGIN IMMEDIATE;").unwrap();
+
+        // 1. Symlinked `-journal` pointing to active ledger fails closed without opening it.
+        symlink(&active_db, &victim_journal).unwrap();
+        let sym_j_err = SqliteLedger::open_read_only(&victim_db).unwrap_err();
+        assert!(
+            matches!(&sym_j_err, LedgerError::Integrity(msg) if msg.contains("symlink")),
+            "expected symlink journal Integrity error, got: {sym_j_err:?}"
+        );
+        assert_cross_process_lock(&active_db, "exclusive", true);
+        assert_cross_process_lock(&active_db, "immediate", true);
+        fs::remove_file(&victim_journal).unwrap();
+
+        // 2. Symlinked `-wal` pointing to active ledger fails closed without following it.
+        symlink(&active_db, &victim_wal).unwrap();
+        let sym_w_err = SqliteLedger::open_read_only(&victim_db).unwrap_err();
+        assert!(
+            matches!(&sym_w_err, LedgerError::Integrity(msg) if msg.contains("symlink")),
+            "expected symlink WAL Integrity error, got: {sym_w_err:?}"
+        );
+        assert_cross_process_lock(&active_db, "exclusive", true);
+        fs::remove_file(&victim_wal).unwrap();
+
+        // 3. Hard-linked `-journal` pointing to active ledger fails closed AND defers its raw fd
+        //    so `close()` never drops the active writer's POSIX `fcntl` lock.
+        fs::hard_link(&active_db, &victim_journal).unwrap();
+        let hl_err = SqliteLedger::open_read_only(&victim_db).unwrap_err();
+        assert!(
+            matches!(hl_err, LedgerError::Integrity(_)),
+            "expected hard-linked hot-journal Integrity error, got: {hl_err:?}"
+        );
+        assert_cross_process_lock(&active_db, "exclusive", true);
+        assert_cross_process_lock(&active_db, "immediate", true);
+        fs::remove_file(&victim_journal).unwrap();
+
+        writer_tx.execute_batch("ROLLBACK;").unwrap();
+    }
+    assert_cross_process_lock(&active_db, "exclusive", false);
+}
+
+#[cfg(unix)]
+#[test]
+fn dropping_writer_while_reader_holds_shared_lock_preserves_reader_posix_lock() {
+    use rusqlite::OpenFlags;
+
+    let dir = TempDir::new().unwrap();
+    let ledger_a = dir.path().join("reader_a.sqlite");
+    let ledger_b = dir.path().join("writer_b.sqlite");
+    let victim_c = dir.path().join("victim_c.sqlite");
+    let victim_c_journal = dir.path().join("victim_c.sqlite-journal");
+    init_single_permit_ledger(&ledger_a);
+    init_single_permit_ledger(&ledger_b);
+    init_single_permit_ledger(&victim_c);
+
+    {
+        let ro1 = SqliteLedger::open_read_only(&ledger_a).unwrap();
+        assert_eq!(ro1.audit_snapshot(None).unwrap().0, 1);
+
+        // Hold an active POSIX SHARED lock on ledger A (same lock acquired by `audit_snapshot`).
+        let ro_shared_tx =
+            Connection::open_with_flags(&ledger_a, OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+        ro_shared_tx
+            .execute_batch("BEGIN DEFERRED; SELECT count(*) FROM receipts;")
+            .unwrap();
+        assert_cross_process_lock(&ledger_a, "exclusive", true);
+
+        // Open writer B, trigger a deferred raw fd referencing ledger A's inode via hard-linked
+        // journal sidecar, then drop writer B while ro1 is STILL active.
+        {
+            let _writer_b = SqliteLedger::open_existing(&ledger_b).unwrap();
+            fs::hard_link(&ledger_a, &victim_c_journal).unwrap();
+            let err = SqliteLedger::open_read_only(&victim_c).unwrap_err();
+            assert!(matches!(err, LedgerError::Integrity(_)));
+            fs::remove_file(&victim_c_journal).unwrap();
+        }
+
+        // Dropping writer B while ro1 is still open MUST NOT close deferred_fds or drop ro1's
+        // POSIX SHARED lock on ledger A.
+        assert_cross_process_lock(&ledger_a, "exclusive", true);
+
+        ro_shared_tx.execute_batch("ROLLBACK;").unwrap();
+        drop(ro_shared_tx);
+        drop(ro1);
+    }
+    assert_cross_process_lock(&ledger_a, "exclusive", false);
+}
+
+#[cfg(unix)]
+#[test]
+fn open_read_only_sequential_70_ledgers_helper() {
+    use std::collections::HashSet;
+    use std::os::unix::fs::MetadataExt;
+    use std::path::PathBuf;
+
+    let Ok(dir) = std::env::var("HANDFEST_SEQ_RO_DIR") else {
+        return;
+    };
+    let dir = PathBuf::from(dir);
+    let ledger_a = dir.join("ledger_a.sqlite");
+    let mut seen_inodes = HashSet::new();
+    let meta_a = fs::metadata(&ledger_a).unwrap();
+    assert!(seen_inodes.insert((meta_a.dev(), meta_a.ino())));
+
+    let ro_a = SqliteLedger::open_read_only(&ledger_a).unwrap();
+    assert_eq!(ro_a.verify_integrity().unwrap(), 1);
+
+    // 1. 70 consecutive failed header probes (no guard created/dropped) must never exhaust the
+    //    64-descriptor cap while ro_a stays open.
+    for i in 0..70 {
+        let bad_path = dir.join(format!("bad_{i}.sqlite"));
+        assert!(matches!(
+            SqliteLedger::open_read_only(&bad_path),
+            Err(LedgerError::Integrity(_))
+        ));
+    }
+
+    // 2. 70 consecutive rollback-journal probes (no guard created/dropped) must never exhaust the
+    //    64-descriptor cap while ro_a stays open.
+    for i in 0..70 {
+        let bad_j_db = dir.join(format!("bad_journal_db_{i}.sqlite"));
+        assert!(matches!(
+            SqliteLedger::open_read_only(&bad_j_db),
+            Err(LedgerError::Integrity(ref m)) if m.contains("SQLite database header")
+        ));
+    }
+
+    // 3. 70 sequential valid read-only audits (each with a distinct clean rollback journal) must
+    //    all succeed while ro_a stays open.
+    for i in 0..70 {
+        let db_path = dir.join(format!("db_{i}.sqlite"));
+        let meta = fs::metadata(&db_path).unwrap();
+        assert!(
+            seen_inodes.insert((meta.dev(), meta.ino())),
+            "db_{i} must have a distinct inode"
+        );
+        let ro = SqliteLedger::open_read_only(&db_path)
+            .unwrap_or_else(|err| panic!("sequential open_read_only failed on db_{i}: {err:?}"));
+        assert_eq!(ro.verify_integrity().unwrap(), 1);
+        drop(ro);
+    }
+
+    assert_eq!(ro_a.verify_integrity().unwrap(), 1);
+    drop(ro_a);
+}
+
+#[cfg(unix)]
+#[test]
+fn open_read_only_sequential_audits_prune_deferred_fds_while_reader_open() {
+    let dir = TempDir::new().unwrap();
+    let ledger_a = dir.path().join("ledger_a.sqlite");
+    init_single_permit_ledger(&ledger_a);
+    let mut sqlite_magic_journal = [0u8; 28];
+    sqlite_magic_journal[..16].copy_from_slice(b"SQLite format 3\0");
+    for i in 0..70 {
+        let bad_path = dir.path().join(format!("bad_{i}.sqlite"));
+        fs::write(&bad_path, [0u8; 100]).unwrap();
+        let bad_j_db = dir.path().join(format!("bad_journal_db_{i}.sqlite"));
+        fs::copy(&ledger_a, &bad_j_db).unwrap();
+        let bad_j = dir
+            .path()
+            .join(format!("bad_journal_db_{i}.sqlite-journal"));
+        fs::write(&bad_j, sqlite_magic_journal).unwrap();
+        let db_path = dir.path().join(format!("db_{i}.sqlite"));
+        fs::copy(&ledger_a, &db_path).unwrap();
+        let journal_path = dir.path().join(format!("db_{i}.sqlite-journal"));
+        fs::write(&journal_path, [0u8; 28]).unwrap();
+    }
+
+    // Run in an isolated child test process so no parallel writer test in this binary can hold
+    // `active_writers > 0` during the 70 sequential read-only opens.
+    let exe = std::env::current_exe().expect("current test exe");
+    let output = std::process::Command::new(&exe)
+        .args([
+            "--exact",
+            "open_read_only_sequential_70_ledgers_helper",
+            "--quiet",
+        ])
+        .env("HANDFEST_SEQ_RO_DIR", dir.path())
+        .output()
+        .expect("spawn sequential read-only audit helper");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "sequential 70-ledger open_read_only helper failed\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(
+        stdout.contains("1 passed"),
+        "sequential 70-ledger helper did not run; stdout:\n{stdout}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn dropping_writer_while_reader_remains_preserves_renamed_db_lock_helper() {
+    use std::path::PathBuf;
+
+    let Ok(dir) = std::env::var("HANDFEST_DROP_WRITER_RO_DIR") else {
+        return;
+    };
+    let dir = PathBuf::from(dir);
+    let db_a = dir.join("db_a.sqlite");
+    let db_b = dir.join("db_b.sqlite");
+    let db_c = dir.join("db_c.sqlite");
+    let db_c_moved = dir.join("db_c_moved.sqlite");
+    let db_d = dir.join("db_d.sqlite");
+
+    // Keep Handfest reader ro_a on db_a and Handfest writer w_b on db_b.
+    let ro_a = SqliteLedger::open_read_only(&db_a).unwrap();
+    let w_b = SqliteLedger::open_existing(&db_b).unwrap();
+
+    // Hold BEGIN IMMEDIATE on db_c (untracked by Handfest) and rename it to db_c_moved.
+    let writer_tx = Connection::open(&db_c).unwrap();
+    writer_tx.execute_batch("BEGIN IMMEDIATE;").unwrap();
+    fs::rename(&db_c, &db_c_moved).unwrap();
+
+    // Open & drop open_read_only on renamed db_c_moved while w_b is active, deferring db_c's fd.
+    let ro_c = SqliteLedger::open_read_only(&db_c_moved).unwrap();
+    assert_eq!(ro_c.verify_integrity().unwrap(), 1);
+    drop(ro_c);
+
+    // Drop w_b while ro_a remains open: active_writers hits 0, but db_c_moved's uncounted
+    // deferred fd MUST NOT be swept while ro_a is still open.
+    drop(w_b);
+    assert_cross_process_lock(&db_c_moved, "exclusive", true);
+    assert_cross_process_lock(&db_c_moved, "immediate", true);
+
+    // Opening & dropping an unrelated reader db_d while active_writers == 0 must also preserve
+    // db_c_moved's deferred fd and POSIX lock while ro_a stays open.
+    let ro_d = SqliteLedger::open_read_only(&db_d).unwrap();
+    assert_eq!(ro_d.verify_integrity().unwrap(), 1);
+    drop(ro_d);
+    assert_cross_process_lock(&db_c_moved, "exclusive", true);
+    assert_cross_process_lock(&db_c_moved, "immediate", true);
+
+    assert_eq!(ro_a.verify_integrity().unwrap(), 1);
+    writer_tx.execute_batch("ROLLBACK;").unwrap();
+    drop(writer_tx);
+    drop(ro_a);
+    assert_cross_process_lock(&db_c_moved, "exclusive", false);
+}
+
+#[cfg(unix)]
+#[test]
+fn dropping_writer_while_reader_remains_preserves_renamed_db_posix_lock() {
+    let dir = TempDir::new().unwrap();
+    for name in ["db_a.sqlite", "db_b.sqlite", "db_c.sqlite", "db_d.sqlite"] {
+        init_single_permit_ledger(&dir.path().join(name));
+    }
+
+    // Run in an isolated child test process so no parallel writer test keeps active_writers > 0
+    // when w_b drops.
+    let exe = std::env::current_exe().expect("current test exe");
+    let output = std::process::Command::new(&exe)
+        .args([
+            "--exact",
+            "dropping_writer_while_reader_remains_preserves_renamed_db_lock_helper",
+            "--quiet",
+        ])
+        .env("HANDFEST_DROP_WRITER_RO_DIR", dir.path())
+        .output()
+        .expect("spawn writer-drop lock preservation helper");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "writer-drop lock preservation helper failed
+stdout:
+{stdout}
+stderr:
+{stderr}"
+    );
+    assert!(
+        stdout.contains("1 passed"),
+        "writer-drop lock preservation helper did not run; stdout:
+{stdout}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn second_reader_on_renamed_db_after_writer_drop_preserves_lock_helper() {
+    use std::path::PathBuf;
+
+    let Ok(dir) = std::env::var("HANDFEST_SECOND_RO_LOCK_DIR") else {
+        return;
+    };
+    let dir = PathBuf::from(dir);
+    let db_a = dir.join("db_a.sqlite");
+    let db_b = dir.join("db_b.sqlite");
+    let db_c = dir.join("db_c.sqlite");
+    let db_c_moved = dir.join("db_c_moved.sqlite");
+
+    // Keep Handfest reader ro_a on db_a and Handfest writer w_b on db_b.
+    let ro_a = SqliteLedger::open_read_only(&db_a).unwrap();
+    let w_b = SqliteLedger::open_existing(&db_b).unwrap();
+
+    // Hold BEGIN IMMEDIATE on db_c (untracked by Handfest) and rename it to db_c_moved.
+    let writer_tx = Connection::open(&db_c).unwrap();
+    writer_tx.execute_batch("BEGIN IMMEDIATE;").unwrap();
+    fs::rename(&db_c, &db_c_moved).unwrap();
+
+    // Open & drop first reader ro_c1 on renamed db_c_moved while w_b is active, retaining db_c in
+    // deferred_fds.
+    let ro_c1 = SqliteLedger::open_read_only(&db_c_moved).unwrap();
+    assert_eq!(ro_c1.verify_integrity().unwrap(), 1);
+    drop(ro_c1);
+
+    // Drop w_b while ro_a stays open, then open & drop a SECOND reader ro_c2 on renamed
+    // db_c_moved: dropping ro_c2 MUST NOT remove db_c's inode from deferred_fds while ro_a lives.
+    drop(w_b);
+    let ro_c2 = SqliteLedger::open_read_only(&db_c_moved).unwrap();
+    assert_eq!(ro_c2.verify_integrity().unwrap(), 1);
+    drop(ro_c2);
+
+    assert_cross_process_lock(&db_c_moved, "exclusive", true);
+    assert_cross_process_lock(&db_c_moved, "immediate", true);
+
+    assert_eq!(ro_a.verify_integrity().unwrap(), 1);
+    writer_tx.execute_batch("ROLLBACK;").unwrap();
+    drop(writer_tx);
+    drop(ro_a);
+    assert_cross_process_lock(&db_c_moved, "exclusive", false);
+}
+
+#[cfg(unix)]
+#[test]
+fn second_reader_on_renamed_db_after_writer_drop_preserves_posix_lock() {
+    let dir = TempDir::new().unwrap();
+    for name in ["db_a.sqlite", "db_b.sqlite", "db_c.sqlite"] {
+        init_single_permit_ledger(&dir.path().join(name));
+    }
+
+    let exe = std::env::current_exe().expect("current test exe");
+    let output = std::process::Command::new(&exe)
+        .args([
+            "--exact",
+            "second_reader_on_renamed_db_after_writer_drop_preserves_lock_helper",
+            "--quiet",
+        ])
+        .env("HANDFEST_SECOND_RO_LOCK_DIR", dir.path())
+        .output()
+        .expect("spawn second-reader lock preservation helper");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "second-reader lock preservation helper failed\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(
+        stdout.contains("1 passed"),
+        "second-reader lock preservation helper did not run; stdout:\n{stdout}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn saturated_deferred_fds_after_writer_drop_allows_fresh_audit_helper() {
+    use std::path::PathBuf;
+
+    let Ok(dir) = std::env::var("HANDFEST_SATURATED_RO_DIR") else {
+        return;
+    };
+    let dir = PathBuf::from(dir);
+    let db_a = dir.join("db_a.sqlite");
+    let db_b = dir.join("db_b.sqlite");
+    let db_new = dir.join("db_new.sqlite");
+
+    let ro_a = SqliteLedger::open_read_only(&db_a).unwrap();
+    let w_b = SqliteLedger::open_existing(&db_b).unwrap();
+
+    // Saturate deferred_fds to MAX_DEFERRED_FDS (64) while ro_a and w_b are active.
+    for i in 0..64 {
+        let fill = dir.join(format!("fill_{i}.sqlite"));
+        let ro_fill = SqliteLedger::open_read_only(&fill)
+            .unwrap_or_else(|err| panic!("fill open_read_only failed at {i}: {err:?}"));
+        drop(ro_fill);
+    }
+
+    // Confirm the 64-entry cap is actively saturated while w_b is still open.
+    assert!(matches!(
+        SqliteLedger::open_read_only(&db_new),
+        Err(LedgerError::Storage(ref m)) if m.contains("deferred raw-open fd cap (64)")
+    ));
+
+    // Drop w_b while keeping ro_a open: deferred_fds stays at 64, yet fresh uncounted db_new
+    // (including its clean rollback journal) MUST succeed because should_defer_inode is false.
+    drop(w_b);
+    let ro_new = SqliteLedger::open_read_only(&db_new)
+        .unwrap_or_else(|err| panic!("fresh open_read_only after writer drop failed: {err:?}"));
+    assert_eq!(ro_new.verify_integrity().unwrap(), 1);
+    drop(ro_new);
+
+    assert_eq!(ro_a.verify_integrity().unwrap(), 1);
+    drop(ro_a);
+}
+
+#[cfg(unix)]
+#[test]
+fn saturated_deferred_fds_after_writer_drop_allows_fresh_read_only_audit() {
+    let dir = TempDir::new().unwrap();
+    let db_a = dir.path().join("db_a.sqlite");
+    init_single_permit_ledger(&db_a);
+    fs::copy(&db_a, dir.path().join("db_b.sqlite")).unwrap();
+    for i in 0..64 {
+        fs::copy(&db_a, dir.path().join(format!("fill_{i}.sqlite"))).unwrap();
+    }
+    let db_new = dir.path().join("db_new.sqlite");
+    fs::copy(&db_a, &db_new).unwrap();
+    fs::write(dir.path().join("db_new.sqlite-journal"), [0u8; 28]).unwrap();
+
+    let exe = std::env::current_exe().expect("current test exe");
+    let output = std::process::Command::new(&exe)
+        .args([
+            "--exact",
+            "saturated_deferred_fds_after_writer_drop_allows_fresh_audit_helper",
+            "--quiet",
+        ])
+        .env("HANDFEST_SATURATED_RO_DIR", dir.path())
+        .output()
+        .expect("spawn saturated-deferred-fds audit helper");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "saturated-deferred-fds audit helper failed\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(
+        stdout.contains("1 passed"),
+        "saturated-deferred-fds audit helper did not run; stdout:\n{stdout}"
     );
 }

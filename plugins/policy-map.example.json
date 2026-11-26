@@ -1,0 +1,24 @@
+{
+  "tools": {
+    "merge_pull_request": {
+      "action": "git.pr.merge",
+      "resource_kind": "repo",
+      "resource_id_arg": "repo",
+      "arg_facts": {
+        "owner": {
+          "field": "resource.owner",
+          "type": "str"
+        },
+        "pullNumber": {
+          "field": "resource.pr",
+          "type": "int"
+        }
+      },
+      "static_facts": {
+        "resource.environment": {
+          "str": "staging"
+        }
+      }
+    }
+  }
+}
