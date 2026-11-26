@@ -298,35 +298,81 @@ fn open_writable_guarded_error_and_deferred_fd_cap_fail_closed() {
         drop(ro_cached);
         assert_eq!(reg.lock().unwrap().total_deferred_fds(), MAX_DEFERRED_FDS);
 
-        // Next distinct inode fails closed with Storage BEFORE opening another fd.
+        // Next distinct inode and uncached non-empty -journal both fail closed BEFORE opening.
         let overflow = write_valid_header_file(&dir.path().join("ro_target_overflow.sqlite"));
+        let uncached_journal = dir.path().join("uncached_cap.sqlite-journal");
+        fs::write(&uncached_journal, [0u8; ROLLBACK_JOURNAL_HDR_LEN]).unwrap();
         assert!(matches!(
             open_read_only_guarded_in(reg, &overflow, |_| Ok(())),
             Err(LedgerError::Storage(_))
         ));
         assert!(matches!(
-            reg.lock().unwrap().ensure_deferred_fd_capacity(),
+            probe_rollback_journal_once(reg, &uncached_journal),
             Err(LedgerError::Storage(_))
         ));
-        // Occupied key pushed directly via maybe_defer_fd retains the duplicate File rather than
-        // dropping it while handles are active.
-        let dup_file = File::open(first_target.as_ref().unwrap()).unwrap();
-        let dup_meta = dup_file.metadata().unwrap();
-        {
-            use std::os::unix::fs::MetadataExt;
-            let key = (dup_meta.dev(), dup_meta.ino());
-            let mut state = reg.lock().unwrap();
-            state.maybe_defer_fd(key, dup_file);
-            assert_eq!(state.deferred_fds[&key].len(), 2);
-            assert_eq!(state.total_deferred_fds(), MAX_DEFERRED_FDS + 1);
-        }
+        assert_eq!(reg.lock().unwrap().total_deferred_fds(), MAX_DEFERRED_FDS);
 
         drop(writer_guard);
         assert!(reg.lock().unwrap().deferred_fds.is_empty());
+        assert_eq!(
+            probe_rollback_journal_once(reg, &uncached_journal).unwrap(),
+            JournalProbe::Clean
+        );
         let ((), ro_after) = open_read_only_guarded_in(reg, &overflow, |_| Ok(())).unwrap();
         drop(ro_after);
         assert!(reg.lock().unwrap().deferred_fds.is_empty());
+
+        assert_duplicate_inode_cap_and_journal_guard(
+            reg,
+            &writer_path,
+            first_target.as_ref().unwrap(),
+            &overflow,
+            &uncached_journal,
+        );
     }
+}
+
+#[cfg(unix)]
+fn assert_duplicate_inode_cap_and_journal_guard(
+    reg: &'static Mutex<ActiveHandleRegistry>,
+    writer_path: &Path,
+    dup_source: &Path,
+    overflow: &Path,
+    uncached_journal: &Path,
+) {
+    use std::os::unix::fs::MetadataExt;
+
+    let ((), writer_guard) = open_writable_guarded_in(reg, writer_path, || Ok(())).unwrap();
+    let meta = fs::metadata(dup_source).unwrap();
+    let key = (meta.dev(), meta.ino());
+    {
+        let mut state = reg.lock().unwrap();
+        for _ in 0..MAX_DEFERRED_FDS {
+            state.maybe_defer_fd(key, File::open(dup_source).unwrap());
+        }
+        assert_eq!(state.deferred_fds.len(), 1);
+        assert_eq!(state.deferred_fds[&key].len(), MAX_DEFERRED_FDS);
+        assert_eq!(state.total_deferred_fds(), MAX_DEFERRED_FDS);
+    }
+    assert!(matches!(
+        open_read_only_guarded_in(reg, overflow, |_| Ok(())),
+        Err(LedgerError::Storage(_))
+    ));
+    assert!(matches!(
+        probe_rollback_journal_once(reg, uncached_journal),
+        Err(LedgerError::Storage(_))
+    ));
+    assert_eq!(reg.lock().unwrap().total_deferred_fds(), MAX_DEFERRED_FDS);
+
+    // Pushing an extra duplicate on the occupied key retains it rather than dropping while active.
+    {
+        let mut state = reg.lock().unwrap();
+        state.maybe_defer_fd(key, File::open(dup_source).unwrap());
+        assert_eq!(state.deferred_fds[&key].len(), MAX_DEFERRED_FDS + 1);
+        assert_eq!(state.total_deferred_fds(), MAX_DEFERRED_FDS + 1);
+    }
+    drop(writer_guard);
+    assert!(reg.lock().unwrap().deferred_fds.is_empty());
 }
 #[cfg(unix)]
 #[test]
@@ -347,6 +393,16 @@ fn open_no_follow_read_only_rejects_symlinks_atomically() {
         return;
     }
 
+    // Derive the platform-native ELOOP io::Error (ErrorKind::FilesystemLoop is still unstable
+    // behind #![feature(io_error_more)]) from a 2-symlink cycle so this assertion is portable
+    // across Linux x86_64/ARM (40), MIPS (90), SPARC (62), Android, macOS, and BSD.
+    let loop_a = dir.path().join("eloop_a.journal");
+    let loop_b = dir.path().join("eloop_b.journal");
+    symlink(&loop_b, &loop_a).unwrap();
+    symlink(&loop_a, &loop_b).unwrap();
+    let expected_eloop = fs::metadata(&loop_a).unwrap_err();
+    assert!(expected_eloop.raw_os_error().is_some());
+
     // Direct call on symlink to existing target (without symlink_metadata) fails atomically with ELOOP.
     let live_sym = dir.path().join("live_sym.journal");
     symlink(&target, &live_sym).unwrap();
@@ -356,11 +412,15 @@ fn open_no_follow_read_only_rejects_symlinks_atomically() {
         io::ErrorKind::NotFound,
         "symlink open must not be misclassified as NotFound: {err:?}"
     );
-    #[cfg(target_os = "linux")]
+    assert_eq!(
+        err.kind(),
+        expected_eloop.kind(),
+        "expected FilesystemLoop (ELOOP) from O_NOFOLLOW, got: {err:?}"
+    );
     assert_eq!(
         err.raw_os_error(),
-        Some(40),
-        "expected Linux ELOOP (40) from O_NOFOLLOW, got: {err:?}"
+        expected_eloop.raw_os_error(),
+        "expected OS ELOOP errno from O_NOFOLLOW, got: {err:?}"
     );
 
     // Direct call on dangling symlink also fails atomically with ELOOP (never NotFound / Clean).
@@ -372,11 +432,15 @@ fn open_no_follow_read_only_rejects_symlinks_atomically() {
         io::ErrorKind::NotFound,
         "dangling symlink must fail with ELOOP, not NotFound: {dangling_err:?}"
     );
-    #[cfg(target_os = "linux")]
+    assert_eq!(
+        dangling_err.kind(),
+        expected_eloop.kind(),
+        "expected FilesystemLoop (ELOOP) on dangling symlink, got: {dangling_err:?}"
+    );
     assert_eq!(
         dangling_err.raw_os_error(),
-        Some(40),
-        "expected Linux ELOOP (40) on dangling symlink, got: {dangling_err:?}"
+        expected_eloop.raw_os_error(),
+        "expected OS ELOOP errno on dangling symlink, got: {dangling_err:?}"
     );
 }
 
@@ -544,7 +608,7 @@ fn probe_rollback_journal_once_and_header_inspect_reject_symlinks_via_o_nofollow
     }
 }
 
-fn assert_concurrent_open_rejected<F>(canonical: &Path, check_path: &Path, mutate: F)
+fn assert_concurrent_open_rejected<F>(canonical: &Path, mutate: F)
 where
     F: FnOnce(&Path),
 {
@@ -560,6 +624,7 @@ where
         }
     }
 
+    let orig_id = FileIdentity::from_path(canonical).unwrap();
     let dropped = Arc::new(AtomicBool::new(false));
     let err = open_read_only_guarded(canonical, |path| {
         mutate(path);
@@ -575,39 +640,40 @@ where
         dropped.load(Ordering::SeqCst),
         "conn must be dropped immediately"
     );
-    assert_eq!(active_handle_count(check_path), 0);
+    let registry = lock_registry(active_handles());
+    assert_eq!(registry.active_count_by_id(&orig_id), 0);
 }
 
 #[test]
 fn open_read_only_guarded_rejects_concurrent_path_replacement_and_drops_conn() {
     let dir = TempDir::new().unwrap();
-    let other_db = write_valid_header_file(&dir.path().join("other.sqlite"));
 
     #[cfg(unix)]
     {
         use std::os::unix::fs::symlink;
 
+        let other_db = write_valid_header_file(&dir.path().join("other.sqlite"));
         let swap_inode = write_valid_header_file(&dir.path().join("swap_inode.sqlite"));
-        assert_concurrent_open_rejected(&swap_inode, &swap_inode, |path| {
+        assert_concurrent_open_rejected(&swap_inode, |path| {
             let replacement = dir.path().join("replacement_inode.sqlite");
             write_valid_header_file(&replacement);
             fs::rename(&replacement, path).unwrap();
         });
 
         let swap_sym = write_valid_header_file(&dir.path().join("swap_symlink.sqlite"));
-        assert_concurrent_open_rejected(&swap_sym, &other_db, |path| {
+        assert_concurrent_open_rejected(&swap_sym, |path| {
             fs::remove_file(path).unwrap();
             symlink(&other_db, path).unwrap();
         });
     }
 
     let unlink_db = write_valid_header_file(&dir.path().join("unlink_during_open.sqlite"));
-    assert_concurrent_open_rejected(&unlink_db, &unlink_db, |path| {
+    assert_concurrent_open_rejected(&unlink_db, |path| {
         fs::remove_file(path).unwrap();
     });
 
     let dir_db = write_valid_header_file(&dir.path().join("dir_during_open.sqlite"));
-    assert_concurrent_open_rejected(&dir_db, &dir_db, |path| {
+    assert_concurrent_open_rejected(&dir_db, |path| {
         fs::remove_file(path).unwrap();
         fs::create_dir(path).unwrap();
     });

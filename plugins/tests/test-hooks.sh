@@ -626,6 +626,24 @@ assert_eq "decimal bare sci quota rc" "$HOOK_RC" "2"
 assert_json "decimal bare sci quota stderr" "$(cat "$TMP_DIR/stderr.txt")" "d['verdict'] == 'deny' and d['code'] == 'mandate_denied'"
 assert_json "decimal bare sci formatted" "$(cat "$CAPTURED_FACTS")" "d['resource.amount'] == {'decimal': '15.0'}"
 
+# Bare JSON scientific over-scale decimal 1e-29 must deny with invalid_argument BEFORE invoking handfest check
+NO_CALL_SHIM="$TMP_DIR/no-call-handfest.sh"
+NO_CALL_MARKER="$TMP_DIR/no-call-invoked"
+cat <<SHIM_EOF >"$NO_CALL_SHIM"
+#!/usr/bin/env bash
+touch "$NO_CALL_MARKER"
+exit 99
+SHIM_EOF
+chmod +x "$NO_CALL_SHIM"
+rm -f "$NO_CALL_MARKER"
+HOOK_RC=0
+HANDFEST_BIN="$NO_CALL_SHIM" HANDFEST_POLICY_MAP="$PAY_MAP" HANDFEST_LEDGER="$PAY_LEDGER" HANDFEST_CHAIN="$PAY_SIGNED" \
+  "$HOOK" <<<'{"tool_name":"charge_card","tool_input":{"currency":"USD","approved":true,"scheduled_at":"2026-11-24T18:30:00Z","amount":1e-29}}' \
+  >"$TMP_DIR/stdout.txt" 2>"$TMP_DIR/stderr.txt" || HOOK_RC=$?
+assert_eq "decimal bare sci over-scale 1e-29 rc" "$HOOK_RC" "2"
+assert_json "decimal bare sci over-scale 1e-29 stderr" "$(cat "$TMP_DIR/stderr.txt")" "d['verdict'] == 'deny' and d['code'] == 'invalid_argument'"
+assert_eq "decimal bare sci over-scale 1e-29 handfest not invoked" "$([[ -e "$NO_CALL_MARKER" ]] && echo called || echo not-called)" "not-called"
+
 # Reject integer-like typed decimal strings without '.', leading-zero decimals ("00.5"), negative zero (-0.0, -0.00, -0, -0e0), quoted scientific notation "1.5e1", pathological exponents, raw fractional scale > 28, i128::MAX+1, and i128::MIN-1
 for bad_amt in '"1"' '"-1"' '"0"' '"00.5"' '"-00.5"' '"01.5"' '"-0.0"' '"-0.00"' '-0.0' '-0.00' '-0' '-0e0' '"1.5e1"' '1e1000000' '"1e1000000"' '"0.00000000000000000000000000001"' "\"$OVER_SCALE_ONE_ZEROS\"" "\"$OVER_SCALE_ZERO_ZEROS\"" "\"$LONG_ZEROS\"" '"170141183460469231731687303715884105728.0"' '"-170141183460469231731687303715884105729.0"'; do
   HOOK_RC=0

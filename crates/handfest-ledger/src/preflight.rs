@@ -45,7 +45,9 @@ const UNIX_O_NOFOLLOW: Option<i32> = if cfg!(all(
         target_arch = "s390x",
         target_arch = "loongarch64",
         target_arch = "mips",
+        target_arch = "mips32r6",
         target_arch = "mips64",
+        target_arch = "mips64r6",
         target_arch = "sparc",
         target_arch = "sparc64"
     )
@@ -83,7 +85,12 @@ const UNIX_O_NONBLOCK: Option<i32> = if cfg!(all(
     Some(0o4000) // 0x800
 } else if cfg!(all(
     any(target_os = "linux", target_os = "android"),
-    any(target_arch = "mips", target_arch = "mips64")
+    any(
+        target_arch = "mips",
+        target_arch = "mips32r6",
+        target_arch = "mips64",
+        target_arch = "mips64r6"
+    )
 )) {
     Some(0x0080)
 } else if cfg!(all(
@@ -106,32 +113,31 @@ const UNIX_O_NONBLOCK: Option<i32> = if cfg!(all(
 
 #[cfg(unix)]
 const fn combine_unix_open_flags(no_follow: Option<i32>, non_block: Option<i32>) -> i32 {
-    let nf = match no_follow {
-        Some(flag) => flag,
-        None => 0,
-    };
-    let nb = match non_block {
-        Some(flag) => flag,
-        None => 0,
-    };
+    let nf = if let Some(flag) = no_follow { flag } else { 0 };
+    let nb = if let Some(flag) = non_block { flag } else { 0 };
     nf | nb
 }
 
-/// Process-local file identity for POSIX `fcntl` lock preservation.
+/// Process-local file identity for POSIX `fcntl` lock preservation and post-open identity checks.
 ///
-/// On Unix, POSIX `fcntl` locks are associated with `(st_dev, st_ino)` across all pathnames and
-/// hard links pointing to the same inode. On non-Unix platforms, falls back to the canonical path.
-#[cfg(unix)]
+/// Unix keys by `(st_dev, st_ino)`; Windows pairs `canonical` with `creation_time()` and
+/// `file_size()` (`std::os::windows::fs::MetadataExt`) to detect same-path replacement; other
+/// targets fall back to `canonical`. Under `#![forbid(unsafe_code)]`,
+/// `rusqlite::Connection::open_with_flags` opens by pathname (not fd), so concurrent in-place ABA
+/// replacement (`A -> B -> A`) during `sqlite3_open_v2` is outside SQLite's supported
+/// local-filesystem concurrency contract ("How To Corrupt An SQLite Database File" §2.1 & §2.4).
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) struct FileIdentity {
+    #[cfg(unix)]
     dev: u64,
+    #[cfg(unix)]
     ino: u64,
-}
-
-#[cfg(not(unix))]
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
-pub(crate) struct FileIdentity {
+    #[cfg(not(unix))]
     canonical: PathBuf,
+    #[cfg(windows)]
+    creation_time: u64,
+    #[cfg(windows)]
+    file_size: u64,
 }
 
 impl FileIdentity {
@@ -144,7 +150,17 @@ impl FileIdentity {
         }
     }
 
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    fn from_metadata(canonical: &Path, meta: &fs::Metadata) -> Self {
+        use std::os::windows::fs::MetadataExt;
+        Self {
+            canonical: canonical.to_path_buf(),
+            creation_time: meta.creation_time(),
+            file_size: meta.file_size(),
+        }
+    }
+
+    #[cfg(not(any(unix, windows)))]
     fn from_metadata(canonical: &Path, _meta: &fs::Metadata) -> Self {
         Self {
             canonical: canonical.to_path_buf(),
@@ -166,6 +182,11 @@ struct ActiveHandleRegistry {
 }
 
 impl ActiveHandleRegistry {
+    #[cfg(test)]
+    fn active_count_by_id(&self, id: &FileIdentity) -> usize {
+        self.counts.get(id).copied().unwrap_or(0)
+    }
+
     #[cfg(unix)]
     fn has_active_handles(&self) -> bool {
         self.active_writers > 0 || !self.counts.is_empty()
@@ -232,6 +253,10 @@ fn active_handles() -> &'static Mutex<ActiveHandleRegistry> {
     ACTIVE_HANDLES.get_or_init(|| Mutex::new(ActiveHandleRegistry::default()))
 }
 
+fn lock_registry(registry: &Mutex<ActiveHandleRegistry>) -> MutexGuard<'_, ActiveHandleRegistry> {
+    registry.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
 struct PendingWriterGuard {
     registry: &'static Mutex<ActiveHandleRegistry>,
     state: MutexGuard<'static, ActiveHandleRegistry>,
@@ -240,7 +265,7 @@ struct PendingWriterGuard {
 
 impl PendingWriterGuard {
     fn acquire(registry: &'static Mutex<ActiveHandleRegistry>) -> Self {
-        let mut state = registry.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut state = lock_registry(registry);
         state.active_writers += 1;
         Self {
             registry,
@@ -288,7 +313,7 @@ pub(crate) struct ActiveHandleGuard {
 
 impl Drop for ActiveHandleGuard {
     fn drop(&mut self) {
-        let mut state = self.registry.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut state = lock_registry(self.registry);
         if let Some(count) = state.counts.get_mut(&self.id) {
             *count -= 1;
             if *count == 0 {
@@ -308,34 +333,22 @@ pub(crate) fn active_handle_count(canonical: &Path) -> usize {
     let Ok(id) = FileIdentity::from_path(canonical) else {
         return 0;
     };
-    let state = active_handles()
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner);
-    state.counts.get(&id).copied().unwrap_or(0)
+    lock_registry(active_handles()).active_count_by_id(&id)
 }
 
 #[cfg(all(test, unix))]
 pub(crate) fn active_writer_count() -> usize {
-    let state = active_handles()
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner);
-    state.active_writers
+    lock_registry(active_handles()).active_writers
 }
 
 #[cfg(all(test, unix))]
 pub(crate) fn deferred_fd_count() -> usize {
-    let state = active_handles()
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner);
-    state.total_deferred_fds()
+    lock_registry(active_handles()).total_deferred_fds()
 }
 
 #[cfg(all(test, unix))]
 pub(crate) fn defer_fd_for_test(key: (u64, u64), file: File) {
-    let mut state = active_handles()
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner);
-    state.maybe_defer_fd(key, file);
+    lock_registry(active_handles()).maybe_defer_fd(key, file);
 }
 
 /// Opens a writable ledger connection while holding the process-local active-handle registry lock
@@ -393,6 +406,13 @@ where
     open_read_only_guarded_in(active_handles(), canonical, open_conn)
 }
 
+/// Opens a read-only handle inside `registry` and verifies post-open [`FileIdentity`].
+///
+/// Trust boundary: under `#![forbid(unsafe_code)]`, `rusqlite::Connection::open_with_flags` opens
+/// by pathname (not fd). Post-open verification rejects concurrent unlink or replacement with a
+/// different identity, whereas concurrent in-place ABA replacement (`A -> B -> A`) during
+/// `sqlite3_open_v2` is outside SQLite's supported local-filesystem concurrency contract
+/// ("How To Corrupt An SQLite Database File" §2.1 & §2.4).
 fn open_read_only_guarded_in<T, F>(
     registry: &'static Mutex<ActiveHandleRegistry>,
     canonical: &Path,
@@ -405,7 +425,7 @@ where
     check_wal_sidecar(&append_suffix(canonical, "-wal"))?;
     check_rollback_journal_sidecar_in(registry, &append_suffix(canonical, "-journal"))?;
 
-    let mut state = registry.lock().unwrap_or_else(PoisonError::into_inner);
+    let mut state = lock_registry(registry);
     let meta = stat_read_only_regular_file(canonical)?;
     let mut id = FileIdentity::from_metadata(canonical, &meta);
     if state.counts.get(&id).copied().unwrap_or(0) == 0 {
@@ -689,7 +709,7 @@ fn probe_rollback_journal_open(
     is_symlink: bool,
 ) -> Result<JournalProbe, LedgerError> {
     #[cfg(unix)]
-    let mut state = registry.lock().unwrap_or_else(PoisonError::into_inner);
+    let mut state = lock_registry(registry);
     #[cfg(not(unix))]
     let _ = registry;
 
