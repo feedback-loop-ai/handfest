@@ -319,6 +319,7 @@ dependencies = [
  "handfest-anchors",
  "handfest-core",
  "handfest-ledger",
+ "handfest-mcp",
  "serde",
  "serde_json",
  "tempfile",

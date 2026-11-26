@@ -45,3 +45,4 @@ tempfile = "3"
 handfest-core = { path = "crates/handfest-core", version = "0.1.0" }
 handfest-anchors = { path = "crates/handfest-anchors", version = "0.1.0" }
 handfest-ledger = { path = "crates/handfest-ledger", version = "0.1.0" }
+handfest-mcp = { path = "crates/handfest-mcp", version = "0.1.0" }

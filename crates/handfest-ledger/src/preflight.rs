@@ -23,101 +23,14 @@ const HOT_JOURNAL_MAX_BACKOFF: Duration = Duration::from_millis(100);
 #[cfg(unix)]
 const MAX_DEFERRED_FDS: usize = 64;
 
-#[cfg(unix)]
-const UNIX_O_NOFOLLOW: Option<i32> = if cfg!(all(
-    any(target_os = "linux", target_os = "android"),
-    any(
-        target_arch = "arm",
-        target_arch = "aarch64",
-        target_arch = "powerpc",
-        target_arch = "powerpc64",
-        target_arch = "m68k"
-    )
-)) {
-    Some(0o100_000) // 0x8000
-} else if cfg!(all(
-    any(target_os = "linux", target_os = "android"),
-    any(
-        target_arch = "x86_64",
-        target_arch = "x86",
-        target_arch = "riscv32",
-        target_arch = "riscv64",
-        target_arch = "s390x",
-        target_arch = "loongarch64",
-        target_arch = "mips",
-        target_arch = "mips32r6",
-        target_arch = "mips64",
-        target_arch = "mips64r6",
-        target_arch = "sparc",
-        target_arch = "sparc64"
-    )
-)) {
-    Some(0o400_000) // 0x20000
-} else if cfg!(any(
-    target_os = "macos",
-    target_os = "ios",
-    target_os = "freebsd",
-    target_os = "openbsd",
-    target_os = "netbsd",
-    target_os = "dragonfly"
-)) {
-    Some(0x0100)
-} else {
-    None
-};
+#[path = "preflight_open.rs"]
+mod preflight_open;
 
+use preflight_open::open_no_follow_read_only;
 #[cfg(unix)]
-const UNIX_O_NONBLOCK: Option<i32> = if cfg!(all(
-    any(target_os = "linux", target_os = "android"),
-    any(
-        target_arch = "x86_64",
-        target_arch = "x86",
-        target_arch = "aarch64",
-        target_arch = "arm",
-        target_arch = "riscv32",
-        target_arch = "riscv64",
-        target_arch = "powerpc",
-        target_arch = "powerpc64",
-        target_arch = "s390x",
-        target_arch = "loongarch64",
-        target_arch = "m68k"
-    )
-)) {
-    Some(0o4000) // 0x800
-} else if cfg!(all(
-    any(target_os = "linux", target_os = "android"),
-    any(
-        target_arch = "mips",
-        target_arch = "mips32r6",
-        target_arch = "mips64",
-        target_arch = "mips64r6"
-    )
-)) {
-    Some(0x0080)
-} else if cfg!(all(
-    any(target_os = "linux", target_os = "android"),
-    any(target_arch = "sparc", target_arch = "sparc64")
-)) {
-    Some(0x4000)
-} else if cfg!(any(
-    target_os = "macos",
-    target_os = "ios",
-    target_os = "freebsd",
-    target_os = "openbsd",
-    target_os = "netbsd",
-    target_os = "dragonfly"
-)) {
-    Some(0x0004)
-} else {
-    None
-};
-
-#[cfg(unix)]
-const fn combine_unix_open_flags(no_follow: Option<i32>, non_block: Option<i32>) -> i32 {
-    let nf = if let Some(flag) = no_follow { flag } else { 0 };
-    let nb = if let Some(flag) = non_block { flag } else { 0 };
-    nf | nb
-}
+use preflight_open::UNIX_O_NOFOLLOW;
+#[cfg(all(test, unix))]
+use preflight_open::{combine_unix_open_flags, raw_open_calls, UNIX_O_NONBLOCK};
 
 /// Process-local file identity for POSIX `fcntl` lock preservation and post-open identity checks.
 ///
@@ -198,34 +111,46 @@ impl ActiveHandleRegistry {
     }
 
     #[cfg(unix)]
+    fn deferred_fd_cap_error() -> LedgerError {
+        LedgerError::Storage(format!(
+            "deferred raw-open fd cap ({MAX_DEFERRED_FDS}) reached while ledger handles are active"
+        ))
+    }
+
+    #[cfg(unix)]
     fn ensure_deferred_fd_capacity(&self, key: Option<(u64, u64)>) -> Result<(), LedgerError> {
         let will_defer = match key {
             Some(id) => self.should_defer_inode(id),
-            None => self.active_writers > 0,
+            None => self.has_active_handles(),
         };
         if will_defer && self.total_deferred_fds() >= MAX_DEFERRED_FDS {
-            return Err(LedgerError::Storage(format!(
-                "deferred raw-open fd cap ({MAX_DEFERRED_FDS}) reached while ledger handles are active"
-            )));
+            return Err(Self::deferred_fd_cap_error());
         }
         Ok(())
     }
 
     #[cfg(unix)]
-    fn maybe_defer_fd(&mut self, key: (u64, u64), file: File) {
-        if self.should_defer_inode(key) {
-            self.deferred_fds.entry(key).or_default().push(file);
+    fn maybe_defer_fd(&mut self, key: (u64, u64), file: File) -> Result<(), LedgerError> {
+        if !self.should_defer_inode(key) {
+            return Ok(());
         }
+        if self.total_deferred_fds() >= MAX_DEFERRED_FDS {
+            drop(file);
+            return Err(Self::deferred_fd_cap_error());
+        }
+        self.deferred_fds.entry(key).or_default().push(file);
+        Ok(())
     }
 
     #[cfg(unix)]
-    fn maybe_defer_regular_file(&mut self, file: File) {
+    fn maybe_defer_regular_file(&mut self, file: File) -> Result<(), LedgerError> {
         use std::os::unix::fs::MetadataExt;
         if self.has_active_handles() {
             if let Some(fstat) = file.metadata().ok().filter(fs::Metadata::is_file) {
-                self.maybe_defer_fd((fstat.dev(), fstat.ino()), file);
+                return self.maybe_defer_fd((fstat.dev(), fstat.ino()), file);
             }
         }
+        Ok(())
     }
 }
 
@@ -332,7 +257,9 @@ pub(crate) fn deferred_fd_count() -> usize {
 
 #[cfg(all(test, unix))]
 pub(crate) fn defer_fd_for_test(key: (u64, u64), file: File) {
-    lock_registry(active_handles()).maybe_defer_fd(key, file);
+    lock_registry(active_handles())
+        .maybe_defer_fd(key, file)
+        .expect("test fixture defer_fd_for_test within MAX_DEFERRED_FDS");
 }
 
 /// Opens a writable ledger connection while holding the process-local active-handle registry lock
@@ -466,10 +393,20 @@ fn stat_read_only_regular_file(canonical: &Path) -> Result<fs::Metadata, LedgerE
 }
 
 #[cfg(unix)]
-fn regular_file_key(path: &Path) -> Option<(u64, u64)> {
+enum PathInode {
+    Regular((u64, u64)),
+    NotFound,
+    Other,
+}
+
+#[cfg(unix)]
+fn path_inode(path: &Path) -> PathInode {
     use std::os::unix::fs::MetadataExt;
-    let meta = fs::symlink_metadata(path).ok()?;
-    meta.file_type().is_file().then(|| (meta.dev(), meta.ino()))
+    match fs::symlink_metadata(path) {
+        Ok(meta) if meta.file_type().is_file() => PathInode::Regular((meta.dev(), meta.ino())),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => PathInode::NotFound,
+        _ => PathInode::Other,
+    }
 }
 
 fn validate_regular_ledger_metadata(
@@ -496,9 +433,20 @@ fn inspect_sqlite_header_locked(
     state: &mut ActiveHandleRegistry,
     canonical: &Path,
 ) -> Result<FileIdentity, LedgerError> {
+    inspect_sqlite_header_with_opener(state, canonical, open_no_follow_read_only)
+}
+
+fn inspect_sqlite_header_with_opener(
+    state: &mut ActiveHandleRegistry,
+    canonical: &Path,
+    open: impl FnOnce(&Path) -> io::Result<File>,
+) -> Result<FileIdentity, LedgerError> {
     #[cfg(unix)]
     {
-        let key = regular_file_key(canonical);
+        let key = match path_inode(canonical) {
+            PathInode::Regular(k) => Some(k),
+            PathInode::NotFound | PathInode::Other => None,
+        };
         if let Some(cached) = key.and_then(|k| state.cached_deferred_fd(k)) {
             cached.seek(SeekFrom::Start(0)).map_err(|err| {
                 LedgerError::Integrity(format!(
@@ -513,7 +461,7 @@ fn inspect_sqlite_header_locked(
     #[cfg(not(unix))]
     let _ = state;
 
-    let mut file = open_no_follow_read_only(canonical).map_err(|err| {
+    let mut file = open(canonical).map_err(|err| {
         LedgerError::Integrity(format!(
             "failed to open read-only ledger '{}': {err}",
             canonical.display()
@@ -521,7 +469,7 @@ fn inspect_sqlite_header_locked(
     })?;
     let res = inspect_sqlite_header_from_file(&mut file, canonical);
     #[cfg(unix)]
-    state.maybe_defer_regular_file(file);
+    state.maybe_defer_regular_file(file)?;
     res
 }
 
@@ -625,30 +573,6 @@ fn check_rollback_journal_sidecar_with_budget_in(
     }
 }
 
-#[cfg(all(test, unix))]
-thread_local! {
-    static RAW_OPEN_CALLS: std::sync::atomic::AtomicUsize =
-        const { std::sync::atomic::AtomicUsize::new(0) };
-}
-
-#[cfg(all(test, unix))]
-fn raw_open_calls() -> usize {
-    RAW_OPEN_CALLS.with(|c| c.load(std::sync::atomic::Ordering::SeqCst))
-}
-
-fn open_no_follow_read_only(path: &Path) -> io::Result<File> {
-    #[cfg(all(test, unix))]
-    RAW_OPEN_CALLS.with(|c| c.fetch_add(1, std::sync::atomic::Ordering::SeqCst));
-    let mut opts = fs::OpenOptions::new();
-    opts.read(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        opts.custom_flags(combine_unix_open_flags(UNIX_O_NOFOLLOW, UNIX_O_NONBLOCK));
-    }
-    opts.open(path)
-}
-
 fn reject_symlink_without_o_nofollow(
     has_o_nofollow: bool,
     is_symlink: bool,
@@ -700,6 +624,20 @@ fn probe_rollback_journal_open(
     journal_path: &Path,
     is_symlink: bool,
 ) -> Result<JournalProbe, LedgerError> {
+    probe_rollback_journal_open_with_opener(
+        registry,
+        journal_path,
+        is_symlink,
+        open_no_follow_read_only,
+    )
+}
+
+fn probe_rollback_journal_open_with_opener(
+    registry: &Mutex<ActiveHandleRegistry>,
+    journal_path: &Path,
+    is_symlink: bool,
+    open: impl FnOnce(&Path) -> io::Result<File>,
+) -> Result<JournalProbe, LedgerError> {
     #[cfg(unix)]
     let mut state = lock_registry(registry);
     #[cfg(not(unix))]
@@ -707,9 +645,15 @@ fn probe_rollback_journal_open(
 
     #[cfg(unix)]
     {
-        let key = (!is_symlink)
-            .then(|| regular_file_key(journal_path))
-            .flatten();
+        let key = if is_symlink {
+            None
+        } else {
+            match path_inode(journal_path) {
+                PathInode::Regular(k) => Some(k),
+                PathInode::NotFound => return Ok(JournalProbe::Clean),
+                PathInode::Other => None,
+            }
+        };
         if let Some(cached) = key.and_then(|k| state.cached_deferred_fd(k)) {
             cached.seek(SeekFrom::Start(0)).map_err(|err| {
                 LedgerError::Integrity(format!(
@@ -721,7 +665,7 @@ fn probe_rollback_journal_open(
         }
         state.ensure_deferred_fd_capacity(key)?;
     }
-    let mut file = match open_no_follow_read_only(journal_path) {
+    let mut file = match open(journal_path) {
         Ok(file) => file,
         Err(err) if !is_symlink && err.kind() == io::ErrorKind::NotFound => {
             return Ok(JournalProbe::Clean);
@@ -741,7 +685,7 @@ fn probe_rollback_journal_open(
     };
     let probe = read_rollback_journal_from_file(&mut file, journal_path);
     #[cfg(unix)]
-    state.maybe_defer_regular_file(file);
+    state.maybe_defer_regular_file(file)?;
     probe
 }
 

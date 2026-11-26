@@ -1065,3 +1065,150 @@ fn check_require_existing_ledger_maps_symlink_cycle_and_0000_ledger_to_storage_e
     let mode000_out = run_check_on_ledger(&signed_path, &agent_key, &ledger, true);
     assert_existing_ledger_open_error(&mode000_out, "storage_error", "0o000 existing ledger");
 }
+
+fn run_policy_map_check(
+    ledger: &Path,
+    signed_path: &Path,
+    agent_key: &str,
+    policy_path: &Path,
+    tool_name: &str,
+    tool_input: &str,
+    stdin_payload: Option<&[u8]>,
+) -> std::process::Output {
+    use std::io::Write;
+    use std::process::Stdio;
+
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_handfest"));
+    cmd.args([
+        "check",
+        "--ledger",
+        ledger.to_str().unwrap(),
+        "--chain",
+        signed_path.to_str().unwrap(),
+        "--actor-key",
+        agent_key,
+        "--policy-map",
+        policy_path.to_str().unwrap(),
+        "--tool-name",
+        tool_name,
+        "--tool-input",
+        tool_input,
+        "--now",
+        "2026-11-24T18:30:00Z",
+    ]);
+    if let Some(bytes) = stdin_payload {
+        let mut child = cmd
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child.stdin.take().unwrap().write_all(bytes).unwrap();
+        child.wait_with_output().unwrap()
+    } else {
+        cmd.output().unwrap()
+    }
+}
+
+#[test]
+fn check_policy_map_mode_shares_mcp_codec_and_emits_typed_mapping_errors() {
+    let dir = TempDir::new().unwrap();
+    let (signed_path, agent_key) = setup_merge_mandate_fixture(dir.path());
+    let ledger = dir.path().join("policy_mode.sqlite");
+    let policy_path = dir.path().join("policy.json");
+    fs::write(
+        &policy_path,
+        r#"{
+  "tools": {
+    "unused\ntool": {
+      "action": "git.pr.merge",
+      "resource_kind": "repo",
+      "resource_id_arg": "repo"
+    },
+    "merge_pull_request": {
+      "action": "git.pr.merge",
+      "resource_kind": "repo",
+      "resource_id_arg": "repo",
+      "arg_facts": {
+        "owner": { "field": "resource.owner", "type": "str" },
+        "pullNumber": { "field": "resource.pr", "type": "int" }
+      },
+      "static_facts": {
+        "resource.environment": { "str": "staging" }
+      }
+    }
+  }
+}"#,
+    )
+    .unwrap();
+
+    // 1. Valid stdin tool-input permits and records receipt (with unused \n tool in map).
+    let ok_out = run_policy_map_check(
+        &ledger,
+        &signed_path,
+        &agent_key,
+        &policy_path,
+        "merge_pull_request",
+        "-",
+        Some(br#"{"owner":"feedback-loop-ai","repo":"feedback-loop-ai/handfest","pullNumber":42}"#),
+    );
+    assert!(
+        ok_out.status.success(),
+        "policy-map check failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&ok_out.stdout),
+        String::from_utf8_lossy(&ok_out.stderr)
+    );
+    let ok_json: serde_json::Value = serde_json::from_slice(&ok_out.stdout).unwrap();
+    assert_eq!(ok_json["verdict"], "permit");
+
+    // 2. Unmapped tool fails closed with structured policy_mapping_failed / unmapped_tool.
+    let unmapped = run_policy_map_check(
+        &ledger,
+        &signed_path,
+        &agent_key,
+        &policy_path,
+        "Bash",
+        "{}",
+        None,
+    );
+    assert!(!unmapped.status.success());
+    let err_json: serde_json::Value = serde_json::from_slice(&unmapped.stderr).unwrap();
+    assert_eq!(err_json["error"], "policy_mapping_failed");
+    assert_eq!(err_json["code"], "unmapped_tool");
+
+    // 3. Invalid argument (-0 for int) fails closed with invalid_argument.
+    let bad_arg = run_policy_map_check(
+        &ledger,
+        &signed_path,
+        &agent_key,
+        &policy_path,
+        "merge_pull_request",
+        r#"{"owner":"feedback-loop-ai","repo":"handfest","pullNumber":-0}"#,
+        None,
+    );
+    assert!(!bad_arg.status.success());
+    let bad_arg_json: serde_json::Value = serde_json::from_slice(&bad_arg.stderr).unwrap();
+    assert_eq!(bad_arg_json["error"], "policy_mapping_failed");
+    assert_eq!(bad_arg_json["code"], "invalid_argument");
+
+    // 4. Invalid policy map (empty tool name) fails closed with invalid_policy_map.
+    let empty_tool_policy = dir.path().join("empty_tool.json");
+    fs::write(
+        &empty_tool_policy,
+        r#"{"tools":{"":{"action":"git.pr.merge","resource_kind":"repo","resource_id_arg":"repo"}}}"#,
+    )
+    .unwrap();
+    let bad_pol = run_policy_map_check(
+        &ledger,
+        &signed_path,
+        &agent_key,
+        &empty_tool_policy,
+        "merge_pull_request",
+        "{}",
+        None,
+    );
+    assert!(!bad_pol.status.success());
+    let bad_pol_json: serde_json::Value = serde_json::from_slice(&bad_pol.stderr).unwrap();
+    assert_eq!(bad_pol_json["error"], "policy_mapping_failed");
+    assert_eq!(bad_pol_json["code"], "invalid_policy_map");
+}

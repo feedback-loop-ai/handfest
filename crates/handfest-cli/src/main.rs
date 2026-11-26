@@ -1,6 +1,7 @@
 //! Reference CLI for formatting, signing, verifying, checking, and auditing `handfest` mandates.
 
 mod facts;
+mod policy_check;
 
 use std::fs;
 use std::io::Write;
@@ -18,6 +19,7 @@ use handfest_ledger::{LedgerError, SqliteLedger};
 use serde_json::json;
 
 use crate::facts::parse_facts_arg;
+use crate::policy_check::resolve_policy_map_request;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -82,18 +84,39 @@ enum Commands {
         /// Concrete requesting actor KeyId (e.g. ed25519:<hex>).
         #[arg(long)]
         actor_key: String,
-        /// Concrete action identifier (e.g. git.pr.merge).
-        #[arg(long)]
-        action: String,
-        /// Concrete resource kind (e.g. repo).
-        #[arg(long)]
-        resource_kind: String,
-        /// Concrete resource identifier (e.g. feedback-loop-ai/handfest).
-        #[arg(long)]
-        resource_id: String,
+        /// Concrete action identifier (e.g. git.pr.merge). Mutually exclusive with --policy-map.
+        #[arg(
+            long,
+            required_unless_present = "policy_map",
+            conflicts_with = "policy_map"
+        )]
+        action: Option<String>,
+        /// Concrete resource kind (e.g. repo). Mutually exclusive with --policy-map.
+        #[arg(
+            long,
+            required_unless_present = "policy_map",
+            conflicts_with = "policy_map"
+        )]
+        resource_kind: Option<String>,
+        /// Concrete resource identifier (e.g. feedback-loop-ai/handfest). Mutually exclusive with --policy-map.
+        #[arg(
+            long,
+            required_unless_present = "policy_map",
+            conflicts_with = "policy_map"
+        )]
+        resource_id: Option<String>,
         /// Gate-verified facts as a JSON object string (or @file / path to JSON file).
-        #[arg(long, default_value = "{}")]
+        #[arg(long, default_value = "{}", conflicts_with = "policy_map")]
         facts: String,
+        /// Path to a ToolPolicyMap JSON file (shared schema with handfest-mcp).
+        #[arg(long, requires = "tool_name")]
+        policy_map: Option<PathBuf>,
+        /// Concrete tool name to resolve against --policy-map.
+        #[arg(long, requires = "policy_map")]
+        tool_name: Option<String>,
+        /// Tool arguments JSON object (or '-' to read raw UTF-8 JSON from stdin).
+        #[arg(long, default_value = "{}", requires = "policy_map")]
+        tool_input: String,
         /// Explicit evaluation UTC timestamp in RFC 3339 format (YYYY-MM-DDTHH:MM:SSZ).
         #[arg(long)]
         now: String,
@@ -151,31 +174,61 @@ fn run(cli: Cli) -> Result<ExitCode, String> {
             resource_kind,
             resource_id,
             facts,
+            policy_map,
+            tool_name,
+            tool_input,
             now,
             require_existing_ledger,
-        } => cmd_check(&CheckArgs {
-            ledger,
-            chain,
-            actor_key,
-            action,
-            resource_kind,
-            resource_id,
-            facts,
-            now,
-            require_existing_ledger,
-        }),
+        } => {
+            let source = match (policy_map, tool_name) {
+                (Some(policy_map), Some(tool_name)) => CheckSource::PolicyMap {
+                    policy_map,
+                    tool_name,
+                    tool_input,
+                },
+                (None, None) => CheckSource::Direct {
+                    action: action.ok_or_else(|| "missing --action".to_string())?,
+                    resource_kind: resource_kind
+                        .ok_or_else(|| "missing --resource-kind".to_string())?,
+                    resource_id: resource_id.ok_or_else(|| "missing --resource-id".to_string())?,
+                    facts,
+                },
+                _ => {
+                    return Err("--policy-map and --tool-name must be supplied together".to_string())
+                }
+            };
+            cmd_check(&CheckArgs {
+                ledger,
+                chain,
+                actor_key,
+                source,
+                now,
+                require_existing_ledger,
+            })
+        }
         Commands::Audit { ledger, actor_key } => cmd_audit(&ledger, actor_key.as_deref()),
     }
+}
+
+enum CheckSource {
+    Direct {
+        action: String,
+        resource_kind: String,
+        resource_id: String,
+        facts: String,
+    },
+    PolicyMap {
+        policy_map: PathBuf,
+        tool_name: String,
+        tool_input: String,
+    },
 }
 
 struct CheckArgs {
     ledger: PathBuf,
     chain: Vec<PathBuf>,
     actor_key: String,
-    action: String,
-    resource_kind: String,
-    resource_id: String,
-    facts: String,
+    source: CheckSource,
     now: String,
     require_existing_ledger: bool,
 }
@@ -285,22 +338,43 @@ fn cmd_verify(paths: &[PathBuf]) -> Result<ExitCode, String> {
 }
 
 fn cmd_check(args: &CheckArgs) -> Result<ExitCode, String> {
-    let signed = load_signed_mandates(&args.chain)?;
-    let verified =
-        verify_chain(&signed).map_err(|err| format!("signature verification failed: {err}"))?;
-
     let actor_key = KeyId::parse(&args.actor_key)
         .map_err(|err| format!("invalid --actor-key '{}': {err}", args.actor_key))?;
     let now = parse_rfc3339_utc(&args.now)
         .map_err(|err| format!("invalid --now '{}': {err}", args.now))?;
-    let facts = parse_facts_arg(&args.facts)?;
 
-    let request = ActionRequest {
-        actor_key,
-        action: args.action.clone(),
-        resource_kind: args.resource_kind.clone(),
-        resource_id: args.resource_id.clone(),
+    let (request, facts) = match &args.source {
+        CheckSource::Direct {
+            action,
+            resource_kind,
+            resource_id,
+            facts,
+        } => {
+            let parsed_facts = parse_facts_arg(facts)?;
+            let req = ActionRequest {
+                actor_key,
+                action: action.clone(),
+                resource_kind: resource_kind.clone(),
+                resource_id: resource_id.clone(),
+            };
+            (req, parsed_facts)
+        }
+        CheckSource::PolicyMap {
+            policy_map,
+            tool_name,
+            tool_input,
+        } => match resolve_policy_map_request(policy_map, &actor_key, tool_name, tool_input) {
+            Ok(resolved) => resolved,
+            Err(err) => {
+                err.emit_stderr();
+                return Ok(ExitCode::FAILURE);
+            }
+        },
     };
+
+    let signed = load_signed_mandates(&args.chain)?;
+    let verified =
+        verify_chain(&signed).map_err(|err| format!("signature verification failed: {err}"))?;
 
     let mut ledger = if args.require_existing_ledger {
         match SqliteLedger::open_existing(&args.ledger) {

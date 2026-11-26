@@ -11,7 +11,7 @@ Use this skill to help a human principal draft, format, verify, and audit `HANDF
 
 1. **Never hold, read, request, or touch private signing keys.** The human principal's private key (`*.key.json`) must stay strictly outside the workspace, prompt context, and agent environment. Never run `handfest sign` with the human's root key.
 2. **Never decide `Permit` or `Deny` in prose.** Runtime authorization happens deterministically outside the model — via `plugins/claude-code/hooks/pre-tool-use.sh` (`handfest check`) or the `handfest-mcp` stdio proxy.
-3. **Always show canonical WYSIWYS text.** Before handing a mandate to the human for signing, run `handfest fmt <file>` so the human reviews the exact canonical text whose SHA-256 digest is signed.
+3. **Always show canonical WYSIWYS text.** Before handing a mandate to the human for signing, run `handfest fmt <file>` so the human reviews the exact canonical text bound alongside the envelope metadata (`anchor_id`, `assurance`, `actor_kind`, `signer_key`, `valid_from`, `valid_until`) into the domain-separated Ed25519 signing payload.
 
 ## Workflows
 

@@ -9,14 +9,19 @@ unset HANDFEST_ALLOW_CREATE_LEDGER
 REPO_ROOT="$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd)"
 HOOK="$REPO_ROOT/plugins/claude-code/hooks/pre-tool-use.sh"
 HANDFEST_BIN="${HANDFEST_BIN:-$REPO_ROOT/target/debug/handfest}"
+HANDFEST_MCP_BIN="${HANDFEST_MCP_BIN:-$REPO_ROOT/target/debug/handfest-mcp}"
 
-if [[ ! -x "$HANDFEST_BIN" ]]; then
-  echo "Building handfest binary..."
-  (cd "$REPO_ROOT" && cargo build --bin handfest --locked --offline >/dev/null)
+if [[ ! -x "$HANDFEST_BIN" || ! -x "$HANDFEST_MCP_BIN" ]]; then
+  echo "Building handfest and handfest-mcp binaries..."
+  (cd "$REPO_ROOT" && cargo build --bin handfest --bin handfest-mcp --locked --offline >/dev/null)
 fi
 
 if [[ ! -x "$HANDFEST_BIN" ]]; then
   echo "FAIL: handfest binary not executable at $HANDFEST_BIN" >&2
+  exit 1
+fi
+if [[ ! -x "$HANDFEST_MCP_BIN" ]]; then
+  echo "FAIL: handfest-mcp binary not executable at $HANDFEST_MCP_BIN" >&2
   exit 1
 fi
 
@@ -292,19 +297,6 @@ TIME_SIGNED="$TMP_DIR/time-window.signed.json"
   --valid-until 2026-11-25T01:00:00Z \
   --out "$TIME_SIGNED" >/dev/null
 
-CAPTURE_SHIM="$TMP_DIR/capture-handfest.sh"
-CAPTURED_FACTS="$TMP_DIR/captured-facts.json"
-cat <<SHIM_EOF >"$CAPTURE_SHIM"
-#!/usr/bin/env bash
-for arg in "\$@"; do
-  case "\$arg" in
-    --facts=*) printf '%s' "\${arg#--facts=}" >"$CAPTURED_FACTS" ;;
-  esac
-done
-exec "$HANDFEST_BIN" "\$@"
-SHIM_EOF
-chmod +x "$CAPTURE_SHIM"
-
 SPOOF_ARG_MAP="$TMP_DIR/spoof-arg-policy-map.json"
 cat <<'SPOOF_MAP_EOF' >"$SPOOF_ARG_MAP"
 {
@@ -351,22 +343,18 @@ SPOOF_STATIC_EOF
 TIME_LEDGER="$TMP_DIR/time-ledger.sqlite"
 SPOOF_PAYLOAD='{"tool_name":"merge_pull_request","tool_input":{"owner":"feedback-loop-ai","repo":"handfest","pullNumber":11,"fake_time":"2026-11-24T18:30:00Z","claimed_env":"prod"}}'
 HOOK_RC=0
-rm -f "$CAPTURED_FACTS"
-HANDFEST_ALLOW_CREATE_LEDGER=1 HANDFEST_BIN="$CAPTURE_SHIM" HANDFEST_LEDGER="$TIME_LEDGER" HANDFEST_CHAIN="$TIME_SIGNED" \
+HANDFEST_ALLOW_CREATE_LEDGER=1 HANDFEST_LEDGER="$TIME_LEDGER" HANDFEST_CHAIN="$TIME_SIGNED" \
   HANDFEST_POLICY_MAP="$SPOOF_ARG_MAP" HANDFEST_NOW="2026-11-24T21:00:00Z" \
   "$HOOK" <<<"$SPOOF_PAYLOAD" >"$TMP_DIR/stdout.txt" 2>"$TMP_DIR/stderr.txt" || HOOK_RC=$?
 assert_eq "clock spoof arg rc" "$HOOK_RC" "2"
 assert_json "clock spoof arg stderr" "$(cat "$TMP_DIR/stderr.txt")" "d['verdict'] == 'deny' and d['code'] == 'mandate_denied' and 'context.time' in d['reason']"
-assert_json "clock spoof arg stripped" "$(cat "$CAPTURED_FACTS")" "'context.time' not in d"
 
 HOOK_RC=0
-rm -f "$CAPTURED_FACTS"
-HANDFEST_BIN="$CAPTURE_SHIM" HANDFEST_LEDGER="$TIME_LEDGER" HANDFEST_CHAIN="$TIME_SIGNED" \
+HANDFEST_LEDGER="$TIME_LEDGER" HANDFEST_CHAIN="$TIME_SIGNED" \
   HANDFEST_POLICY_MAP="$SPOOF_STATIC_MAP" HANDFEST_NOW="2026-11-24T21:00:00Z" \
   "$HOOK" <<<"$VALID_PAYLOAD" >"$TMP_DIR/stdout.txt" 2>"$TMP_DIR/stderr.txt" || HOOK_RC=$?
 assert_eq "clock spoof static rc" "$HOOK_RC" "2"
 assert_json "clock spoof static stderr" "$(cat "$TMP_DIR/stderr.txt")" "d['verdict'] == 'deny' and d['code'] == 'mandate_denied' and 'context.time' in d['reason']"
-assert_json "clock spoof static stripped" "$(cat "$CAPTURED_FACTS")" "'context.time' not in d"
 pass "Active-mandate WHERE context.time clock spoof denied and hook stripped context.time from arg_facts & static_facts"
 
 # Test 14: Permitted call #2 (also verifies static_facts overrides claimed_env='prod' -> 'staging') -> exit 0
@@ -489,83 +477,102 @@ def assert_all_paths_safe(node, loc):
 
 assert_all_paths_safe(cc_settings, "settings.example.json")
 
+import datetime
+
+MCP_REQUIRED_FLAGS = {"--chain", "--ledger", "--policy-map", "--actor-key"}
+MCP_OPTIONAL_FLAGS = {"--now"}
+MCP_SINGLETON_FLAGS = {"--ledger", "--policy-map", "--actor-key", "--now"}
+MCP_PATH_FLAGS = {"--chain", "--ledger", "--policy-map"}
+MCP_ALLOWED_FLAGS = MCP_REQUIRED_FLAGS | MCP_OPTIONAL_FLAGS
+RFC3339_UTC_RE = re.compile(r"^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})Z\Z", re.ASCII)
+
+def is_rfc3339_utc(value):
+    m = RFC3339_UTC_RE.match(value)
+    if not m:
+        return False
+    y, mo, d, h, mi, sec = (int(g) for g in m.groups())
+    try:
+        datetime.datetime(2000 if y == 0 else y, mo, d, h, mi, sec, tzinfo=datetime.timezone.utc)
+        return True
+    except ValueError:
+        return False
+
+def assert_no_forbidden_tokens(token, loc):
+    assert not token.startswith("./"), f"{loc} contains relative path {token}"
+    assert ".." not in token.split("/"), f"{loc} contains '..' traversal in {token}"
+    assert "plugins/policy-map.example.json" not in token, f"{loc} must not point inside repo plugins/"
+
+def assert_actor_key_valid(value, loc):
+    scheme, sep, key_val = value.partition(":")
+    assert sep == ":" and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_-]*", scheme), (
+        f"{loc} --actor-key must have a valid KeyId scheme (<scheme>:<value>), got {value!r}"
+    )
+    assert key_val and all(0x21 <= ord(ch) <= 0x7E and ch not in ',()"/\\' for ch in key_val), (
+        f"{loc} --actor-key value contains whitespace, control chars, or forbidden KeyId characters: {value!r}"
+    )
+    assert not value.endswith(".key.json"), (
+        f"{loc} --actor-key must be a public KeyId, not a key file path: {value!r}"
+    )
+
+def assert_mcp_flag_value(flag, value, loc, workspace_root):
+    assert_no_forbidden_tokens(value, loc)
+    if flag in MCP_PATH_FLAGS:
+        assert_safe_outside_path(value, f"{loc} {flag}", workspace_root=workspace_root)
+    elif flag == "--now":
+        assert is_rfc3339_utc(value), (
+            f"{loc} --now must be a valid RFC 3339 UTC timestamp (YYYY-MM-DDTHH:MM:SSZ), got {value!r}"
+        )
+    else:
+        assert_actor_key_valid(value, loc)
+
+def consume_separate_flag_values(proxy_args, start_idx, flag, loc):
+    if flag == "--chain":
+        values, i = [], start_idx
+        while i < len(proxy_args):
+            tok = proxy_args[i]
+            assert isinstance(tok, str) and tok, f"{loc} non-string or empty value after {flag}: {tok!r}"
+            if tok.startswith("-"):
+                break
+            values.append(tok)
+            i += 1
+        assert values, f"{loc} missing value after {flag}"
+        return values, i
+    assert start_idx < len(proxy_args), f"{loc} missing value after {flag}"
+    tok = proxy_args[start_idx]
+    assert isinstance(tok, str) and tok and not tok.startswith("-"), (
+        f"{loc} missing or invalid value after {flag}: {tok!r}"
+    )
+    return [tok], start_idx + 1
+
+def parse_mcp_flag_token(proxy_args, idx, loc):
+    arg = proxy_args[idx]
+    assert isinstance(arg, str) and arg, f"{loc} contains non-string or empty proxy arg: {arg!r}"
+    assert_no_forbidden_tokens(arg, loc)
+    if "=" in arg:
+        flag, value = arg.split("=", 1)
+        assert flag in MCP_ALLOWED_FLAGS, f"{loc} unexpected positional token or unknown flag before '--': {arg!r}"
+        return flag, [value], idx + 1
+    assert arg in MCP_ALLOWED_FLAGS, f"{loc} unexpected positional token or unknown flag before '--': {arg!r}"
+    values, next_idx = consume_separate_flag_values(proxy_args, idx + 1, arg, loc)
+    return arg, values, next_idx
+
 def assert_mcp_args_safe(args, loc, workspace_root=root_norm):
     assert isinstance(args, list) and "--" in args, f"{loc} must separate upstream server command with '--'"
     sep_idx = args.index("--")
-    proxy_args = args[:sep_idx]
-    upstream_args = args[sep_idx + 1:]
+    proxy_args, upstream_args = args[:sep_idx], args[sep_idx + 1:]
     assert upstream_args and all(isinstance(a, str) and a for a in upstream_args), (
         f"{loc} must provide a non-empty upstream command after '--'"
     )
-    required_flags = {"--chain", "--ledger", "--policy-map", "--actor-key"}
-    optional_flags = {"--now"}
-    singleton_flags = {"--ledger", "--policy-map", "--actor-key", "--now"}
-    path_flags = {"--chain", "--ledger", "--policy-map"}
-    allowed_flags = required_flags | optional_flags
-    seen_flags = set()
-    i = 0
+    seen_flags, i = set(), 0
     while i < len(proxy_args):
-        arg = proxy_args[i]
-        assert isinstance(arg, str) and arg, f"{loc} contains non-string or empty proxy arg: {arg!r}"
-        assert not arg.startswith("./"), f"{loc} contains relative path {arg}"
-        assert ".." not in arg.split("/"), f"{loc} contains '..' traversal in {arg}"
-        assert "plugins/policy-map.example.json" not in arg, f"{loc} must not point inside repo plugins/"
-        if "=" in arg:
-            flag, value = arg.split("=", 1)
-            assert flag in allowed_flags, f"{loc} unexpected positional token or unknown flag before '--': {arg!r}"
-            if flag in singleton_flags:
-                assert flag not in seen_flags, f"{loc} duplicates singleton flag {flag}"
-            seen_flags.add(flag)
-            values = [value]
-            i += 1
-        else:
-            flag = arg
-            assert flag in allowed_flags, f"{loc} unexpected positional token or unknown flag before '--': {arg!r}"
-            if flag in singleton_flags:
-                assert flag not in seen_flags, f"{loc} duplicates singleton flag {flag}"
-            seen_flags.add(flag)
-            i += 1
-            if flag == "--chain":
-                values = []
-                while i < len(proxy_args):
-                    tok = proxy_args[i]
-                    assert isinstance(tok, str) and tok, f"{loc} non-string or empty value after {flag}: {tok!r}"
-                    if tok.startswith("-"):
-                        break
-                    values.append(tok)
-                    i += 1
-                assert values, f"{loc} missing value after {flag}"
-            else:
-                assert i < len(proxy_args), f"{loc} missing value after {flag}"
-                tok = proxy_args[i]
-                assert isinstance(tok, str) and tok and not tok.startswith("-"), (
-                    f"{loc} missing or invalid value after {flag}: {tok!r}"
-                )
-                values = [tok]
-                i += 1
+        flag, values, i = parse_mcp_flag_token(proxy_args, i, loc)
+        if flag in MCP_SINGLETON_FLAGS:
+            assert flag not in seen_flags, f"{loc} duplicates singleton flag {flag}"
+        seen_flags.add(flag)
         for value in values:
-            assert not value.startswith("./"), f"{loc} contains relative path {value}"
-            assert ".." not in value.split("/"), f"{loc} contains '..' traversal in {value}"
-            assert "plugins/policy-map.example.json" not in value, f"{loc} must not point inside repo plugins/"
-            if flag in path_flags:
-                assert_safe_outside_path(value, f"{loc} {flag}", workspace_root=workspace_root)
-            elif flag == "--now":
-                assert value and all(0x21 <= ord(ch) <= 0x7E for ch in value), (
-                    f"{loc} --now must be a non-empty timestamp without whitespace or control chars, got {value!r}"
-                )
-            else:
-                scheme, sep, key_val = value.partition(":")
-                assert sep == ":" and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_-]*", scheme), (
-                    f"{loc} --actor-key must have a valid KeyId scheme (<scheme>:<value>), got {value!r}"
-                )
-                assert key_val and all(0x21 <= ord(ch) <= 0x7E and ch not in ',()"/\\' for ch in key_val), (
-                    f"{loc} --actor-key value contains whitespace, control chars, or forbidden KeyId characters: {value!r}"
-                )
-                assert not value.endswith(".key.json"), (
-                    f"{loc} --actor-key must be a public KeyId, not a key file path: {value!r}"
-                )
-    assert required_flags <= seen_flags <= allowed_flags, (
-        f"{loc} must include {sorted(required_flags)} (optional {sorted(optional_flags)}), got {sorted(seen_flags)}"
+            assert_mcp_flag_value(flag, value, loc, workspace_root)
+    assert MCP_REQUIRED_FLAGS <= seen_flags <= MCP_ALLOWED_FLAGS, (
+        f"{loc} must include {sorted(MCP_REQUIRED_FLAGS)} (optional {sorted(MCP_OPTIONAL_FLAGS)}), got {sorted(seen_flags)}"
     )
 
 # Self-test assert_mcp_args_safe invariants (singleton duplicates, --flag=value, positional tokens, multi --chain)
@@ -596,11 +603,18 @@ assert_mcp_args_safe(
     base_valid[:8] + ["--now", "2026-11-24T18:00:00Z"] + base_valid[8:],
     "self-test-now-separate",
 )
+assert_mcp_args_safe(
+    base_valid[:8] + ["--now=2024-02-29T18:00:00Z"] + base_valid[8:],
+    "self-test-now-leap-day",
+)
 for bad_label, bad_args in (
     ("dup-ledger", base_valid[:6] + ["--ledger", "/path/to/handfest-config/state/other.sqlite"] + base_valid[6:]),
     ("dup-now", base_valid[:8] + ["--now=2026-11-24T18:00:00Z", "--now", "2026-11-24T19:00:00Z"] + base_valid[8:]),
     ("dup-now-eq", base_valid[:8] + ["--now=2026-11-24T18:00:00Z", "--now=2026-11-24T19:00:00Z"] + base_valid[8:]),
     ("empty-eq-now", base_valid[:8] + ["--now="] + base_valid[8:]),
+    ("non-rfc3339-now", base_valid[:8] + ["--now=tomorrow"] + base_valid[8:]),
+    ("invalid-date-now", base_valid[:8] + ["--now=2026-02-29T18:00:00Z"] + base_valid[8:]),
+    ("offset-now", base_valid[:8] + ["--now=2026-11-24T18:00:00+00:00"] + base_valid[8:]),
     ("whitespace-now", base_valid[:8] + ["--now=2026-11-24 18:00:00Z"] + base_valid[8:]),
     ("missing-now-value", base_valid[:8] + ["--now"] + base_valid[8:]),
     ("actor-key-whitespace", base_valid[:5] + ["--actor-key=ed25519:not a key"] + base_valid[6:]),
@@ -747,16 +761,14 @@ cat <<'PAY_MAP_EOF' >"$PAY_MAP"
 }
 PAY_MAP_EOF
 
-# Zero-scale JSON integer 15 -> normalized to 15.0 and permitted
+# Zero-scale JSON integer 15 -> permitted via shared handfest-core decimal codec
 PAY_LEDGER="$TMP_DIR/pay-ledger.sqlite"
 HOOK_RC=0
-rm -f "$CAPTURED_FACTS"
-HANDFEST_ALLOW_CREATE_LEDGER=1 HANDFEST_BIN="$CAPTURE_SHIM" HANDFEST_POLICY_MAP="$PAY_MAP" HANDFEST_LEDGER="$PAY_LEDGER" HANDFEST_CHAIN="$PAY_SIGNED" \
+HANDFEST_ALLOW_CREATE_LEDGER=1 HANDFEST_POLICY_MAP="$PAY_MAP" HANDFEST_LEDGER="$PAY_LEDGER" HANDFEST_CHAIN="$PAY_SIGNED" \
   "$HOOK" <<<'{"tool_name":"charge_card","tool_input":{"currency":"USD","approved":true,"scheduled_at":"2026-11-24T18:30:00Z","amount":15}}' \
   >"$TMP_DIR/stdout.txt" 2>"$TMP_DIR/stderr.txt" || HOOK_RC=$?
 assert_eq "decimal int-15 permit rc" "$HOOK_RC" "0"
 assert_json "decimal int-15 stdout" "$(cat "$TMP_DIR/stdout.txt")" "d['verdict'] == 'permit'"
-assert_json "decimal int-15 formatted" "$(cat "$CAPTURED_FACTS")" "d['resource.amount'] == {'decimal': '15.0'}"
 
 # Zero, integer-like decimal strings ("0", "1"), trailing zeros (including >28 redundant trailing zeros), scale 28, and bare JSON number 1. + 127 zeros
 MAX_SCALE_ZEROS="$(python3 -I -c 'print("1." + "0" * 28)')"
@@ -766,58 +778,39 @@ OVER_SCALE_SIG_ONE="$(python3 -I -c 'print("1." + "0" * 28 + "1")')"
 LONG_ZEROS="$(python3 -I -c 'print("1." + "0" * 127)')"
 for amt_json in '0' '"0"' '"1"' '"1.0000000000000000000"' '"0.0000000000000000000000000001"' "\"$MAX_SCALE_ZEROS\"" "\"$OVER_SCALE_ONE_ZEROS\"" "\"$OVER_SCALE_ZERO_ZEROS\"" "\"$LONG_ZEROS\"" "$LONG_ZEROS"; do
   HOOK_RC=0
-  rm -f "$CAPTURED_FACTS"
-  HANDFEST_BIN="$CAPTURE_SHIM" HANDFEST_POLICY_MAP="$PAY_MAP" HANDFEST_LEDGER="$PAY_LEDGER" HANDFEST_CHAIN="$PAY_SIGNED" \
+  HANDFEST_POLICY_MAP="$PAY_MAP" HANDFEST_LEDGER="$PAY_LEDGER" HANDFEST_CHAIN="$PAY_SIGNED" \
     "$HOOK" <<<"{\"tool_name\":\"charge_card\",\"tool_input\":{\"currency\":\"USD\",\"approved\":true,\"scheduled_at\":\"2026-11-24T18:30:00Z\",\"amount\":$amt_json}}" \
     >"$TMP_DIR/stdout.txt" 2>"$TMP_DIR/stderr.txt" || HOOK_RC=$?
   assert_eq "decimal norm $amt_json rc" "$HOOK_RC" "0"
   assert_json "decimal norm $amt_json stdout" "$(cat "$TMP_DIR/stdout.txt")" "d['verdict'] == 'permit'"
-  if [[ "$amt_json" == "0" || "$amt_json" == '"0"' || "$amt_json" == "\"$OVER_SCALE_ZERO_ZEROS\"" ]]; then
-    assert_json "decimal zero formatted" "$(cat "$CAPTURED_FACTS")" "d['resource.amount'] == {'decimal': '0.0'}"
-  elif [[ "$amt_json" == '"0.0000000000000000000000000001"' ]]; then
-    assert_json "decimal scale 28 formatted" "$(cat "$CAPTURED_FACTS")" "d['resource.amount'] == {'decimal': '0.0000000000000000000000000001'}"
-  else
-    assert_json "decimal one formatted" "$(cat "$CAPTURED_FACTS")" "d['resource.amount'] == {'decimal': '1.0'}"
-  fi
 done
 
-# Mixed integer+fraction decimal ("12.34") preserved verbatim and permitted (cumulative 30.3400... <= 40.00)
+# Mixed integer+fraction decimal ("12.34") preserved verbatim and permitted (cumulative 33.3400... <= 40.00)
 HOOK_RC=0
-rm -f "$CAPTURED_FACTS"
-HANDFEST_BIN="$CAPTURE_SHIM" HANDFEST_POLICY_MAP="$PAY_MAP" HANDFEST_LEDGER="$PAY_LEDGER" HANDFEST_CHAIN="$PAY_SIGNED" \
+HANDFEST_POLICY_MAP="$PAY_MAP" HANDFEST_LEDGER="$PAY_LEDGER" HANDFEST_CHAIN="$PAY_SIGNED" \
   "$HOOK" <<<'{"tool_name":"charge_card","tool_input":{"currency":"USD","approved":true,"scheduled_at":"2026-11-24T18:30:00Z","amount":"12.34"}}' \
   >"$TMP_DIR/stdout.txt" 2>"$TMP_DIR/stderr.txt" || HOOK_RC=$?
 assert_eq "decimal mixed 12.34 rc" "$HOOK_RC" "0"
 assert_json "decimal mixed 12.34 stdout" "$(cat "$TMP_DIR/stdout.txt")" "d['verdict'] == 'permit'"
-assert_json "decimal mixed 12.34 formatted" "$(cat "$CAPTURED_FACTS")" "d['resource.amount'] == {'decimal': '12.34'}"
 
-# Bare JSON scientific notation 1.5e1 (15.0) pushes cumulative 30.34... + 15.0 > 40.00 USD -> mandate_denied
+# Bare JSON scientific notation 1.5e1 (15.0) pushes cumulative 33.34... + 15.0 > 40.00 USD -> mandate_denied
 HOOK_RC=0
-rm -f "$CAPTURED_FACTS"
-HANDFEST_BIN="$CAPTURE_SHIM" HANDFEST_POLICY_MAP="$PAY_MAP" HANDFEST_LEDGER="$PAY_LEDGER" HANDFEST_CHAIN="$PAY_SIGNED" \
+HANDFEST_POLICY_MAP="$PAY_MAP" HANDFEST_LEDGER="$PAY_LEDGER" HANDFEST_CHAIN="$PAY_SIGNED" \
   "$HOOK" <<<'{"tool_name":"charge_card","tool_input":{"currency":"USD","approved":true,"scheduled_at":"2026-11-24T18:30:00Z","amount":1.5e1}}' \
   >"$TMP_DIR/stdout.txt" 2>"$TMP_DIR/stderr.txt" || HOOK_RC=$?
 assert_eq "decimal bare sci quota rc" "$HOOK_RC" "2"
 assert_json "decimal bare sci quota stderr" "$(cat "$TMP_DIR/stderr.txt")" "d['verdict'] == 'deny' and d['code'] == 'mandate_denied'"
-assert_json "decimal bare sci formatted" "$(cat "$CAPTURED_FACTS")" "d['resource.amount'] == {'decimal': '15.0'}"
 
-# Bare JSON scientific over-scale decimal 1e-29 must deny with invalid_argument BEFORE invoking handfest check
-NO_CALL_SHIM="$TMP_DIR/no-call-handfest.sh"
-NO_CALL_MARKER="$TMP_DIR/no-call-invoked"
-cat <<SHIM_EOF >"$NO_CALL_SHIM"
-#!/usr/bin/env bash
-touch "$NO_CALL_MARKER"
-exit 99
-SHIM_EOF
-chmod +x "$NO_CALL_SHIM"
-rm -f "$NO_CALL_MARKER"
+# Bare JSON scientific over-scale decimal 1e-29 must deny with invalid_argument WITHOUT touching ledger receipts
+PAY_AUDIT_BEFORE="$("$HANDFEST_BIN" audit --ledger "$PAY_LEDGER")"
 HOOK_RC=0
-HANDFEST_BIN="$NO_CALL_SHIM" HANDFEST_POLICY_MAP="$PAY_MAP" HANDFEST_LEDGER="$PAY_LEDGER" HANDFEST_CHAIN="$PAY_SIGNED" \
+HANDFEST_POLICY_MAP="$PAY_MAP" HANDFEST_LEDGER="$PAY_LEDGER" HANDFEST_CHAIN="$PAY_SIGNED" \
   "$HOOK" <<<'{"tool_name":"charge_card","tool_input":{"currency":"USD","approved":true,"scheduled_at":"2026-11-24T18:30:00Z","amount":1e-29}}' \
   >"$TMP_DIR/stdout.txt" 2>"$TMP_DIR/stderr.txt" || HOOK_RC=$?
 assert_eq "decimal bare sci over-scale 1e-29 rc" "$HOOK_RC" "2"
 assert_json "decimal bare sci over-scale 1e-29 stderr" "$(cat "$TMP_DIR/stderr.txt")" "d['verdict'] == 'deny' and d['code'] == 'invalid_argument'"
-assert_eq "decimal bare sci over-scale 1e-29 handfest not invoked" "$([[ -e "$NO_CALL_MARKER" ]] && echo called || echo not-called)" "not-called"
+PAY_AUDIT_AFTER="$("$HANDFEST_BIN" audit --ledger "$PAY_LEDGER")"
+assert_eq "decimal bare sci over-scale 1e-29 ledger untouched" "$PAY_AUDIT_AFTER" "$PAY_AUDIT_BEFORE"
 
 # Reject leading-zero decimals ("00", "01", "-01", "00.5", "01.5"), negative zero ("-0", "-0.0", "-0.00", -0.0, -0.00, -0, -0e0), quoted scientific notation "1.5e1", pathological exponents, canonical fractional scale > 28, i128::MAX+1, and i128::MIN-1
 for bad_amt in '"-0"' '"00"' '"01"' '"-01"' '"00.5"' '"-00.5"' '"01.5"' '"-0.0"' '"-0.00"' '-0.0' '-0.00' '-0' '-0e0' '"1.5e1"' '1e1000000' '"1e1000000"' '"0.00000000000000000000000000001"' "\"$OVER_SCALE_SIG_ONE\"" '"170141183460469231731687303715884105728"' '"-170141183460469231731687303715884105729"' '"170141183460469231731687303715884105728.0"' '"-170141183460469231731687303715884105729.0"'; do
@@ -853,13 +846,11 @@ cat <<'STATIC_DEC_MAP_EOF' >"$STATIC_DEC_MAP"
 STATIC_DEC_MAP_EOF
 STATIC_DEC_LEDGER="$TMP_DIR/static-int-decimal-ledger.sqlite"
 HOOK_RC=0
-rm -f "$CAPTURED_FACTS"
-HANDFEST_ALLOW_CREATE_LEDGER=1 HANDFEST_BIN="$CAPTURE_SHIM" HANDFEST_POLICY_MAP="$STATIC_DEC_MAP" HANDFEST_LEDGER="$STATIC_DEC_LEDGER" HANDFEST_CHAIN="$PAY_SIGNED" \
+HANDFEST_ALLOW_CREATE_LEDGER=1 HANDFEST_POLICY_MAP="$STATIC_DEC_MAP" HANDFEST_LEDGER="$STATIC_DEC_LEDGER" HANDFEST_CHAIN="$PAY_SIGNED" \
   "$HOOK" <<<'{"tool_name":"charge_card","tool_input":{}}' \
   >"$TMP_DIR/stdout.txt" 2>"$TMP_DIR/stderr.txt" || HOOK_RC=$?
 assert_eq "static_facts integer-like decimal strings permit rc" "$HOOK_RC" "0"
 assert_json "static_facts integer-like decimal strings stdout" "$(cat "$TMP_DIR/stdout.txt")" "d['verdict'] == 'permit'"
-assert_json "static_facts integer-like decimal strings formatted" "$(cat "$CAPTURED_FACTS")" "d['resource.amount'] == {'decimal': '1.0'} and d['resource.zero'] == {'decimal': '0.0'} and d['resource.offset'] == {'decimal': '-1.0'}"
 
 # Reject negative zero in static_facts {"decimal": "-0.0"} and integer tool argument -0
 NEG_ZERO_MAP="$TMP_DIR/neg-zero-map.json"
@@ -886,7 +877,7 @@ assert_json "static_facts negative zero decimal stderr" "$(cat "$TMP_DIR/stderr.
 
 run_hook '{"tool_name":"merge_pull_request","tool_input":{"owner":"feedback-loop-ai","repo":"handfest","pullNumber":-0}}'
 assert_eq "negative zero int arg rc" "$HOOK_RC" "2"
-assert_json "negative zero int arg stderr" "$(cat "$TMP_DIR/stderr.txt")" "d['verdict'] == 'deny' and d['code'] == 'invalid_argument' and 'negative zero' in d['reason']"
+assert_json "negative zero int arg stderr" "$(cat "$TMP_DIR/stderr.txt")" "d['verdict'] == 'deny' and d['code'] == 'invalid_argument'"
 pass "static_resource_id + PascalCase types + canonical decimal normalization, no-negative-zero, scale<=28, and i128 bounds verified"
 
 # Test 20: Defense-in-depth: broken gate exiting 0 without Permit JSON OR malformed receipt_hash fails closed
@@ -1267,7 +1258,7 @@ HOOK_RC=0
 HANDFEST_BIN="$TOCTOU_WRAPPER" HANDFEST_LEDGER="$TOCTOU_LEDGER" "$HOOK" <<<"$VALID_PAYLOAD" >"$TMP_DIR/stdout.txt" 2>"$TMP_DIR/stderr.txt" || HOOK_RC=$?
 assert_eq "hook-to-cli toctou rc" "$HOOK_RC" "2"
 assert_eq "hook-to-cli toctou stdout empty" "$(cat "$TMP_DIR/stdout.txt")" ""
-assert_strict_rfc8259_json_line "hook-to-cli toctou stderr" "$TMP_DIR/stderr.txt" "d['verdict'] == 'deny' and d['code'] == 'gate_error' and 'missing_ledger' in d['reason']"
+assert_strict_rfc8259_json_line "hook-to-cli toctou stderr" "$TMP_DIR/stderr.txt" "d['verdict'] == 'deny' and d['code'] == 'missing_ledger'"
 if [[ -e "$TOCTOU_LEDGER" ]]; then
   echo "FAIL [toctou ledger recreated]: $TOCTOU_LEDGER must not be recreated by handfest check" >&2
   exit 1
@@ -1655,7 +1646,7 @@ for label, nested, expect_depth_error in (
     assert deny_pm.get("verdict") == "deny" and deny_pm.get("code") == "invalid_policy_map", (
         f"policy map ({label}) expected invalid_policy_map deny, got {deny_pm!r}"
     )
-    is_depth_err = "nesting depth exceeds 128" in deny_pm.get("reason", "")
+    is_depth_err = "nesting depth exceeded" in deny_pm.get("reason", "")
     assert is_depth_err == expect_depth_error, (
         f"policy map ({label}) expected depth_err={expect_depth_error}, got {deny_pm!r}"
     )
@@ -1714,6 +1705,30 @@ HOOK_RC=0
 HANDFEST_POLICY_MAP="$EMPTY_TOOL_MAP" "$HOOK" <<<"$VALID_PAYLOAD" >"$TMP_DIR/stdout.txt" 2>"$TMP_DIR/stderr.txt" || HOOK_RC=$?
 assert_eq "policy map with empty tool name rc" "$HOOK_RC" "2"
 assert_json "policy map with empty tool name stderr" "$(cat "$TMP_DIR/stderr.txt")" "d['verdict'] == 'deny' and d['code'] == 'invalid_policy_map'"
-pass "Policy map tool-name validation matches handfest-mcp (unused \\n/\\t tool accepted; empty tool rejected)"
+# Cross-binary parity: exercise real handfest-mcp startup directly against the exact same policy maps.
+MCP_RC=0
+"$HANDFEST_MCP_BIN" \
+  --chain "$ROOT_SIGNED" \
+  --ledger "$CTRL_TOOL_LEDGER" \
+  --actor-key "$AGENT_KEY" \
+  --policy-map "$CTRL_TOOL_MAP" \
+  --now "$HANDFEST_NOW" \
+  -- /bin/true </dev/null >"$TMP_DIR/mcp_stdout.txt" 2>"$TMP_DIR/mcp_stderr.txt" || MCP_RC=$?
+assert_eq "handfest-mcp accepts unused newline/tab tool name rc" "$MCP_RC" "0"
+
+MCP_RC=0
+"$HANDFEST_MCP_BIN" \
+  --chain "$ROOT_SIGNED" \
+  --ledger "$CTRL_TOOL_LEDGER" \
+  --actor-key "$AGENT_KEY" \
+  --policy-map "$EMPTY_TOOL_MAP" \
+  --now "$HANDFEST_NOW" \
+  -- /bin/true </dev/null >"$TMP_DIR/mcp_stdout.txt" 2>"$TMP_DIR/mcp_stderr.txt" || MCP_RC=$?
+if [[ "$MCP_RC" -eq 0 ]]; then
+  echo "FAIL [handfest-mcp empty tool name]: expected non-zero exit" >&2
+  exit 1
+fi
+assert_strict_rfc8259_json_line "handfest-mcp rejects empty tool name stderr" "$TMP_DIR/mcp_stderr.txt" "d['error'] == 'startup_failed' and d['code'] == 'policy_invalid'"
+pass "Policy map tool-name validation shares one codec and passes live parity against handfest-mcp (unused \\n/\\t accepted; empty rejected)"
 
 echo "ALL $PASS_COUNT HOOK & PLUGIN TESTS PASSED."

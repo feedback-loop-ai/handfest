@@ -375,9 +375,15 @@ fn assert_duplicate_inode_cap_and_journal_guard(
     let key = (meta.dev(), meta.ino());
     {
         let mut state = reg.lock().unwrap();
-        for _ in 0..MAX_DEFERRED_FDS {
-            state.maybe_defer_fd(key, File::open(dup_source).unwrap());
+        for _ in 0..(MAX_DEFERRED_FDS - 1) {
+            state
+                .maybe_defer_fd(key, File::open(dup_source).unwrap())
+                .unwrap();
         }
+        // Pushing a duplicate on an occupied key below the cap retains it rather than dropping.
+        state
+            .maybe_defer_fd(key, File::open(dup_source).unwrap())
+            .unwrap();
         assert_eq!(state.deferred_fds.len(), 1);
         assert_eq!(state.deferred_fds[&key].len(), MAX_DEFERRED_FDS);
         assert_eq!(state.total_deferred_fds(), MAX_DEFERRED_FDS);
@@ -403,12 +409,15 @@ fn assert_duplicate_inode_cap_and_journal_guard(
     );
     assert_eq!(reg.lock().unwrap().total_deferred_fds(), MAX_DEFERRED_FDS);
 
-    // Pushing an extra duplicate on the occupied key retains it rather than dropping while active.
+    // Attempting to retain past MAX_DEFERRED_FDS must fail closed and never exceed the cap.
     {
         let mut state = reg.lock().unwrap();
-        state.maybe_defer_fd(key, File::open(dup_source).unwrap());
-        assert_eq!(state.deferred_fds[&key].len(), MAX_DEFERRED_FDS + 1);
-        assert_eq!(state.total_deferred_fds(), MAX_DEFERRED_FDS + 1);
+        assert!(matches!(
+            state.maybe_defer_fd(key, File::open(dup_source).unwrap()),
+            Err(LedgerError::Storage(ref m)) if m.contains("deferred raw-open fd cap (64)")
+        ));
+        assert_eq!(state.deferred_fds[&key].len(), MAX_DEFERRED_FDS);
+        assert_eq!(state.total_deferred_fds(), MAX_DEFERRED_FDS);
     }
     drop(writer_guard);
     assert!(reg.lock().unwrap().deferred_fds.is_empty());
@@ -989,5 +998,91 @@ fn cached_rollback_journal_fd_rewinds_to_start_on_repeated_clean_probes() {
     assert_eq!(reg.lock().unwrap().total_deferred_fds(), 1);
 
     drop(writer_guard);
+    assert!(reg.lock().unwrap().deferred_fds.is_empty());
+}
+
+#[cfg(unix)]
+#[test]
+fn inode_change_before_open_cannot_exceed_deferred_fd_cap() {
+    static REG: OnceLock<Mutex<ActiveHandleRegistry>> = OnceLock::new();
+    let reg = REG.get_or_init(|| Mutex::new(ActiveHandleRegistry::default()));
+
+    let dir = TempDir::new().unwrap();
+    let db_a = write_valid_header_file(&dir.path().join("db_a.sqlite"));
+    let db_b = write_valid_header_file(&dir.path().join("db_b.sqlite"));
+    let db_new = write_valid_header_file(&dir.path().join("db_new.sqlite"));
+    let journal_new = dir.path().join("db_new.sqlite-journal");
+    fs::write(&journal_new, [0u8; ROLLBACK_JOURNAL_HDR_LEN]).unwrap();
+
+    // Keep reader ro_a on db_a (tracked in counts) and writer w_b on db_b, then saturate
+    // deferred_fds to MAX_DEFERRED_FDS (64) and drop w_b while ro_a stays open.
+    let ((), ro_a) = open_read_only_guarded_in(reg, &db_a, |_| Ok(())).unwrap();
+    let ((), w_b) = open_writable_guarded_in(reg, &db_b, || Ok(())).unwrap();
+    for i in 0..MAX_DEFERRED_FDS {
+        let fill = write_valid_header_file(&dir.path().join(format!("race_fill_{i}.sqlite")));
+        let ((), ro_fill) = open_read_only_guarded_in(reg, &fill, |_| Ok(())).unwrap();
+        drop(ro_fill);
+    }
+    assert_eq!(reg.lock().unwrap().total_deferred_fds(), MAX_DEFERRED_FDS);
+    drop(w_b);
+    assert_eq!(reg.lock().unwrap().active_writers, 0);
+    assert_eq!(reg.lock().unwrap().total_deferred_fds(), MAX_DEFERRED_FDS);
+
+    // Positive control: stable untracked paths succeed without growing deferred_fds.
+    {
+        let mut state = reg.lock().unwrap();
+        inspect_sqlite_header_locked(&mut state, &db_new).unwrap();
+        assert_eq!(state.total_deferred_fds(), MAX_DEFERRED_FDS);
+    }
+    assert_eq!(
+        probe_rollback_journal_once(reg, &journal_new).unwrap(),
+        JournalProbe::Clean
+    );
+    assert_eq!(reg.lock().unwrap().total_deferred_fds(), MAX_DEFERRED_FDS);
+
+    // Header probe race: pathname starts as untracked db_new, then changes to tracked db_a
+    // right before open. Pool MUST stay capped at MAX_DEFERRED_FDS and return Storage error.
+    {
+        let mut state = reg.lock().unwrap();
+        let res = inspect_sqlite_header_with_opener(&mut state, &db_new, |path| {
+            fs::remove_file(path)?;
+            fs::hard_link(&db_a, path)?;
+            open_no_follow_read_only(path)
+        });
+        assert!(matches!(
+            res,
+            Err(LedgerError::Storage(ref m)) if m.contains("deferred raw-open fd cap (64)")
+        ));
+        assert_eq!(state.total_deferred_fds(), MAX_DEFERRED_FDS);
+    }
+
+    // Journal probe race: pathname starts as untracked journal_new, then changes to tracked db_a
+    // right before open. Pool MUST stay capped at MAX_DEFERRED_FDS and return Storage error.
+    let res = probe_rollback_journal_open_with_opener(reg, &journal_new, false, |path| {
+        fs::remove_file(path)?;
+        fs::hard_link(&db_a, path)?;
+        open_no_follow_read_only(path)
+    });
+    assert!(matches!(
+        res,
+        Err(LedgerError::Storage(ref m)) if m.contains("deferred raw-open fd cap (64)")
+    ));
+    assert_eq!(reg.lock().unwrap().total_deferred_fds(), MAX_DEFERRED_FDS);
+
+    // Unknown/missing pre-open inode key with active reader and saturated pool also fails closed
+    // before invoking open.
+    {
+        let mut state = reg.lock().unwrap();
+        let missing = dir.path().join("vanished.sqlite");
+        let calls_before = raw_open_calls();
+        assert!(matches!(
+            inspect_sqlite_header_locked(&mut state, &missing),
+            Err(LedgerError::Storage(ref m)) if m.contains("deferred raw-open fd cap (64)")
+        ));
+        assert_eq!(raw_open_calls(), calls_before);
+        assert_eq!(state.total_deferred_fds(), MAX_DEFERRED_FDS);
+    }
+
+    drop(ro_a);
     assert!(reg.lock().unwrap().deferred_fds.is_empty());
 }
