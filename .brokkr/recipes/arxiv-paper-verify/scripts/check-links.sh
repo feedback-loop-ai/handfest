@@ -48,6 +48,7 @@ def norm_words(s: str) -> set[str]:
     return {w for w in re.findall(r"[a-z0-9]+", s.lower()) if len(w) > 2}
 
 def strip_tags(s: str) -> str:
+    s = re.sub(r"<(script|style)[^>]*>.*?</\1>", " ", s, flags=re.I | re.S)
     s = re.sub(r"<[^>]+>", " ", s)
     return re.sub(r"\s+", " ", html.unescape(s)).strip()
 
@@ -92,6 +93,24 @@ def extract_html_meta(body: str) -> dict:
         info["meta_authors"] = authors[:8]
     if dates:
         info["meta_dates"] = dates[:4]
+    # Capture EIP / spec header tables (Authors, Created, etc.)
+    kv = {}
+    for k, v in re.findall(r"<tr[^>]*>\s*<th[^>]*>(.*?)</th>\s*<td[^>]*>(.*?)</td>\s*</tr>", body, re.I | re.S):
+        kk = strip_tags(k).lower()
+        if any(x in kk for x in ("author", "created", "date", "status")):
+            kv[strip_tags(k)] = strip_tags(v)[:240]
+    if kv:
+        info["header_table"] = kv
+    # Capture W3C editor lists (<dd class="editor..."> or <dd class="p-author...">)
+    eds = [strip_tags(m)[:120] for m in re.findall(r"<dd[^>]*class=[\"'][^\"']*(?:editor|p-author)[^\"']*[\"'][^>]*>(.*?)</dd>", body, re.I | re.S)]
+    if eds:
+        info["editors"] = eds[:10]
+    # Capture visible body header excerpt (dates/origin/etc.)
+    bm = re.search(r"<body[^>]*>(.*?)</body>", body, re.I | re.S)
+    if bm:
+        vis = strip_tags(bm.group(1))
+        if vis:
+            info["body_excerpt"] = vis[:500]
     return info
 
 bib_report = json.loads(bib_report_path.read_text(encoding="utf-8"))
@@ -138,7 +157,7 @@ for key, info in sorted(entries.items()):
                     break
             cr_container = (msg.get("container-title") or [""])[0]
             overlap = len(norm_words(f.get("title", "")) & norm_words(cr_title)) / max(1, len(norm_words(f.get("title", ""))))
-            entry_check["verifications"].append({
+            cr_ver = {
                 "kind": "doi",
                 "doi": doi,
                 "status": 200,
@@ -147,7 +166,10 @@ for key, info in sorted(entries.items()):
                 "crossref_year": cr_year,
                 "crossref_container": cr_container,
                 "title_overlap": round(overlap, 2),
-            })
+            }
+            if msg.get("abstract"):
+                cr_ver["crossref_abstract"] = strip_tags(msg["abstract"])[:1200]
+            entry_check["verifications"].append(cr_ver)
             if overlap < 0.5:
                 errors.append(f"{key}: DOI {doi} title mismatch (bib='{f.get('title','')}' vs crossref='{cr_title}')")
 
