@@ -214,17 +214,27 @@ for key, info in sorted(entries.items()):
             )
             sparql_url = "https://publications.europa.eu/webapi/rdf/sparql?query=" + urllib.parse.quote(q)
             req = urllib.request.Request(sparql_url, headers={"Accept": "application/sparql-results+json", "User-Agent": UA})
-            try:
-                with urllib.request.urlopen(req, timeout=20) as resp:
-                    rows = json.loads(resp.read().decode("utf-8", errors="replace")).get("results", {}).get("bindings", [])
-                eli_title = rows[0]["title"]["value"] if rows else ""
+            last_exc = None
+            eli_title = ""
+            for attempt in range(4):
+                try:
+                    with urllib.request.urlopen(req, timeout=45) as resp:
+                        rows = json.loads(resp.read().decode("utf-8", errors="replace")).get("results", {}).get("bindings", [])
+                    eli_title = rows[0]["title"]["value"] if rows else ""
+                    last_exc = None
+                    break
+                except Exception as exc:
+                    last_exc = exc
+                    import time
+                    time.sleep(2 * (attempt + 1))
+            if last_exc is not None:
+                errors.append(f"{key}: EU ELI {url} Cellar SPARQL lookup failed: {last_exc}")
+                entry_check["verifications"].append({"kind": "eu_eli_cellar", "eli": rel, "status": 0})
+            else:
                 overlap = len(norm_words(f.get("title", "")) & norm_words(eli_title)) / max(1, len(norm_words(f.get("title", ""))))
                 entry_check["verifications"].append({"kind": "eu_eli_cellar", "eli": rel, "status": 200, "cellar_title": eli_title[:240], "title_overlap": round(overlap, 2)})
                 if not eli_title or overlap < 0.5:
                     errors.append(f"{key}: EU ELI {url} title mismatch via Cellar (bib='{f.get('title','')}' vs cellar='{eli_title[:120]}')")
-            except Exception as exc:
-                errors.append(f"{key}: EU ELI {url} Cellar SPARQL lookup failed: {exc}")
-                entry_check["verifications"].append({"kind": "eu_eli_cellar", "eli": rel, "status": 0})
         else:
             is_pdf_hint = url.lower().endswith(".pdf")
             code, final_url, ctype, raw = fetch_raw(url, max_bytes=(4 * 1024 * 1024 if is_pdf_hint else 512 * 1024))
