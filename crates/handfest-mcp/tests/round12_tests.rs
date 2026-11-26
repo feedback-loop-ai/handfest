@@ -538,9 +538,16 @@ fn compiled_policy_map_borrows_mcp_tool_policy_map_and_supports_map_call_exact()
     let loaded = handfest_mcp::ToolPolicyMap::from_json_str(policy_json).unwrap();
     let compiled: handfest_mcp::CompiledPolicyMap = loaded.clone().compile().unwrap();
 
-    // Direct type identity: CompiledPolicyMap::policy_map() borrows &handfest_mcp::ToolPolicyMap.
+    // Direct type identity: CompiledPolicyMap::policy_map() borrows &handfest_mcp::ToolPolicyMap,
+    // and StaticFactValue is exported at both mapping and crate roots as TypedScalar.
     let m: &handfest_mcp::ToolPolicyMap = compiled.policy_map();
     assert_eq!(m, &loaded);
+    let expected_static: handfest_mcp::mapping::StaticFactValue =
+        handfest_mcp::StaticFactValue::Str("prod".to_string());
+    assert_eq!(
+        m.get("merge_pr").and_then(|p| p.static_facts.get("env")),
+        Some(&expected_static)
+    );
     assert_eq!(
         m.get("merge_pr").map(|p| p.action.as_str()),
         Some("git.pr.merge")
@@ -586,4 +593,93 @@ fn compiled_policy_map_borrows_mcp_tool_policy_map_and_supports_map_call_exact()
         Err(handfest_mcp::MappingError::MissingResourceId { ref tool, ref arg })
             if tool == "merge_pr" && arg == "repo"
     ));
+}
+
+#[test]
+fn map_call_json_does_not_clone_full_policy_map() {
+    use handfest_core::ast::KeyId;
+    use std::collections::BTreeMap;
+    use std::hint::black_box;
+
+    let mut tools = BTreeMap::new();
+    tools.insert(
+        "merge_pr".to_string(),
+        handfest_mcp::ToolPolicy {
+            action: "git.pr.merge".to_string(),
+            resource_kind: "repo".to_string(),
+            resource_id_arg: Some("repo".to_string()),
+            static_resource_id: None,
+            arg_facts: BTreeMap::new(),
+            static_facts: BTreeMap::from([(
+                "env".to_string(),
+                handfest_mcp::mapping::StaticFactValue::Str("prod".to_string()),
+            )]),
+        },
+    );
+
+    // Add 2,000 unrelated rules carrying 4 KiB static payloads (~8 MiB total) so cloning the full
+    // map is ~100x heavier than mapping a single call.
+    let filler = "x".repeat(4096);
+    for idx in 0..2_000 {
+        tools.insert(
+            format!("unrelated_tool_{idx:04}"),
+            handfest_mcp::ToolPolicy {
+                action: "noop.run".to_string(),
+                resource_kind: "item".to_string(),
+                resource_id_arg: None,
+                static_resource_id: Some(format!("item-{idx}")),
+                arg_facts: BTreeMap::new(),
+                static_facts: BTreeMap::from([(
+                    "blob".to_string(),
+                    handfest_mcp::mapping::StaticFactValue::Str(filler.clone()),
+                )]),
+            },
+        );
+    }
+
+    let large_map = handfest_mcp::ToolPolicyMap { tools };
+    let actor =
+        KeyId::parse("ed25519:1111111111111111111111111111111111111111111111111111111111111111")
+            .unwrap();
+    let raw_args = r#"{"repo":"acme/handfest"}"#;
+
+    // Warm up allocator and verify correctness once before timing.
+    let (req, _) = large_map
+        .map_call_json(&actor, "merge_pr", Some(raw_args))
+        .unwrap();
+    assert_eq!(req.resource_id, "acme/handfest");
+    drop(black_box(large_map.clone()));
+
+    // Take the minimum of 3 rounds to ignore transient OS scheduling jitter. If map_call_json
+    // regressed to cloning the entire map, 16 calls would perform 16 full clones (~8x slower than
+    // 2 full clones) and fail this self-calibrating bound on any hardware.
+    let min_two_clones = (0..3)
+        .map(|_| {
+            let start = Instant::now();
+            for _ in 0..2 {
+                drop(black_box(large_map.clone()));
+            }
+            start.elapsed()
+        })
+        .min()
+        .unwrap();
+
+    let min_sixteen_maps = (0..3)
+        .map(|_| {
+            let start = Instant::now();
+            for _ in 0..16 {
+                let res = large_map
+                    .map_call_json(&actor, "merge_pr", Some(raw_args))
+                    .unwrap();
+                black_box(res);
+            }
+            start.elapsed()
+        })
+        .min()
+        .unwrap();
+
+    assert!(
+        min_sixteen_maps < min_two_clones,
+        "16 map_call_json calls ({min_sixteen_maps:?}) must be faster than 2 full ToolPolicyMap clones ({min_two_clones:?}); indicates map_call_json cloned the whole map"
+    );
 }

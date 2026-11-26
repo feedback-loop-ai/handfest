@@ -5,6 +5,6 @@
 //! full public API compatibility.
 
 pub use handfest_core::policy::{
-    denial_resource_id, CompiledPolicyMap, FactSpec, FactType, MappingError, ToolPolicy,
-    ToolPolicyMap, TypedScalar,
+    denial_resource_id, CompiledPolicyMap, FactSpec, FactType, MappingError, StaticFactValue,
+    ToolPolicy, ToolPolicyMap, TypedScalar,
 };

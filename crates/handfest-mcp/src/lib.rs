@@ -11,7 +11,8 @@ mod transport;
 pub use handfest_core::Verdict;
 pub use handfest_ledger::ReceiptLedger;
 pub use mapping::{
-    CompiledPolicyMap, FactSpec, FactType, MappingError, ToolPolicy, ToolPolicyMap, TypedScalar,
+    CompiledPolicyMap, FactSpec, FactType, MappingError, StaticFactValue, ToolPolicy,
+    ToolPolicyMap, TypedScalar,
 };
 pub use proxy::{
     verify_mandate_chain, verify_mandate_chain_with, Clock, FixedClock, McpProxy, ProxyError,

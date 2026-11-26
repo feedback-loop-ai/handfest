@@ -109,6 +109,9 @@ pub enum TypedScalar {
     Timestamp(i64),
 }
 
+/// Public alias for [`TypedScalar`] matching the static-fact configuration terminology.
+pub type StaticFactValue = TypedScalar;
+
 impl TypedScalar {
     /// Converts and validates this typed scalar into a canonical `handfest_core::ast::Scalar`.
     pub fn to_scalar(&self) -> Result<Scalar, MappingError> {
