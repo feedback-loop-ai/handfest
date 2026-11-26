@@ -24,8 +24,8 @@ const HOT_JOURNAL_MAX_BACKOFF: Duration = Duration::from_millis(100);
 const MAX_DEFERRED_FDS: usize = 64;
 
 #[cfg(unix)]
-const O_NOFOLLOW: Option<i32> = if cfg!(all(
-    target_os = "linux",
+const UNIX_O_NOFOLLOW: Option<i32> = if cfg!(all(
+    any(target_os = "linux", target_os = "android"),
     any(
         target_arch = "arm",
         target_arch = "aarch64",
@@ -36,7 +36,7 @@ const O_NOFOLLOW: Option<i32> = if cfg!(all(
 )) {
     Some(0o100_000) // 0x8000
 } else if cfg!(all(
-    target_os = "linux",
+    any(target_os = "linux", target_os = "android"),
     any(
         target_arch = "x86_64",
         target_arch = "x86",
@@ -65,8 +65,8 @@ const O_NOFOLLOW: Option<i32> = if cfg!(all(
 };
 
 #[cfg(unix)]
-const O_NONBLOCK: Option<i32> = if cfg!(all(
-    target_os = "linux",
+const UNIX_O_NONBLOCK: Option<i32> = if cfg!(all(
+    any(target_os = "linux", target_os = "android"),
     any(
         target_arch = "x86_64",
         target_arch = "x86",
@@ -81,6 +81,16 @@ const O_NONBLOCK: Option<i32> = if cfg!(all(
     )
 )) {
     Some(0o4000) // 0x800
+} else if cfg!(all(
+    any(target_os = "linux", target_os = "android"),
+    any(target_arch = "mips", target_arch = "mips64")
+)) {
+    Some(0x0080)
+} else if cfg!(all(
+    any(target_os = "linux", target_os = "android"),
+    any(target_arch = "sparc", target_arch = "sparc64")
+)) {
+    Some(0x4000)
 } else if cfg!(any(
     target_os = "macos",
     target_os = "ios",
@@ -152,13 +162,18 @@ struct ActiveHandleRegistry {
     counts: BTreeMap<FileIdentity, usize>,
     active_writers: usize,
     #[cfg(unix)]
-    deferred_fds: HashMap<(u64, u64), File>,
+    deferred_fds: HashMap<(u64, u64), Vec<File>>,
 }
 
 impl ActiveHandleRegistry {
     #[cfg(unix)]
     fn has_active_handles(&self) -> bool {
         self.active_writers > 0 || !self.counts.is_empty()
+    }
+
+    #[cfg(unix)]
+    fn total_deferred_fds(&self) -> usize {
+        self.deferred_fds.values().map(Vec::len).sum()
     }
 
     fn maybe_clear_deferred_fds(&mut self) {
@@ -170,7 +185,7 @@ impl ActiveHandleRegistry {
 
     #[cfg(unix)]
     fn ensure_deferred_fd_capacity(&self) -> Result<(), LedgerError> {
-        if self.has_active_handles() && self.deferred_fds.len() >= MAX_DEFERRED_FDS {
+        if self.has_active_handles() && self.total_deferred_fds() >= MAX_DEFERRED_FDS {
             return Err(LedgerError::Storage(format!(
                 "deferred raw-open fd cap ({MAX_DEFERRED_FDS}) reached while ledger handles are active"
             )));
@@ -179,36 +194,30 @@ impl ActiveHandleRegistry {
     }
 
     #[cfg(unix)]
-    fn maybe_defer_fd(&mut self, key: (u64, u64), file: File) -> Result<(), LedgerError> {
+    fn maybe_defer_fd(&mut self, key: (u64, u64), file: File) {
         if !self.has_active_handles() {
             drop(file);
-            return Ok(());
+            return;
         }
-        if !self.deferred_fds.contains_key(&key) && self.deferred_fds.len() >= MAX_DEFERRED_FDS {
-            return Err(LedgerError::Storage(format!(
-                "deferred raw-open fd cap ({MAX_DEFERRED_FDS}) reached while ledger handles are active"
-            )));
-        }
-        self.deferred_fds.entry(key).or_insert(file);
-        Ok(())
+        self.deferred_fds.entry(key).or_default().push(file);
     }
 
     #[cfg(unix)]
-    fn maybe_defer_regular_file(&mut self, file: File) -> Result<(), LedgerError> {
+    fn maybe_defer_regular_file(&mut self, file: File) {
         use std::os::unix::fs::MetadataExt;
         if !self.has_active_handles() {
             drop(file);
-            return Ok(());
+            return;
         }
         let Ok(fstat) = file.metadata() else {
             drop(file);
-            return Ok(());
+            return;
         };
         if !fstat.is_file() {
             drop(file);
-            return Ok(());
+            return;
         }
-        self.maybe_defer_fd((fstat.dev(), fstat.ino()), file)
+        self.maybe_defer_fd((fstat.dev(), fstat.ino()), file);
     }
 
     fn decrement_writer(&mut self) {
@@ -268,8 +277,9 @@ impl Drop for PendingWriterGuard {
 /// concurrent readers. On Unix, while ANY writable OR read-only handle is active
 /// (`active_writers > 0 || !counts.is_empty()`), every regular-file `File` opened for header
 /// inspection or rollback-journal probing is retained in `deferred_fds` keyed by `(st_dev, st_ino)`
-/// (rewound via `SeekFrom::Start(0)` on repeated inspections of the same live inode) and only
-/// closed once BOTH `active_writers == 0` and `counts.is_empty()`.
+/// (reusing the first retained `File` via `SeekFrom::Start(0)` on repeated inspections of the same
+/// live inode, and pushing any additional `File` opened on an occupied key rather than dropping it)
+/// and only closed once BOTH `active_writers == 0` and `counts.is_empty()`.
 pub(crate) struct ActiveHandleGuard {
     registry: &'static Mutex<ActiveHandleRegistry>,
     id: FileIdentity,
@@ -317,7 +327,15 @@ pub(crate) fn deferred_fd_count() -> usize {
     let state = active_handles()
         .lock()
         .unwrap_or_else(PoisonError::into_inner);
-    state.deferred_fds.len()
+    state.total_deferred_fds()
+}
+
+#[cfg(all(test, unix))]
+pub(crate) fn defer_fd_for_test(key: (u64, u64), file: File) {
+    let mut state = active_handles()
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
+    state.maybe_defer_fd(key, file);
 }
 
 /// Opens a writable ledger connection while holding the process-local active-handle registry lock
@@ -394,6 +412,10 @@ where
         id = inspect_sqlite_header_locked(&mut state, canonical)?;
     }
     let conn = open_conn(canonical)?;
+    if let Err(err) = verify_post_open_canonical_identity(canonical, &id) {
+        drop(conn);
+        return Err(err);
+    }
     *state.counts.entry(id.clone()).or_insert(0) += 1;
     Ok((
         conn,
@@ -403,6 +425,26 @@ where
             is_writer: false,
         },
     ))
+}
+
+fn verify_post_open_canonical_identity(
+    canonical: &Path,
+    expected_id: &FileIdentity,
+) -> Result<(), LedgerError> {
+    let Ok(post_meta) = fs::symlink_metadata(canonical) else {
+        return Err(LedgerError::Integrity(
+            "read-only ledger path changed concurrently during open".to_string(),
+        ));
+    };
+    if post_meta.file_type().is_symlink()
+        || !post_meta.file_type().is_file()
+        || FileIdentity::from_metadata(canonical, &post_meta) != *expected_id
+    {
+        return Err(LedgerError::Integrity(
+            "read-only ledger path changed concurrently during open".to_string(),
+        ));
+    }
+    Ok(())
 }
 
 fn stat_read_only_regular_file(canonical: &Path) -> Result<fs::Metadata, LedgerError> {
@@ -426,7 +468,10 @@ fn cached_deferred_fd<'a>(
     if !meta.file_type().is_file() {
         return None;
     }
-    state.deferred_fds.get_mut(&(meta.dev(), meta.ino()))
+    state
+        .deferred_fds
+        .get_mut(&(meta.dev(), meta.ino()))
+        .and_then(|files| files.first_mut())
 }
 
 fn validate_regular_ledger_metadata(
@@ -477,7 +522,7 @@ fn inspect_sqlite_header_locked(
     })?;
     let res = inspect_sqlite_header_from_file(&mut file, canonical);
     #[cfg(unix)]
-    state.maybe_defer_regular_file(file)?;
+    state.maybe_defer_regular_file(file);
     res
 }
 
@@ -542,7 +587,7 @@ fn check_wal_sidecar(wal_path: &Path) -> Result<(), LedgerError> {
     Ok(())
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq)]
 enum JournalProbe {
     Clean,
     Hot,
@@ -587,7 +632,7 @@ fn open_no_follow_read_only(path: &Path) -> io::Result<File> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
-        opts.custom_flags(combine_unix_open_flags(O_NOFOLLOW, O_NONBLOCK));
+        opts.custom_flags(combine_unix_open_flags(UNIX_O_NOFOLLOW, UNIX_O_NONBLOCK));
     }
     opts.open(path)
 }
@@ -625,7 +670,7 @@ fn probe_rollback_journal_once(
         return Ok(JournalProbe::Clean);
     }
     #[cfg(unix)]
-    let has_o_nofollow = O_NOFOLLOW.is_some();
+    let has_o_nofollow = UNIX_O_NOFOLLOW.is_some();
     #[cfg(not(unix))]
     let has_o_nofollow = false;
     reject_symlink_without_o_nofollow(has_o_nofollow, is_symlink, journal_path)?;
@@ -683,7 +728,7 @@ fn probe_rollback_journal_open(
     };
     let probe = read_rollback_journal_from_file(&mut file, journal_path);
     #[cfg(unix)]
-    state.maybe_defer_regular_file(file)?;
+    state.maybe_defer_regular_file(file);
     probe
 }
 

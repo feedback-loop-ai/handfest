@@ -232,6 +232,24 @@ def split_decimal_exp(raw: str) -> tuple[str, str | None]:
     return raw, None
 
 
+def scale_decimal_mantissa(
+    trimmed: str, net_exp: int, neg: bool, raw: str, code: str, ctx: str
+) -> tuple[int, int]:
+    if net_exp >= 0:
+        if len(trimmed) + net_exp > 39:
+            raise HookError(code, f"{ctx}: decimal out of supported range '{raw}'")
+        acc, scale = int(trimmed, 10) * (10 ** net_exp), 0
+    else:
+        scale = -net_exp
+        if scale > MAX_DEC_SCALE or len(trimmed) > 39:
+            raise HookError(code, f"{ctx}: decimal out of supported scale/range '{raw}'")
+        acc = int(trimmed, 10)
+    mantissa = -acc if neg else acc
+    if not (I128_MIN <= mantissa <= I128_MAX):
+        raise HookError(code, f"{ctx}: decimal out of supported range '{raw}'")
+    return acc, scale
+
+
 def parse_decimal(raw: str, code: str, ctx: str, allow_exponent: bool = False) -> str:
     regex = DECIMAL_NUM_RE if allow_exponent else DECIMAL_STR_RE
     if not regex.match(raw):
@@ -250,18 +268,7 @@ def parse_decimal(raw: str, code: str, ctx: str, allow_exponent: bool = False) -
     exp = parse_decimal_exp(exp_str, raw, code, ctx) if exp_str is not None else 0
     trimmed = digits.rstrip("0")
     net_exp = exp - len(frac_digits) + (len(digits) - len(trimmed))
-    if net_exp >= 0:
-        if len(trimmed) + net_exp > 39:
-            raise HookError(code, f"{ctx}: decimal out of supported range '{raw}'")
-        acc, scale = int(trimmed, 10) * (10 ** net_exp), 0
-    else:
-        scale = -net_exp
-        if scale > MAX_DEC_SCALE or len(trimmed) > 39:
-            raise HookError(code, f"{ctx}: decimal out of supported scale/range '{raw}'")
-        acc = int(trimmed, 10)
-    mantissa = -acc if neg else acc
-    if not (I128_MIN <= mantissa <= I128_MAX):
-        raise HookError(code, f"{ctx}: decimal out of supported range '{raw}'")
+    acc, scale = scale_decimal_mantissa(trimmed, net_exp, neg, raw, code, ctx)
     return format_decimal(neg, acc, scale)
 
 

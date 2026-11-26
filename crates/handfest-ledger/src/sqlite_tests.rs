@@ -8,7 +8,7 @@ use tempfile::TempDir;
 
 use crate::preflight::active_handle_count;
 #[cfg(unix)]
-use crate::preflight::{active_writer_count, deferred_fd_count};
+use crate::preflight::{active_writer_count, defer_fd_for_test, deferred_fd_count};
 
 use super::*;
 
@@ -878,6 +878,60 @@ fn repeated_audits_on_ledger_b_while_writer_a_open_deduplicate_deferred_fd() {
     run_isolated_child_test(
         "sqlite::tests::repeated_audits_dedup_child_helper",
         "HANDFEST_REPEATED_AUDIT_DEDUP_DIR",
+        dir.path(),
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn duplicate_deferred_fd_preserves_writer_lock_child_helper() {
+    use std::os::unix::fs::MetadataExt;
+
+    let Ok(dir_str) = std::env::var("HANDFEST_DUP_DEFERRED_FD_DIR") else {
+        return;
+    };
+    let db_path = std::path::PathBuf::from(dir_str).join("dup_deferred.sqlite");
+
+    assert_eq!(active_writer_count(), 0);
+    assert_eq!(deferred_fd_count(), 0);
+    {
+        let writer = SqliteLedger::open_existing(&db_path).unwrap();
+        assert_eq!(active_writer_count(), 1);
+        writer.conn.execute_batch("BEGIN IMMEDIATE;").unwrap();
+
+        let meta = fs::metadata(&db_path).unwrap();
+        let key = (meta.dev(), meta.ino());
+
+        let first = fs::File::open(&db_path).unwrap();
+        defer_fd_for_test(key, first);
+        assert_eq!(deferred_fd_count(), 1);
+
+        // Deferring a second File on the same occupied (dev, ino) MUST push it onto Vec<File>
+        // rather than dropping it (dropping would close() and release writer's POSIX lock).
+        let second = fs::File::open(&db_path).unwrap();
+        defer_fd_for_test(key, second);
+        assert_cross_process_exclusive_lock(&db_path, true);
+        assert_eq!(deferred_fd_count(), 2);
+        writer.conn.execute_batch("ROLLBACK;").unwrap();
+    }
+    assert_eq!(active_writer_count(), 0);
+    assert_eq!(deferred_fd_count(), 0);
+    assert_cross_process_exclusive_lock(&db_path, false);
+}
+
+#[cfg(unix)]
+#[test]
+fn duplicate_deferred_fd_on_same_inode_preserves_writer_lock() {
+    let dir = TempDir::new().unwrap();
+    let db_path = dir.path().join("dup_deferred.sqlite");
+    let (chain, req, facts, now) = sample_chain_and_req();
+    {
+        let mut init = SqliteLedger::open(&db_path).unwrap();
+        init.evaluate_and_record(&chain, &req, &facts, now).unwrap();
+    }
+    run_isolated_child_test(
+        "sqlite::tests::duplicate_deferred_fd_preserves_writer_lock_child_helper",
+        "HANDFEST_DUP_DEFERRED_FD_DIR",
         dir.path(),
     );
 }

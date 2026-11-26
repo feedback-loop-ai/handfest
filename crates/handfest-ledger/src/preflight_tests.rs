@@ -100,6 +100,10 @@ fn read_only_header_and_sidecar_helpers_fail_closed_on_invalid_inputs() {
         let unreadable = dir.path().join("unreadable-journal");
         fs::write(&unreadable, [0u8; 32]).unwrap();
         fs::set_permissions(&unreadable, fs::Permissions::from_mode(0o000)).unwrap();
+        if File::open(&unreadable).is_ok() {
+            let _ = fs::set_permissions(&unreadable, fs::Permissions::from_mode(0o644));
+            return;
+        }
         let res = check_rollback_journal_sidecar_in(active_handles(), &unreadable);
         let _ = fs::set_permissions(&unreadable, fs::Permissions::from_mode(0o644));
         assert!(matches!(res, Err(LedgerError::Integrity(_))));
@@ -286,13 +290,13 @@ fn open_writable_guarded_error_and_deferred_fd_cap_fail_closed() {
             let ((), ro) = open_read_only_guarded_in(reg, &target, |_| Ok(())).unwrap();
             drop(ro);
         }
-        assert_eq!(reg.lock().unwrap().deferred_fds.len(), MAX_DEFERRED_FDS);
+        assert_eq!(reg.lock().unwrap().total_deferred_fds(), MAX_DEFERRED_FDS);
 
-        // Already-cached inode reuses its deferred fd even at the distinct-inode cap.
+        // Already-cached inode reuses its deferred fd even at the total-fd cap.
         let ((), ro_cached) =
             open_read_only_guarded_in(reg, first_target.as_ref().unwrap(), |_| Ok(())).unwrap();
         drop(ro_cached);
-        assert_eq!(reg.lock().unwrap().deferred_fds.len(), MAX_DEFERRED_FDS);
+        assert_eq!(reg.lock().unwrap().total_deferred_fds(), MAX_DEFERRED_FDS);
 
         // Next distinct inode fails closed with Storage BEFORE opening another fd.
         let overflow = write_valid_header_file(&dir.path().join("ro_target_overflow.sqlite"));
@@ -300,14 +304,22 @@ fn open_writable_guarded_error_and_deferred_fd_cap_fail_closed() {
             open_read_only_guarded_in(reg, &overflow, |_| Ok(())),
             Err(LedgerError::Storage(_))
         ));
-        // Direct maybe_defer_fd cap guard also fails closed with Storage on a new distinct inode key.
-        let extra_file = File::open(&overflow).unwrap();
         assert!(matches!(
-            reg.lock()
-                .unwrap()
-                .maybe_defer_fd((u64::MAX, u64::MAX), extra_file),
+            reg.lock().unwrap().ensure_deferred_fd_capacity(),
             Err(LedgerError::Storage(_))
         ));
+        // Occupied key pushed directly via maybe_defer_fd retains the duplicate File rather than
+        // dropping it while handles are active.
+        let dup_file = File::open(first_target.as_ref().unwrap()).unwrap();
+        let dup_meta = dup_file.metadata().unwrap();
+        {
+            use std::os::unix::fs::MetadataExt;
+            let key = (dup_meta.dev(), dup_meta.ino());
+            let mut state = reg.lock().unwrap();
+            state.maybe_defer_fd(key, dup_file);
+            assert_eq!(state.deferred_fds[&key].len(), 2);
+            assert_eq!(state.total_deferred_fds(), MAX_DEFERRED_FDS + 1);
+        }
 
         drop(writer_guard);
         assert!(reg.lock().unwrap().deferred_fds.is_empty());
@@ -330,6 +342,10 @@ fn open_no_follow_read_only_rejects_symlinks_atomically() {
     let mut buf = Vec::new();
     ok_file.read_to_end(&mut buf).unwrap();
     assert_eq!(buf, b"rollback-payload");
+
+    if UNIX_O_NOFOLLOW.is_none() {
+        return;
+    }
 
     // Direct call on symlink to existing target (without symlink_metadata) fails atomically with ELOOP.
     let live_sym = dir.path().join("live_sym.journal");
@@ -450,6 +466,10 @@ fn post_open_non_file_guards_and_nonblock_fifo_reject_without_blocking() {
         "non-regular file must never be inserted into deferred_fds"
     );
 
+    if UNIX_O_NONBLOCK.is_none() {
+        return;
+    }
+
     // 3. Writerless FIFO: O_NONBLOCK ensures open returns immediately (no deadlock under mutex)
     //    and post-open !meta.is_file() rejects it cleanly in both header and journal helpers.
     let fifo = dir.path().join("writerless.fifo");
@@ -514,10 +534,114 @@ fn probe_rollback_journal_once_and_header_inspect_reject_symlinks_via_o_nofollow
         "expected not a regular file error from stat_read_only_regular_file on symlink, got: {stat_err:?}"
     );
 
-    let mut reg_state = ActiveHandleRegistry::default();
-    let hdr_err = inspect_sqlite_header_locked(&mut reg_state, &sym_db).unwrap_err();
+    if UNIX_O_NOFOLLOW.is_some() {
+        let mut reg_state = ActiveHandleRegistry::default();
+        let hdr_err = inspect_sqlite_header_locked(&mut reg_state, &sym_db).unwrap_err();
+        assert!(
+            matches!(hdr_err, LedgerError::Integrity(_)),
+            "expected Integrity error from inspect_sqlite_header_locked on symlink, got: {hdr_err:?}"
+        );
+    }
+}
+
+fn assert_concurrent_open_rejected<F>(canonical: &Path, check_path: &Path, mutate: F)
+where
+    F: FnOnce(&Path),
+{
+    use std::sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    };
+
+    struct ConnDropProbe(Arc<AtomicBool>);
+    impl Drop for ConnDropProbe {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+
+    let dropped = Arc::new(AtomicBool::new(false));
+    let err = open_read_only_guarded(canonical, |path| {
+        mutate(path);
+        Ok(ConnDropProbe(Arc::clone(&dropped)))
+    })
+    .err()
+    .expect("concurrent path mutation during open_conn must fail closed");
     assert!(
-        matches!(hdr_err, LedgerError::Integrity(_)),
-        "expected Integrity error from inspect_sqlite_header_locked on symlink, got: {hdr_err:?}"
+        matches!(&err, LedgerError::Integrity(m) if m == "read-only ledger path changed concurrently during open"),
+        "unexpected error on concurrent open mutation: {err:?}"
     );
+    assert!(
+        dropped.load(Ordering::SeqCst),
+        "conn must be dropped immediately"
+    );
+    assert_eq!(active_handle_count(check_path), 0);
+}
+
+#[test]
+fn open_read_only_guarded_rejects_concurrent_path_replacement_and_drops_conn() {
+    let dir = TempDir::new().unwrap();
+    let other_db = write_valid_header_file(&dir.path().join("other.sqlite"));
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::symlink;
+
+        let swap_inode = write_valid_header_file(&dir.path().join("swap_inode.sqlite"));
+        assert_concurrent_open_rejected(&swap_inode, &swap_inode, |path| {
+            let replacement = dir.path().join("replacement_inode.sqlite");
+            write_valid_header_file(&replacement);
+            fs::rename(&replacement, path).unwrap();
+        });
+
+        let swap_sym = write_valid_header_file(&dir.path().join("swap_symlink.sqlite"));
+        assert_concurrent_open_rejected(&swap_sym, &other_db, |path| {
+            fs::remove_file(path).unwrap();
+            symlink(&other_db, path).unwrap();
+        });
+    }
+
+    let unlink_db = write_valid_header_file(&dir.path().join("unlink_during_open.sqlite"));
+    assert_concurrent_open_rejected(&unlink_db, &unlink_db, |path| {
+        fs::remove_file(path).unwrap();
+    });
+
+    let dir_db = write_valid_header_file(&dir.path().join("dir_during_open.sqlite"));
+    assert_concurrent_open_rejected(&dir_db, &dir_db, |path| {
+        fs::remove_file(path).unwrap();
+        fs::create_dir(path).unwrap();
+    });
+}
+
+#[cfg(unix)]
+#[test]
+fn cached_rollback_journal_fd_rewinds_to_start_on_repeated_clean_probes() {
+    static REG: OnceLock<Mutex<ActiveHandleRegistry>> = OnceLock::new();
+    let reg = REG.get_or_init(|| Mutex::new(ActiveHandleRegistry::default()));
+
+    let dir = TempDir::new().unwrap();
+    let db = write_valid_header_file(&dir.path().join("rewind_db.sqlite"));
+    let journal = dir.path().join("rewind_db.sqlite-journal");
+    fs::write(&journal, [0u8; ROLLBACK_JOURNAL_HDR_LEN]).unwrap();
+
+    let ((), writer_guard) = open_writable_guarded_in(reg, &db, || Ok(())).unwrap();
+
+    let first = probe_rollback_journal_once(reg, &journal).unwrap();
+    assert_eq!(first, JournalProbe::Clean);
+    assert_eq!(reg.lock().unwrap().total_deferred_fds(), 1);
+
+    // Second probe hits deferred_fds cache and MUST rewind via seek(SeekFrom::Start(0));
+    // without rewind, read_exact hits EOF and misclassifies the clean journal as Hot.
+    let second = probe_rollback_journal_once(reg, &journal).unwrap();
+    assert_eq!(second, JournalProbe::Clean);
+    assert_eq!(reg.lock().unwrap().total_deferred_fds(), 1);
+
+    // In-place update to non-zero hot bytes is observed via the rewound cached fd.
+    fs::write(&journal, [0xd9u8; ROLLBACK_JOURNAL_HDR_LEN]).unwrap();
+    let third = probe_rollback_journal_once(reg, &journal).unwrap();
+    assert_eq!(third, JournalProbe::Hot);
+    assert_eq!(reg.lock().unwrap().total_deferred_fds(), 1);
+
+    drop(writer_guard);
+    assert!(reg.lock().unwrap().deferred_fds.is_empty());
 }
