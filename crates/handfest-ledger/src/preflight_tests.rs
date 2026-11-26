@@ -1003,6 +1003,14 @@ fn cached_rollback_journal_fd_rewinds_to_start_on_repeated_clean_probes() {
 }
 
 #[cfg(unix)]
+fn assert_deferred_fd_cap_err<T>(res: Result<T, LedgerError>) {
+    assert!(matches!(
+        res,
+        Err(LedgerError::Storage(ref m)) if m.contains("deferred raw-open fd cap (64)")
+    ));
+}
+
+#[cfg(unix)]
 #[test]
 fn inode_change_before_open_cannot_exceed_deferred_fd_cap() {
     static REG: OnceLock<Mutex<ActiveHandleRegistry>> = OnceLock::new();
@@ -1012,24 +1020,14 @@ fn inode_change_before_open_cannot_exceed_deferred_fd_cap() {
     let db_a = write_valid_header_file(&dir.path().join("db_a.sqlite"));
     let db_b = write_valid_header_file(&dir.path().join("db_b.sqlite"));
     let db_new = write_valid_header_file(&dir.path().join("db_new.sqlite"));
+    let db_other = write_valid_header_file(&dir.path().join("db_other.sqlite"));
     let journal_new = dir.path().join("db_new.sqlite-journal");
     fs::write(&journal_new, [0u8; ROLLBACK_JOURNAL_HDR_LEN]).unwrap();
 
-    // Keep reader ro_a on db_a (tracked in counts) and writer w_b on db_b, then saturate
-    // deferred_fds to MAX_DEFERRED_FDS (64) and drop w_b while ro_a stays open.
-    let ((), ro_a) = open_read_only_guarded_in(reg, &db_a, |_| Ok(())).unwrap();
-    let ((), w_b) = open_writable_guarded_in(reg, &db_b, || Ok(())).unwrap();
-    for i in 0..MAX_DEFERRED_FDS {
-        let fill = write_valid_header_file(&dir.path().join(format!("race_fill_{i}.sqlite")));
-        let ((), ro_fill) = open_read_only_guarded_in(reg, &fill, |_| Ok(())).unwrap();
-        drop(ro_fill);
-    }
-    assert_eq!(reg.lock().unwrap().total_deferred_fds(), MAX_DEFERRED_FDS);
-    drop(w_b);
-    assert_eq!(reg.lock().unwrap().active_writers, 0);
-    assert_eq!(reg.lock().unwrap().total_deferred_fds(), MAX_DEFERRED_FDS);
+    // Saturate deferred_fds to MAX_DEFERRED_FDS (64) with active_writers == 0 while ro_a stays open.
+    let ro_a = saturate_registry_for_reader_only_state(reg, dir.path(), &db_a, &db_b);
 
-    // Positive control: stable untracked paths succeed without growing deferred_fds.
+    // Positive control at 64: stable untracked paths succeed without growing deferred_fds.
     {
         let mut state = reg.lock().unwrap();
         inspect_sqlite_header_locked(&mut state, &db_new).unwrap();
@@ -1041,40 +1039,7 @@ fn inode_change_before_open_cannot_exceed_deferred_fd_cap() {
     );
     assert_eq!(reg.lock().unwrap().total_deferred_fds(), MAX_DEFERRED_FDS);
 
-    // Header probe race: pathname starts as untracked db_new, then changes to tracked db_a
-    // right before open. File MUST be retained (never dropped) while still returning Storage error.
-    {
-        let mut state = reg.lock().unwrap();
-        let res = inspect_sqlite_header_with_opener(&mut state, &db_new, |path| {
-            fs::remove_file(path)?;
-            fs::hard_link(&db_a, path)?;
-            open_no_follow_read_only(path)
-        });
-        assert!(matches!(
-            res,
-            Err(LedgerError::Storage(ref m)) if m.contains("deferred raw-open fd cap (64)")
-        ));
-        assert_eq!(state.total_deferred_fds(), MAX_DEFERRED_FDS + 1);
-    }
-
-    // Journal probe race: pathname starts as untracked journal_new, then changes to tracked db_a
-    // right before open. File MUST be retained (never dropped) while still returning Storage error.
-    let res = probe_rollback_journal_open_with_opener(reg, &journal_new, false, |path| {
-        fs::remove_file(path)?;
-        fs::hard_link(&db_a, path)?;
-        open_no_follow_read_only(path)
-    });
-    assert!(matches!(
-        res,
-        Err(LedgerError::Storage(ref m)) if m.contains("deferred raw-open fd cap (64)")
-    ));
-    assert_eq!(
-        reg.lock().unwrap().total_deferred_fds(),
-        MAX_DEFERRED_FDS + 2
-    );
-
-    // Unknown/missing pre-open inode key with active_writers == 0 fails with Integrity (not
-    // Storage), while with active_writers > 0 it fails closed with Storage before invoking open.
+    // Missing pre-open inode key at 64: Integrity with active_writers == 0, Storage before open with writer.
     let missing = dir.path().join("vanished.sqlite");
     {
         let mut state = reg.lock().unwrap();
@@ -1087,13 +1052,54 @@ fn inode_change_before_open_cannot_exceed_deferred_fd_cap() {
     {
         let mut state = reg.lock().unwrap();
         let calls_before = raw_open_calls();
-        assert!(matches!(
-            inspect_sqlite_header_locked(&mut state, &missing),
-            Err(LedgerError::Storage(ref m)) if m.contains("deferred raw-open fd cap (64)")
-        ));
+        assert_deferred_fd_cap_err(inspect_sqlite_header_locked(&mut state, &missing));
         assert_eq!(raw_open_calls(), calls_before);
     }
     drop(w_b2);
+
+    // First raced probe at 64: pathname swaps from untracked db_new to tracked db_a before open.
+    // File MUST be retained (65, preserving POSIX locks) while returning Storage cap error.
+    {
+        let mut state = reg.lock().unwrap();
+        let res = inspect_sqlite_header_with_opener(&mut state, &db_new, |path| {
+            fs::remove_file(path)?;
+            fs::hard_link(&db_a, path)?;
+            open_no_follow_read_only(path)
+        });
+        assert_deferred_fd_cap_err(res);
+        assert_eq!(state.total_deferred_fds(), MAX_DEFERRED_FDS + 1);
+    }
+
+    // Second raced probe at 65: hard ceiling refuses ALL uncached raw opens BEFORE calling open
+    // (raw_open_calls unchanged, opener never invoked, total_deferred_fds stays capped at 65).
+    let calls_before = raw_open_calls();
+    let mut opener_called = false;
+    let res = probe_rollback_journal_open_with_opener(reg, &journal_new, false, |path| {
+        opener_called = true;
+        fs::remove_file(path)?;
+        fs::hard_link(&db_a, path)?;
+        open_no_follow_read_only(path)
+    });
+    assert_deferred_fd_cap_err(res);
+    assert!(
+        !opener_called,
+        "opener must not be invoked past MAX_DEFERRED_FDS"
+    );
+    assert_eq!(raw_open_calls(), calls_before);
+    assert_eq!(
+        reg.lock().unwrap().total_deferred_fds(),
+        MAX_DEFERRED_FDS + 1
+    );
+
+    // Uncached header probes (untracked or missing) also fail closed BEFORE open while at 65.
+    {
+        let mut state = reg.lock().unwrap();
+        let calls_before = raw_open_calls();
+        assert_deferred_fd_cap_err(inspect_sqlite_header_locked(&mut state, &db_other));
+        assert_deferred_fd_cap_err(inspect_sqlite_header_locked(&mut state, &missing));
+        assert_eq!(raw_open_calls(), calls_before);
+        assert_eq!(state.total_deferred_fds(), MAX_DEFERRED_FDS + 1);
+    }
 
     drop(ro_a);
     assert!(reg.lock().unwrap().deferred_fds.is_empty());
@@ -1148,15 +1154,15 @@ fn inode_swap_at_deferred_fd_cap_retains_fd_and_preserves_posix_lock() {
     let db_a = init_real_sqlite_db(&dir.path().join("cap_lock_a.sqlite"));
     let db_b = write_valid_header_file(&dir.path().join("cap_lock_b.sqlite"));
     let db_new = write_valid_header_file(&dir.path().join("cap_lock_new.sqlite"));
+    let db_new2 = write_valid_header_file(&dir.path().join("cap_lock_new2.sqlite"));
     let journal_new = dir.path().join("cap_lock_new.sqlite-journal");
     fs::write(&journal_new, [0u8; ROLLBACK_JOURNAL_HDR_LEN]).unwrap();
 
+    // Phase 1: header-probe inode-swap race at 64 retains fd (65) + lock; second probe refuses before open.
     let ro_a = saturate_registry_for_reader_only_state(reg, dir.path(), &db_a, &db_b);
-
     let lock_conn = rusqlite::Connection::open(&db_a).unwrap();
     lock_conn.execute_batch("BEGIN IMMEDIATE;").unwrap();
     assert_preflight_exclusive_lock(&db_a, true);
-
     {
         let mut state = reg.lock().unwrap();
         let res = inspect_sqlite_header_with_opener(&mut state, &db_new, |path| {
@@ -1164,10 +1170,7 @@ fn inode_swap_at_deferred_fd_cap_retains_fd_and_preserves_posix_lock() {
             fs::hard_link(&db_a, path)?;
             open_no_follow_read_only(path)
         });
-        assert!(matches!(
-            res,
-            Err(LedgerError::Storage(ref m)) if m.contains("deferred raw-open fd cap (64)")
-        ));
+        assert_deferred_fd_cap_err(res);
     }
     assert_preflight_exclusive_lock(&db_a, true);
     assert_eq!(
@@ -1175,24 +1178,55 @@ fn inode_swap_at_deferred_fd_cap_retains_fd_and_preserves_posix_lock() {
         MAX_DEFERRED_FDS + 1
     );
 
-    let j_res = probe_rollback_journal_open_with_opener(reg, &journal_new, false, |path| {
-        fs::remove_file(path)?;
-        fs::hard_link(&db_a, path)?;
+    let calls_before = raw_open_calls();
+    let mut j_opened = false;
+    let j_blocked = probe_rollback_journal_open_with_opener(reg, &journal_new, false, |path| {
+        j_opened = true;
         open_no_follow_read_only(path)
     });
-    assert!(matches!(
-        j_res,
-        Err(LedgerError::Storage(ref m)) if m.contains("deferred raw-open fd cap (64)")
-    ));
+    assert_deferred_fd_cap_err(j_blocked);
+    assert!(!j_opened);
+    assert_eq!(raw_open_calls(), calls_before);
     assert_preflight_exclusive_lock(&db_a, true);
     assert_eq!(
         reg.lock().unwrap().total_deferred_fds(),
-        MAX_DEFERRED_FDS + 2
+        MAX_DEFERRED_FDS + 1
     );
 
     lock_conn.execute_batch("ROLLBACK;").unwrap();
     drop(lock_conn);
     drop(ro_a);
+    assert!(reg.lock().unwrap().deferred_fds.is_empty());
+    assert_preflight_exclusive_lock(&db_a, false);
+
+    // Phase 2: journal-probe inode-swap race at 64 retains fd (65) + lock; header probe refuses before open.
+    let ro_a2 = saturate_registry_for_reader_only_state(reg, dir.path(), &db_a, &db_b);
+    let lock_conn2 = rusqlite::Connection::open(&db_a).unwrap();
+    lock_conn2.execute_batch("BEGIN IMMEDIATE;").unwrap();
+    assert_preflight_exclusive_lock(&db_a, true);
+    let j_res = probe_rollback_journal_open_with_opener(reg, &journal_new, false, |path| {
+        fs::remove_file(path)?;
+        fs::hard_link(&db_a, path)?;
+        open_no_follow_read_only(path)
+    });
+    assert_deferred_fd_cap_err(j_res);
+    assert_preflight_exclusive_lock(&db_a, true);
+    assert_eq!(
+        reg.lock().unwrap().total_deferred_fds(),
+        MAX_DEFERRED_FDS + 1
+    );
+    {
+        let mut state = reg.lock().unwrap();
+        let calls_before = raw_open_calls();
+        assert_deferred_fd_cap_err(inspect_sqlite_header_locked(&mut state, &db_new2));
+        assert_eq!(raw_open_calls(), calls_before);
+        assert_eq!(state.total_deferred_fds(), MAX_DEFERRED_FDS + 1);
+    }
+    assert_preflight_exclusive_lock(&db_a, true);
+
+    lock_conn2.execute_batch("ROLLBACK;").unwrap();
+    drop(lock_conn2);
+    drop(ro_a2);
     assert!(reg.lock().unwrap().deferred_fds.is_empty());
     assert_preflight_exclusive_lock(&db_a, false);
 }

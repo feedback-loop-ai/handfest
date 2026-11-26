@@ -121,11 +121,15 @@ impl ActiveHandleRegistry {
 
     #[cfg(unix)]
     fn ensure_deferred_fd_capacity(&self, key: Option<(u64, u64)>) -> Result<(), LedgerError> {
+        let total = self.total_deferred_fds();
+        if total > MAX_DEFERRED_FDS {
+            return Err(Self::deferred_fd_cap_error());
+        }
         let will_defer = match key {
             Some(id) => self.should_defer_inode(id),
             None => self.active_writers > 0,
         };
-        if will_defer && self.total_deferred_fds() >= MAX_DEFERRED_FDS {
+        if will_defer && total >= MAX_DEFERRED_FDS {
             return Err(Self::deferred_fd_cap_error());
         }
         Ok(())
@@ -210,8 +214,10 @@ impl Drop for PendingWriterGuard {
 /// deferred in `deferred_fds` by `(st_dev, st_ino)` (reusing the first retained `File` via
 /// `SeekFrom::Start(0)` and appending duplicates) whenever `active_writers > 0`, the probed inode
 /// is currently tracked in `counts`, or the inode is already retained in `deferred_fds` (never
-/// dropping a protected fd even if an inode-swap race lands at `MAX_DEFERRED_FDS`). With
-/// `active_writers == 0`, uncounted non-deferred header/journal probes
+/// dropping a protected fd even if an inode-swap race lands at `MAX_DEFERRED_FDS`, then refusing
+/// all further uncached raw opens while `total_deferred_fds() > MAX_DEFERRED_FDS` so the pool is
+/// hard-capped at `MAX_DEFERRED_FDS + 1`). With `active_writers == 0` and
+/// `total_deferred_fds() <= MAX_DEFERRED_FDS`, uncounted non-deferred header/journal probes
 /// close immediately so a long-lived reader never exhausts the fd cap. `deferred_fds` is cleared
 /// only when BOTH `active_writers == 0` and `counts.is_empty()` (never removing individual entries
 /// while any handle remains active, so an fd retained for an inode holding an external POSIX lock
