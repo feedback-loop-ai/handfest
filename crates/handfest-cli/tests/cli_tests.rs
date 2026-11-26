@@ -1020,6 +1020,9 @@ fn check_require_existing_ledger_rejects_readonly_0444_ledger_with_storage_error
     // time with exit 1 and `"code": "storage_error"`.
     let _restore = RestoreMode(ledger.clone());
     fs::set_permissions(&ledger, fs::Permissions::from_mode(0o444)).unwrap();
+    if fs::OpenOptions::new().write(true).open(&ledger).is_ok() {
+        return;
+    }
 
     let out = run_check_on_ledger(&signed_path, &agent_key, &ledger, true);
     assert_existing_ledger_open_error(&out, "storage_error", "read-only 0444 ledger");

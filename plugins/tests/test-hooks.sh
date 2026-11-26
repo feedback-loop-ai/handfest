@@ -626,8 +626,8 @@ assert_eq "decimal bare sci quota rc" "$HOOK_RC" "2"
 assert_json "decimal bare sci quota stderr" "$(cat "$TMP_DIR/stderr.txt")" "d['verdict'] == 'deny' and d['code'] == 'mandate_denied'"
 assert_json "decimal bare sci formatted" "$(cat "$CAPTURED_FACTS")" "d['resource.amount'] == {'decimal': '15.0'}"
 
-# Reject integer-like typed decimal strings without '.', leading-zero decimals ("00.5"), quoted scientific notation "1.5e1", pathological exponents, raw fractional scale > 28, i128::MAX+1, and i128::MIN-1
-for bad_amt in '"1"' '"-1"' '"0"' '"00.5"' '"-00.5"' '"01.5"' '"1.5e1"' '1e1000000' '"1e1000000"' '"0.00000000000000000000000000001"' "\"$OVER_SCALE_ONE_ZEROS\"" "\"$OVER_SCALE_ZERO_ZEROS\"" "\"$LONG_ZEROS\"" '"170141183460469231731687303715884105728.0"' '"-170141183460469231731687303715884105729.0"'; do
+# Reject integer-like typed decimal strings without '.', leading-zero decimals ("00.5"), negative zero (-0.0, -0.00, -0, -0e0), quoted scientific notation "1.5e1", pathological exponents, raw fractional scale > 28, i128::MAX+1, and i128::MIN-1
+for bad_amt in '"1"' '"-1"' '"0"' '"00.5"' '"-00.5"' '"01.5"' '"-0.0"' '"-0.00"' '-0.0' '-0.00' '-0' '-0e0' '"1.5e1"' '1e1000000' '"1e1000000"' '"0.00000000000000000000000000001"' "\"$OVER_SCALE_ONE_ZEROS\"" "\"$OVER_SCALE_ZERO_ZEROS\"" "\"$LONG_ZEROS\"" '"170141183460469231731687303715884105728.0"' '"-170141183460469231731687303715884105729.0"'; do
   HOOK_RC=0
   HANDFEST_POLICY_MAP="$PAY_MAP" HANDFEST_LEDGER="$PAY_LEDGER" HANDFEST_CHAIN="$PAY_SIGNED" \
     "$HOOK" <<<"{\"tool_name\":\"charge_card\",\"tool_input\":{\"currency\":\"USD\",\"approved\":true,\"scheduled_at\":\"2026-11-24T18:30:00Z\",\"amount\":$bad_amt}}" \
@@ -635,7 +635,34 @@ for bad_amt in '"1"' '"-1"' '"0"' '"00.5"' '"-00.5"' '"01.5"' '"1.5e1"' '1e10000
   assert_eq "bad decimal $bad_amt rc" "$HOOK_RC" "2"
   assert_json "bad decimal $bad_amt stderr" "$(cat "$TMP_DIR/stderr.txt")" "d['verdict'] == 'deny' and d['code'] == 'invalid_argument'"
 done
-pass "static_resource_id + PascalCase types + canonical decimal normalization, scale<=28, and i128 bounds verified"
+
+# Reject negative zero in static_facts {"decimal": "-0.0"} and integer tool argument -0
+NEG_ZERO_MAP="$TMP_DIR/neg-zero-map.json"
+cat <<'NEG_ZERO_MAP_EOF' >"$NEG_ZERO_MAP"
+{
+  "tools": {
+    "charge_card": {
+      "action": "billing.charge",
+      "resource_kind": "account",
+      "static_resource_id": "acct-prod",
+      "static_facts": {
+        "resource.amount": { "decimal": "-0.0" }
+      }
+    }
+  }
+}
+NEG_ZERO_MAP_EOF
+HOOK_RC=0
+HANDFEST_POLICY_MAP="$NEG_ZERO_MAP" HANDFEST_LEDGER="$PAY_LEDGER" HANDFEST_CHAIN="$PAY_SIGNED" \
+  "$HOOK" <<<'{"tool_name":"charge_card","tool_input":{}}' \
+  >"$TMP_DIR/stdout.txt" 2>"$TMP_DIR/stderr.txt" || HOOK_RC=$?
+assert_eq "static_facts negative zero decimal rc" "$HOOK_RC" "2"
+assert_json "static_facts negative zero decimal stderr" "$(cat "$TMP_DIR/stderr.txt")" "d['verdict'] == 'deny' and d['code'] == 'invalid_policy_map' and 'negative zero' in d['reason']"
+
+run_hook '{"tool_name":"merge_pull_request","tool_input":{"owner":"feedback-loop-ai","repo":"handfest","pullNumber":-0}}'
+assert_eq "negative zero int arg rc" "$HOOK_RC" "2"
+assert_json "negative zero int arg stderr" "$(cat "$TMP_DIR/stderr.txt")" "d['verdict'] == 'deny' and d['code'] == 'invalid_argument' and 'negative zero' in d['reason']"
+pass "static_resource_id + PascalCase types + canonical decimal normalization, no-negative-zero, scale<=28, and i128 bounds verified"
 
 # Test 20: Defense-in-depth: broken gate exiting 0 without Permit JSON OR malformed receipt_hash fails closed
 FAKE_BIN="$TMP_DIR/fake-handfest"

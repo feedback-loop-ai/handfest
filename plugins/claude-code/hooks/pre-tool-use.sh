@@ -192,6 +192,8 @@ def parse_strict_json(raw: str, code: str, ctx: str):
 def parse_i64(raw: RawNumber, code: str, ctx: str) -> int:
     if any(c in raw for c in (".", "e", "E")):
         raise HookError(code, f"{ctx}: expected 64-bit signed integer")
+    if raw == "-0":
+        raise HookError(code, f"{ctx}: negative zero integer '-0' is not allowed")
     if len(raw) > 21:
         raise HookError(code, f"{ctx}: integer outside 64-bit signed range")
     n = int(raw, 10)
@@ -242,6 +244,8 @@ def parse_decimal(raw: str, code: str, ctx: str, allow_exponent: bool = False) -
         raise HookError(code, f"{ctx}: decimal fractional scale exceeds {MAX_DEC_SCALE} '{raw}'")
     digits = (int_digits + frac_digits).lstrip("0")
     if not digits:
+        if neg:
+            raise HookError(code, f"{ctx}: negative zero decimal '{raw}' is not allowed")
         return "0.0"
     exp = parse_decimal_exp(exp_str, raw, code, ctx) if exp_str is not None else 0
     trimmed = digits.rstrip("0")

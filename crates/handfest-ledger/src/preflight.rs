@@ -2,8 +2,12 @@
 //! tracking.
 
 use std::collections::BTreeMap;
+#[cfg(unix)]
+use std::collections::HashMap;
 use std::fs::{self, File};
 use std::io::{self, Read};
+#[cfg(unix)]
+use std::io::{Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard, OnceLock, PoisonError};
 use std::time::{Duration, Instant};
@@ -16,29 +20,92 @@ const ROLLBACK_JOURNAL_HDR_LEN: usize = 28;
 const HOT_JOURNAL_RETRY_BUDGET: Duration = Duration::from_millis(500);
 const HOT_JOURNAL_INITIAL_BACKOFF: Duration = Duration::from_millis(2);
 const HOT_JOURNAL_MAX_BACKOFF: Duration = Duration::from_millis(100);
+#[cfg(unix)]
 const MAX_DEFERRED_FDS: usize = 64;
 
-#[cfg(all(
+#[cfg(unix)]
+const O_NOFOLLOW: Option<i32> = if cfg!(all(
+    target_os = "linux",
+    any(
+        target_arch = "arm",
+        target_arch = "aarch64",
+        target_arch = "powerpc",
+        target_arch = "powerpc64",
+        target_arch = "m68k"
+    )
+)) {
+    Some(0o100_000) // 0x8000
+} else if cfg!(all(
     target_os = "linux",
     any(
         target_arch = "x86_64",
         target_arch = "x86",
+        target_arch = "riscv32",
         target_arch = "riscv64",
-        target_arch = "s390x"
+        target_arch = "s390x",
+        target_arch = "loongarch64",
+        target_arch = "mips",
+        target_arch = "mips64",
+        target_arch = "sparc",
+        target_arch = "sparc64"
     )
-))]
-const O_NOFOLLOW: i32 = 0x20000;
-
-#[cfg(all(target_os = "linux", any(target_arch = "aarch64", target_arch = "arm")))]
-const O_NOFOLLOW: i32 = 0x10000;
-
-#[cfg(any(
+)) {
+    Some(0o400_000) // 0x20000
+} else if cfg!(any(
     target_os = "macos",
+    target_os = "ios",
     target_os = "freebsd",
     target_os = "openbsd",
-    target_os = "netbsd"
-))]
-const O_NOFOLLOW: i32 = 0x0100;
+    target_os = "netbsd",
+    target_os = "dragonfly"
+)) {
+    Some(0x0100)
+} else {
+    None
+};
+
+#[cfg(unix)]
+const O_NONBLOCK: Option<i32> = if cfg!(all(
+    target_os = "linux",
+    any(
+        target_arch = "x86_64",
+        target_arch = "x86",
+        target_arch = "aarch64",
+        target_arch = "arm",
+        target_arch = "riscv32",
+        target_arch = "riscv64",
+        target_arch = "powerpc",
+        target_arch = "powerpc64",
+        target_arch = "s390x",
+        target_arch = "loongarch64"
+    )
+)) {
+    Some(0o4000) // 0x800
+} else if cfg!(any(
+    target_os = "macos",
+    target_os = "ios",
+    target_os = "freebsd",
+    target_os = "openbsd",
+    target_os = "netbsd",
+    target_os = "dragonfly"
+)) {
+    Some(0x0004)
+} else {
+    None
+};
+
+#[cfg(unix)]
+const fn combine_unix_open_flags(no_follow: Option<i32>, non_block: Option<i32>) -> i32 {
+    let nf = match no_follow {
+        Some(flag) => flag,
+        None => 0,
+    };
+    let nb = match non_block {
+        Some(flag) => flag,
+        None => 0,
+    };
+    nf | nb
+}
 
 /// Process-local file identity for POSIX `fcntl` lock preservation.
 ///
@@ -84,20 +151,24 @@ impl FileIdentity {
 struct ActiveHandleRegistry {
     counts: BTreeMap<FileIdentity, usize>,
     active_writers: usize,
-    deferred_fds: Vec<File>,
+    #[cfg(unix)]
+    deferred_fds: HashMap<(u64, u64), File>,
 }
 
 impl ActiveHandleRegistry {
+    #[cfg(unix)]
     fn has_active_handles(&self) -> bool {
         self.active_writers > 0 || !self.counts.is_empty()
     }
 
     fn maybe_clear_deferred_fds(&mut self) {
+        #[cfg(unix)]
         if !self.has_active_handles() {
             self.deferred_fds.clear();
         }
     }
 
+    #[cfg(unix)]
     fn ensure_deferred_fd_capacity(&self) -> Result<(), LedgerError> {
         if self.has_active_handles() && self.deferred_fds.len() >= MAX_DEFERRED_FDS {
             return Err(LedgerError::Storage(format!(
@@ -107,18 +178,37 @@ impl ActiveHandleRegistry {
         Ok(())
     }
 
-    fn maybe_defer_fd(&mut self, file: File) -> Result<(), LedgerError> {
+    #[cfg(unix)]
+    fn maybe_defer_fd(&mut self, key: (u64, u64), file: File) -> Result<(), LedgerError> {
         if !self.has_active_handles() {
             drop(file);
             return Ok(());
         }
-        if self.deferred_fds.len() >= MAX_DEFERRED_FDS {
+        if !self.deferred_fds.contains_key(&key) && self.deferred_fds.len() >= MAX_DEFERRED_FDS {
             return Err(LedgerError::Storage(format!(
                 "deferred raw-open fd cap ({MAX_DEFERRED_FDS}) reached while ledger handles are active"
             )));
         }
-        self.deferred_fds.push(file);
+        self.deferred_fds.entry(key).or_insert(file);
         Ok(())
+    }
+
+    #[cfg(unix)]
+    fn maybe_defer_regular_file(&mut self, file: File) -> Result<(), LedgerError> {
+        use std::os::unix::fs::MetadataExt;
+        if !self.has_active_handles() {
+            drop(file);
+            return Ok(());
+        }
+        let Ok(fstat) = file.metadata() else {
+            drop(file);
+            return Ok(());
+        };
+        if !fstat.is_file() {
+            drop(file);
+            return Ok(());
+        }
+        self.maybe_defer_fd((fstat.dev(), fstat.ino()), file)
     }
 
     fn decrement_writer(&mut self) {
@@ -175,10 +265,11 @@ impl Drop for PendingWriterGuard {
 /// While at least one handle is open on a given inode in this process (`refcount > 0`),
 /// `open_read_only_guarded` skips raw `std::fs::File::open` on the main DB inode so POSIX
 /// `close()` never drops in-process `fcntl` SHARED/RESERVED/EXCLUSIVE locks across hard links or
-/// concurrent readers. While ANY writable OR read-only handle is active
-/// (`active_writers > 0 || !counts.is_empty()`), every raw `File` opened for header inspection or
-/// rollback-journal probing is retained (never reused) in `deferred_fds` and only closed once BOTH
-/// `active_writers == 0` and `counts.is_empty()`.
+/// concurrent readers. On Unix, while ANY writable OR read-only handle is active
+/// (`active_writers > 0 || !counts.is_empty()`), every regular-file `File` opened for header
+/// inspection or rollback-journal probing is retained in `deferred_fds` keyed by `(st_dev, st_ino)`
+/// (rewound via `SeekFrom::Start(0)` on repeated inspections of the same live inode) and only
+/// closed once BOTH `active_writers == 0` and `counts.is_empty()`.
 pub(crate) struct ActiveHandleGuard {
     registry: &'static Mutex<ActiveHandleRegistry>,
     id: FileIdentity,
@@ -213,7 +304,7 @@ pub(crate) fn active_handle_count(canonical: &Path) -> usize {
     state.counts.get(&id).copied().unwrap_or(0)
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 pub(crate) fn active_writer_count() -> usize {
     let state = active_handles()
         .lock()
@@ -221,7 +312,7 @@ pub(crate) fn active_writer_count() -> usize {
     state.active_writers
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 pub(crate) fn deferred_fd_count() -> usize {
     let state = active_handles()
         .lock()
@@ -315,7 +406,7 @@ where
 }
 
 fn stat_read_only_regular_file(canonical: &Path) -> Result<fs::Metadata, LedgerError> {
-    let meta = fs::metadata(canonical).map_err(|err| {
+    let meta = fs::symlink_metadata(canonical).map_err(|err| {
         LedgerError::Integrity(format!(
             "failed to stat read-only ledger '{}': {err}",
             canonical.display()
@@ -323,6 +414,19 @@ fn stat_read_only_regular_file(canonical: &Path) -> Result<fs::Metadata, LedgerE
     })?;
     validate_regular_ledger_metadata(&meta, canonical)?;
     Ok(meta)
+}
+
+#[cfg(unix)]
+fn cached_deferred_fd<'a>(
+    state: &'a mut ActiveHandleRegistry,
+    path: &Path,
+) -> Option<&'a mut File> {
+    use std::os::unix::fs::MetadataExt;
+    let meta = fs::symlink_metadata(path).ok()?;
+    if !meta.file_type().is_file() {
+        return None;
+    }
+    state.deferred_fds.get_mut(&(meta.dev(), meta.ino()))
 }
 
 fn validate_regular_ledger_metadata(
@@ -349,15 +453,31 @@ fn inspect_sqlite_header_locked(
     state: &mut ActiveHandleRegistry,
     canonical: &Path,
 ) -> Result<FileIdentity, LedgerError> {
+    #[cfg(unix)]
+    if let Some(cached) = cached_deferred_fd(state, canonical) {
+        cached.seek(SeekFrom::Start(0)).map_err(|err| {
+            LedgerError::Integrity(format!(
+                "failed to rewind cached read-only ledger '{}': {err}",
+                canonical.display()
+            ))
+        })?;
+        return inspect_sqlite_header_from_file(cached, canonical);
+    }
+
+    #[cfg(unix)]
     state.ensure_deferred_fd_capacity()?;
-    let mut file = File::open(canonical).map_err(|err| {
+    #[cfg(not(unix))]
+    let _ = state;
+
+    let mut file = open_no_follow_read_only(canonical).map_err(|err| {
         LedgerError::Integrity(format!(
             "failed to open read-only ledger '{}': {err}",
             canonical.display()
         ))
     })?;
     let res = inspect_sqlite_header_from_file(&mut file, canonical);
-    state.maybe_defer_fd(file)?;
+    #[cfg(unix)]
+    state.maybe_defer_regular_file(file)?;
     res
 }
 
@@ -422,6 +542,7 @@ fn check_wal_sidecar(wal_path: &Path) -> Result<(), LedgerError> {
     Ok(())
 }
 
+#[derive(Debug)]
 enum JournalProbe {
     Clean,
     Hot,
@@ -466,9 +587,23 @@ fn open_no_follow_read_only(path: &Path) -> io::Result<File> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
-        opts.custom_flags(O_NOFOLLOW);
+        opts.custom_flags(combine_unix_open_flags(O_NOFOLLOW, O_NONBLOCK));
     }
     opts.open(path)
+}
+
+fn reject_symlink_without_o_nofollow(
+    has_o_nofollow: bool,
+    is_symlink: bool,
+    journal_path: &Path,
+) -> Result<(), LedgerError> {
+    if !has_o_nofollow && is_symlink {
+        return Err(LedgerError::Integrity(format!(
+            "symlink rollback journal '{}' is forbidden",
+            journal_path.display()
+        )));
+    }
+    Ok(())
 }
 
 fn probe_rollback_journal_once(
@@ -485,26 +620,60 @@ fn probe_rollback_journal_once(
             )));
         }
     };
-    if meta.file_type().is_symlink() {
-        return Err(LedgerError::Integrity(format!(
-            "symlink rollback journal '{}' is forbidden",
-            journal_path.display()
-        )));
+    let is_symlink = meta.file_type().is_symlink();
+    if meta.file_type().is_file() && meta.len() == 0 {
+        return Ok(JournalProbe::Clean);
     }
-    if !meta.file_type().is_file() {
+    #[cfg(unix)]
+    let has_o_nofollow = O_NOFOLLOW.is_some();
+    #[cfg(not(unix))]
+    let has_o_nofollow = false;
+    reject_symlink_without_o_nofollow(has_o_nofollow, is_symlink, journal_path)?;
+    if !is_symlink && !meta.file_type().is_file() {
         return Err(LedgerError::Integrity(format!(
             "invalid non-file rollback journal '{}'",
             journal_path.display()
         )));
     }
-    if meta.len() == 0 {
-        return Ok(JournalProbe::Clean);
-    }
+    probe_rollback_journal_open(registry, journal_path, is_symlink)
+}
+
+fn probe_rollback_journal_open(
+    registry: &Mutex<ActiveHandleRegistry>,
+    journal_path: &Path,
+    is_symlink: bool,
+) -> Result<JournalProbe, LedgerError> {
+    #[cfg(unix)]
     let mut state = registry.lock().unwrap_or_else(PoisonError::into_inner);
+    #[cfg(not(unix))]
+    let _ = registry;
+
+    #[cfg(unix)]
+    if !is_symlink {
+        if let Some(cached) = cached_deferred_fd(&mut state, journal_path) {
+            cached.seek(SeekFrom::Start(0)).map_err(|err| {
+                LedgerError::Integrity(format!(
+                    "cannot rewind cached rollback journal '{}': {err}",
+                    journal_path.display()
+                ))
+            })?;
+            return read_rollback_journal_from_file(cached, journal_path);
+        }
+    }
+
+    #[cfg(unix)]
     state.ensure_deferred_fd_capacity()?;
     let mut file = match open_no_follow_read_only(journal_path) {
         Ok(file) => file,
-        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(JournalProbe::Clean),
+        Err(err) if !is_symlink && err.kind() == io::ErrorKind::NotFound => {
+            return Ok(JournalProbe::Clean);
+        }
+        Err(err) if is_symlink => {
+            return Err(LedgerError::Integrity(format!(
+                "symlink rollback journal '{}' is forbidden: {err}",
+                journal_path.display()
+            )));
+        }
         Err(err) => {
             return Err(LedgerError::Integrity(format!(
                 "cannot read non-empty rollback journal '{}': {err}",
@@ -513,7 +682,8 @@ fn probe_rollback_journal_once(
         }
     };
     let probe = read_rollback_journal_from_file(&mut file, journal_path);
-    state.maybe_defer_fd(file)?;
+    #[cfg(unix)]
+    state.maybe_defer_regular_file(file)?;
     probe
 }
 

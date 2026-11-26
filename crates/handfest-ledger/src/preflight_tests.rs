@@ -180,8 +180,9 @@ fn transient_rollback_journal_retry_succeeds_when_journal_clears_and_fails_when_
     ));
 }
 
+#[cfg(unix)]
 #[test]
-fn deferred_fds_never_reuse_handles_retain_for_readers_and_clear_only_when_all_drop() {
+fn deferred_fds_deduplicate_by_inode_read_live_contents_and_clear_only_when_all_drop() {
     static REG: OnceLock<Mutex<ActiveHandleRegistry>> = OnceLock::new();
     let reg = REG.get_or_init(|| Mutex::new(ActiveHandleRegistry::default()));
 
@@ -198,24 +199,41 @@ fn deferred_fds_never_reuse_handles_retain_for_readers_and_clear_only_when_all_d
     .unwrap();
     assert!(reg.lock().unwrap().deferred_fds.is_empty());
 
-    // Each unindexed raw open pushes a fresh File (never reused).
+    // Repeated raw inspections of the same inode deduplicate to 1 deferred fd.
     let canonical_moved = fs::canonicalize(&moved).unwrap();
     let ((), ro1) = open_read_only_guarded_in(reg, &canonical_moved, |_| Ok(())).unwrap();
     assert_eq!(reg.lock().unwrap().deferred_fds.len(), 1);
     drop(ro1);
 
     let ((), ro2) = open_read_only_guarded_in(reg, &canonical_moved, |_| Ok(())).unwrap();
-    assert_eq!(reg.lock().unwrap().deferred_fds.len(), 2);
+    assert_eq!(reg.lock().unwrap().deferred_fds.len(), 1);
 
-    // Journal probe while handles are active also defers its fd; failed header inspect too.
-    let bad_magic = dir.path().join("bad_magic_deferred.sqlite");
-    fs::write(&bad_magic, [0u8; SQLITE_HEADER_LEN]).unwrap();
-    let canonical_bad = fs::canonicalize(&bad_magic).unwrap();
+    // Distinct regular-file inode with bad magic adds a second deferred fd, and rewinding it reads
+    // live in-place updates on the same inode.
+    let mutating = dir.path().join("mutating_deferred.sqlite");
+    fs::write(&mutating, [0u8; SQLITE_HEADER_LEN]).unwrap();
+    let canonical_mut = fs::canonicalize(&mutating).unwrap();
     assert!(matches!(
-        open_read_only_guarded_in(reg, &canonical_bad, |_| Ok(())),
+        open_read_only_guarded_in(reg, &canonical_mut, |_| Ok(())),
         Err(LedgerError::Integrity(_))
     ));
-    assert_eq!(reg.lock().unwrap().deferred_fds.len(), 3);
+    assert_eq!(reg.lock().unwrap().deferred_fds.len(), 2);
+
+    write_valid_header_file(&canonical_mut);
+    let ((), ro_mut) = open_read_only_guarded_in(reg, &canonical_mut, |_| Ok(())).unwrap();
+    assert_eq!(reg.lock().unwrap().deferred_fds.len(), 2);
+    drop(ro_mut);
+
+    let mut wal_hdr = [0u8; SQLITE_HEADER_LEN];
+    wal_hdr[..SQLITE_HEADER_MAGIC.len()].copy_from_slice(SQLITE_HEADER_MAGIC);
+    wal_hdr[18] = 2;
+    wal_hdr[19] = 2;
+    fs::write(&canonical_mut, wal_hdr).unwrap();
+    assert!(matches!(
+        open_read_only_guarded_in(reg, &canonical_mut, |_| Ok(())),
+        Err(LedgerError::Integrity(ref m)) if m.contains("WAL")
+    ));
+    assert_eq!(reg.lock().unwrap().deferred_fds.len(), 2);
 
     // Dropping writer while ro2 is STILL active MUST NOT clear deferred_fds.
     drop(writer_guard);
@@ -223,7 +241,7 @@ fn deferred_fds_never_reuse_handles_retain_for_readers_and_clear_only_when_all_d
         let state = reg.lock().unwrap();
         assert_eq!(state.active_writers, 0);
         assert!(!state.counts.is_empty());
-        assert_eq!(state.deferred_fds.len(), 3);
+        assert_eq!(state.deferred_fds.len(), 2);
     }
 
     // Only dropping the very last handle (ro2) clears deferred_fds.
@@ -256,31 +274,47 @@ fn open_writable_guarded_error_and_deferred_fd_cap_fail_closed() {
     assert!(matches!(err, Err(LedgerError::Storage(_))));
     assert_eq!(reg.lock().unwrap().active_writers, 0);
 
-    let ((), writer_guard) = open_writable_guarded_in(reg, &writer_path, || Ok(())).unwrap();
-    let target = write_valid_header_file(&dir.path().join("ro_target.sqlite"));
-    for _ in 0..MAX_DEFERRED_FDS {
-        let ((), ro) = open_read_only_guarded_in(reg, &target, |_| Ok(())).unwrap();
-        drop(ro);
+    #[cfg(unix)]
+    {
+        let ((), writer_guard) = open_writable_guarded_in(reg, &writer_path, || Ok(())).unwrap();
+        let mut first_target = None;
+        for i in 0..MAX_DEFERRED_FDS {
+            let target = write_valid_header_file(&dir.path().join(format!("ro_target_{i}.sqlite")));
+            if first_target.is_none() {
+                first_target = Some(target.clone());
+            }
+            let ((), ro) = open_read_only_guarded_in(reg, &target, |_| Ok(())).unwrap();
+            drop(ro);
+        }
+        assert_eq!(reg.lock().unwrap().deferred_fds.len(), MAX_DEFERRED_FDS);
+
+        // Already-cached inode reuses its deferred fd even at the distinct-inode cap.
+        let ((), ro_cached) =
+            open_read_only_guarded_in(reg, first_target.as_ref().unwrap(), |_| Ok(())).unwrap();
+        drop(ro_cached);
+        assert_eq!(reg.lock().unwrap().deferred_fds.len(), MAX_DEFERRED_FDS);
+
+        // Next distinct inode fails closed with Storage BEFORE opening another fd.
+        let overflow = write_valid_header_file(&dir.path().join("ro_target_overflow.sqlite"));
+        assert!(matches!(
+            open_read_only_guarded_in(reg, &overflow, |_| Ok(())),
+            Err(LedgerError::Storage(_))
+        ));
+        // Direct maybe_defer_fd cap guard also fails closed with Storage on a new distinct inode key.
+        let extra_file = File::open(&overflow).unwrap();
+        assert!(matches!(
+            reg.lock()
+                .unwrap()
+                .maybe_defer_fd((u64::MAX, u64::MAX), extra_file),
+            Err(LedgerError::Storage(_))
+        ));
+
+        drop(writer_guard);
+        assert!(reg.lock().unwrap().deferred_fds.is_empty());
+        let ((), ro_after) = open_read_only_guarded_in(reg, &overflow, |_| Ok(())).unwrap();
+        drop(ro_after);
+        assert!(reg.lock().unwrap().deferred_fds.is_empty());
     }
-    assert_eq!(reg.lock().unwrap().deferred_fds.len(), MAX_DEFERRED_FDS);
-
-    // Next raw open fails closed with Storage BEFORE opening another fd.
-    assert!(matches!(
-        open_read_only_guarded_in(reg, &target, |_| Ok(())),
-        Err(LedgerError::Storage(_))
-    ));
-    // Direct maybe_defer_fd cap guard also fails closed with Storage.
-    let extra_file = File::open(&target).unwrap();
-    assert!(matches!(
-        reg.lock().unwrap().maybe_defer_fd(extra_file),
-        Err(LedgerError::Storage(_))
-    ));
-
-    drop(writer_guard);
-    assert!(reg.lock().unwrap().deferred_fds.is_empty());
-    let ((), ro_after) = open_read_only_guarded_in(reg, &target, |_| Ok(())).unwrap();
-    drop(ro_after);
-    assert!(reg.lock().unwrap().deferred_fds.is_empty());
 }
 #[cfg(unix)]
 #[test]
@@ -330,6 +364,7 @@ fn open_no_follow_read_only_rejects_symlinks_atomically() {
     );
 }
 
+#[cfg(unix)]
 #[test]
 fn reader_only_deferred_fds_retain_with_zero_writers_and_clear_on_reader_drop() {
     static REG: OnceLock<Mutex<ActiveHandleRegistry>> = OnceLock::new();
@@ -365,4 +400,124 @@ fn reader_only_deferred_fds_retain_with_zero_writers_and_clear_on_reader_drop() 
         assert!(state.counts.is_empty());
         assert!(state.deferred_fds.is_empty());
     }
+}
+
+#[cfg(unix)]
+#[test]
+fn unix_open_flags_combination_and_symlink_fallback_guard() {
+    assert_eq!(combine_unix_open_flags(Some(0x20000), Some(0x800)), 0x20800);
+    assert_eq!(combine_unix_open_flags(Some(0x8000), None), 0x8000);
+    assert_eq!(combine_unix_open_flags(None, Some(0x0004)), 0x0004);
+    assert_eq!(combine_unix_open_flags(None, None), 0);
+
+    let p = Path::new("/tmp/fake.sqlite-journal");
+    assert!(matches!(
+        reject_symlink_without_o_nofollow(false, true, p),
+        Err(LedgerError::Integrity(ref m)) if m.contains("symlink")
+    ));
+    reject_symlink_without_o_nofollow(true, true, p).unwrap();
+    reject_symlink_without_o_nofollow(false, false, p).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn post_open_non_file_guards_and_nonblock_fifo_reject_without_blocking() {
+    use std::process::Command;
+
+    let dir = TempDir::new().unwrap();
+    let mut reg = ActiveHandleRegistry {
+        active_writers: 1,
+        ..Default::default()
+    };
+
+    // 1. Direct post-open !meta.is_file() guard in read_rollback_journal_from_file on /dev/null.
+    let dev_null = Path::new("/dev/null");
+    let mut null_file = File::open(dev_null).unwrap();
+    let jrnl_err = read_rollback_journal_from_file(&mut null_file, dev_null).unwrap_err();
+    assert!(
+        matches!(&jrnl_err, LedgerError::Integrity(m) if m.contains("invalid non-file")),
+        "expected invalid non-file error from read_rollback_journal_from_file, got: {jrnl_err:?}"
+    );
+
+    // 2. Direct post-open !meta.is_file() guard in inspect_sqlite_header_locked on /dev/null.
+    let hdr_null_err = inspect_sqlite_header_locked(&mut reg, dev_null).unwrap_err();
+    assert!(
+        matches!(&hdr_null_err, LedgerError::Integrity(m) if m.contains("not a regular file")),
+        "expected not a regular file error from inspect_sqlite_header_locked(/dev/null), got: {hdr_null_err:?}"
+    );
+    assert!(
+        reg.deferred_fds.is_empty(),
+        "non-regular file must never be inserted into deferred_fds"
+    );
+
+    // 3. Writerless FIFO: O_NONBLOCK ensures open returns immediately (no deadlock under mutex)
+    //    and post-open !meta.is_file() rejects it cleanly in both header and journal helpers.
+    let fifo = dir.path().join("writerless.fifo");
+    let mkfifo_status = Command::new("mkfifo").arg(&fifo).status().unwrap();
+    assert!(mkfifo_status.success(), "mkfifo must succeed");
+
+    let hdr_fifo_err = inspect_sqlite_header_locked(&mut reg, &fifo).unwrap_err();
+    assert!(
+        matches!(&hdr_fifo_err, LedgerError::Integrity(m) if m.contains("not a regular file")),
+        "expected not a regular file error on writerless FIFO, got: {hdr_fifo_err:?}"
+    );
+    assert!(reg.deferred_fds.is_empty());
+
+    let mut fifo_file = open_no_follow_read_only(&fifo).unwrap();
+    let jrnl_fifo_err = read_rollback_journal_from_file(&mut fifo_file, &fifo).unwrap_err();
+    assert!(
+        matches!(&jrnl_fifo_err, LedgerError::Integrity(m) if m.contains("invalid non-file")),
+        "expected invalid non-file error on writerless FIFO journal, got: {jrnl_fifo_err:?}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn probe_rollback_journal_once_and_header_inspect_reject_symlinks_via_o_nofollow() {
+    use std::os::unix::fs::symlink;
+
+    let dir = TempDir::new().unwrap();
+    let reg = Mutex::new(ActiveHandleRegistry::default());
+
+    // Target is a 32-byte all-zero regular file (which read_rollback_journal_from_file would treat
+    // as JournalProbe::Clean if followed!). Calling probe_rollback_journal_once directly on a
+    // symlink to it proves production probing uses open_no_follow_read_only (O_NOFOLLOW).
+    let zero_target = dir.path().join("zero_target.journal");
+    fs::write(&zero_target, [0u8; 32]).unwrap();
+    let sym_journal = dir.path().join("sym.sqlite-journal");
+    symlink(&zero_target, &sym_journal).unwrap();
+
+    let sym_err = probe_rollback_journal_once(&reg, &sym_journal).unwrap_err();
+    assert!(
+        matches!(&sym_err, LedgerError::Integrity(m) if m.contains("symlink")),
+        "expected symlink Integrity error from probe_rollback_journal_once, got: {sym_err:?}"
+    );
+
+    // Dangling symlink must also fail with Integrity (never Clean/NotFound).
+    let dangling = dir.path().join("dangling.sqlite-journal");
+    symlink(dir.path().join("missing_target.journal"), &dangling).unwrap();
+    let dangling_err = probe_rollback_journal_once(&reg, &dangling).unwrap_err();
+    assert!(
+        matches!(&dangling_err, LedgerError::Integrity(m) if m.contains("symlink")),
+        "expected symlink Integrity error on dangling journal symlink, got: {dangling_err:?}"
+    );
+
+    // Replacing canonical with a symlink is rejected both by stat_read_only_regular_file
+    // (fs::symlink_metadata) and atomically by inspect_sqlite_header_locked (O_NOFOLLOW).
+    let valid_db = write_valid_header_file(&dir.path().join("valid_target.sqlite"));
+    let sym_db = dir.path().join("sym_canonical.sqlite");
+    symlink(&valid_db, &sym_db).unwrap();
+
+    let stat_err = stat_read_only_regular_file(&sym_db).unwrap_err();
+    assert!(
+        matches!(&stat_err, LedgerError::Integrity(m) if m.contains("not a regular file")),
+        "expected not a regular file error from stat_read_only_regular_file on symlink, got: {stat_err:?}"
+    );
+
+    let mut reg_state = ActiveHandleRegistry::default();
+    let hdr_err = inspect_sqlite_header_locked(&mut reg_state, &sym_db).unwrap_err();
+    assert!(
+        matches!(hdr_err, LedgerError::Integrity(_)),
+        "expected Integrity error from inspect_sqlite_header_locked on symlink, got: {hdr_err:?}"
+    );
 }

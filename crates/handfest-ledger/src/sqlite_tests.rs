@@ -6,7 +6,9 @@ use handfest_core::gate::VerifiedAnchorProof;
 use handfest_core::AssuranceLevel;
 use tempfile::TempDir;
 
-use crate::preflight::{active_handle_count, active_writer_count, deferred_fd_count};
+use crate::preflight::active_handle_count;
+#[cfg(unix)]
+use crate::preflight::{active_writer_count, deferred_fd_count};
 
 use super::*;
 
@@ -577,6 +579,9 @@ fn open_existing_and_open_reject_read_only_0444_file_at_open_time() {
 
     let _restore = RestoreMode(db_path.clone());
     fs::set_permissions(&db_path, fs::Permissions::from_mode(0o444)).unwrap();
+    if fs::OpenOptions::new().write(true).open(&db_path).is_ok() {
+        return;
+    }
 
     let err_existing = SqliteLedger::open_existing(&db_path).unwrap_err();
     assert!(
@@ -657,10 +662,30 @@ fn reader_only_deferred_fd_child_helper() {
 }
 
 #[cfg(unix)]
-#[test]
-fn reader_only_deferred_fd_retains_and_preserves_shared_lock_with_zero_writers() {
+fn run_isolated_child_test(test_name: &str, env_key: &str, dir: &Path) {
     use std::process::Command;
 
+    let exe = std::env::current_exe().expect("current test exe");
+    let output = Command::new(&exe)
+        .args(["--exact", test_name, "--quiet"])
+        .env(env_key, dir)
+        .output()
+        .expect("spawn isolated child test");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "{test_name} child failed\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(
+        stdout.contains("1 passed"),
+        "{test_name} child did not execute helper test; stdout:\n{stdout}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn reader_only_deferred_fd_retains_and_preserves_shared_lock_with_zero_writers() {
     let dir = TempDir::new().unwrap();
     let (chain, req, facts, now) = sample_chain_and_req();
     for name in [
@@ -671,43 +696,29 @@ fn reader_only_deferred_fd_retains_and_preserves_shared_lock_with_zero_writers()
         let mut w = SqliteLedger::open(dir.path().join(name)).unwrap();
         w.evaluate_and_record(&chain, &req, &facts, now).unwrap();
     }
-
-    let exe = std::env::current_exe().expect("current test exe");
-    let output = Command::new(&exe)
-        .args([
-            "--exact",
-            "sqlite::tests::reader_only_deferred_fd_child_helper",
-            "--quiet",
-        ])
-        .env("HANDFEST_READER_ONLY_DEFERRED_DIR", dir.path())
-        .output()
-        .expect("spawn reader-only child");
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        output.status.success(),
-        "reader-only deferred-fd child failed\nstdout:\n{stdout}\nstderr:\n{stderr}"
-    );
-    assert!(
-        stdout.contains("1 passed"),
-        "reader-only deferred-fd child did not execute helper test; stdout:\n{stdout}"
+    run_isolated_child_test(
+        "sqlite::tests::reader_only_deferred_fd_child_helper",
+        "HANDFEST_READER_ONLY_DEFERRED_DIR",
+        dir.path(),
     );
 }
 
 #[cfg(unix)]
 #[test]
-fn tracked_open_existing_conn_preserves_lock_across_rename() {
-    let dir = TempDir::new().unwrap();
-    let db_path = dir.path().join("tracked_rename.sqlite");
-    let renamed = dir.path().join("tracked_rename_moved.sqlite");
+fn tracked_open_existing_rename_child_helper() {
+    let Ok(dir_str) = std::env::var("HANDFEST_TRACKED_RENAME_DIR") else {
+        return;
+    };
+    let dir = std::path::PathBuf::from(dir_str);
+    let db_path = dir.join("tracked_rename.sqlite");
+    let renamed = dir.join("tracked_rename_moved.sqlite");
     let (chain, req, facts, now) = sample_chain_and_req();
-    {
-        let mut init = SqliteLedger::open(&db_path).unwrap();
-        init.evaluate_and_record(&chain, &req, &facts, now).unwrap();
-    }
 
+    assert_eq!(active_writer_count(), 0);
+    assert_eq!(deferred_fd_count(), 0);
     {
         let writer = SqliteLedger::open_existing(&db_path).unwrap();
+        assert_eq!(active_writer_count(), 1);
         writer.conn.execute_batch("BEGIN IMMEDIATE;").unwrap();
 
         fs::rename(&db_path, &renamed).unwrap();
@@ -729,27 +740,47 @@ fn tracked_open_existing_conn_preserves_lock_across_rename() {
         assert_cross_process_exclusive_lock(&renamed, true);
         writer.conn.execute_batch("ROLLBACK;").unwrap();
     }
+    assert_eq!(active_writer_count(), 0);
+    assert_eq!(deferred_fd_count(), 0);
     assert_cross_process_exclusive_lock(&renamed, false);
 }
 
 #[cfg(unix)]
 #[test]
-fn tracked_open_existing_conn_preserves_lock_across_journal_sidecars() {
-    use std::os::unix::fs::symlink;
-
+fn tracked_open_existing_conn_preserves_lock_across_rename() {
     let dir = TempDir::new().unwrap();
-    let active_db = dir.path().join("tracked_sidecar_active.sqlite");
-    let victim_db = dir.path().join("tracked_sidecar_victim.sqlite");
-    let victim_journal = dir.path().join("tracked_sidecar_victim.sqlite-journal");
-    let victim_wal = dir.path().join("tracked_sidecar_victim.sqlite-wal");
+    let db_path = dir.path().join("tracked_rename.sqlite");
     let (chain, req, facts, now) = sample_chain_and_req();
-    for path in [&active_db, &victim_db] {
-        let mut init = SqliteLedger::open(path).unwrap();
+    {
+        let mut init = SqliteLedger::open(&db_path).unwrap();
         init.evaluate_and_record(&chain, &req, &facts, now).unwrap();
     }
+    run_isolated_child_test(
+        "sqlite::tests::tracked_open_existing_rename_child_helper",
+        "HANDFEST_TRACKED_RENAME_DIR",
+        dir.path(),
+    );
+}
 
+#[cfg(unix)]
+#[test]
+fn tracked_open_existing_sidecar_child_helper() {
+    use std::os::unix::fs::symlink;
+
+    let Ok(dir_str) = std::env::var("HANDFEST_TRACKED_SIDECAR_DIR") else {
+        return;
+    };
+    let dir = std::path::PathBuf::from(dir_str);
+    let active_db = dir.join("tracked_sidecar_active.sqlite");
+    let victim_db = dir.join("tracked_sidecar_victim.sqlite");
+    let victim_journal = dir.join("tracked_sidecar_victim.sqlite-journal");
+    let victim_wal = dir.join("tracked_sidecar_victim.sqlite-wal");
+
+    assert_eq!(active_writer_count(), 0);
+    assert_eq!(deferred_fd_count(), 0);
     {
         let writer = SqliteLedger::open_existing(&active_db).unwrap();
+        assert_eq!(active_writer_count(), 1);
         writer.conn.execute_batch("BEGIN IMMEDIATE;").unwrap();
 
         symlink(&active_db, &victim_journal).unwrap();
@@ -781,5 +812,72 @@ fn tracked_open_existing_conn_preserves_lock_across_journal_sidecars() {
 
         writer.conn.execute_batch("ROLLBACK;").unwrap();
     }
+    assert_eq!(active_writer_count(), 0);
+    assert_eq!(deferred_fd_count(), 0);
     assert_cross_process_exclusive_lock(&active_db, false);
+}
+
+#[cfg(unix)]
+#[test]
+fn tracked_open_existing_conn_preserves_lock_across_journal_sidecars() {
+    let dir = TempDir::new().unwrap();
+    let active_db = dir.path().join("tracked_sidecar_active.sqlite");
+    let victim_db = dir.path().join("tracked_sidecar_victim.sqlite");
+    let (chain, req, facts, now) = sample_chain_and_req();
+    for path in [&active_db, &victim_db] {
+        let mut init = SqliteLedger::open(path).unwrap();
+        init.evaluate_and_record(&chain, &req, &facts, now).unwrap();
+    }
+    run_isolated_child_test(
+        "sqlite::tests::tracked_open_existing_sidecar_child_helper",
+        "HANDFEST_TRACKED_SIDECAR_DIR",
+        dir.path(),
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn repeated_audits_dedup_child_helper() {
+    let Ok(dir_str) = std::env::var("HANDFEST_REPEATED_AUDIT_DEDUP_DIR") else {
+        return;
+    };
+    let dir = std::path::PathBuf::from(dir_str);
+    let db_a = dir.join("dedup_a.sqlite");
+    let db_b = dir.join("dedup_b.sqlite");
+
+    assert_eq!(active_writer_count(), 0);
+    assert_eq!(deferred_fd_count(), 0);
+    {
+        let _writer_a = SqliteLedger::open_existing(&db_a).unwrap();
+        assert_eq!(active_writer_count(), 1);
+        for i in 0..70 {
+            let ro_b = SqliteLedger::open_read_only(&db_b)
+                .unwrap_or_else(|err| panic!("audit #{i} on db_b failed: {err:?}"));
+            assert_eq!(ro_b.verify_integrity().unwrap(), 1);
+            assert_eq!(
+                deferred_fd_count(),
+                1,
+                "repeated audits on db_b must deduplicate to 1 deferred fd (iteration {i})"
+            );
+        }
+        assert_eq!(deferred_fd_count(), 1);
+    }
+    assert_eq!(active_writer_count(), 0);
+    assert_eq!(deferred_fd_count(), 0);
+}
+
+#[cfg(unix)]
+#[test]
+fn repeated_audits_on_ledger_b_while_writer_a_open_deduplicate_deferred_fd() {
+    let dir = TempDir::new().unwrap();
+    let (chain, req, facts, now) = sample_chain_and_req();
+    for name in ["dedup_a.sqlite", "dedup_b.sqlite"] {
+        let mut init = SqliteLedger::open(dir.path().join(name)).unwrap();
+        init.evaluate_and_record(&chain, &req, &facts, now).unwrap();
+    }
+    run_isolated_child_test(
+        "sqlite::tests::repeated_audits_dedup_child_helper",
+        "HANDFEST_REPEATED_AUDIT_DEDUP_DIR",
+        dir.path(),
+    );
 }
