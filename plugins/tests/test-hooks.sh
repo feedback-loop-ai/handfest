@@ -626,8 +626,8 @@ assert_eq "decimal bare sci quota rc" "$HOOK_RC" "2"
 assert_json "decimal bare sci quota stderr" "$(cat "$TMP_DIR/stderr.txt")" "d['verdict'] == 'deny' and d['code'] == 'mandate_denied'"
 assert_json "decimal bare sci formatted" "$(cat "$CAPTURED_FACTS")" "d['resource.amount'] == {'decimal': '15.0'}"
 
-# Reject quoted scientific notation "1.5e1", pathological bare/quoted exponents, raw fractional scale > 28 (including trailing zeros), i128::MAX+1, and i128::MIN-1
-for bad_amt in '"1.5e1"' '1e1000000' '"1e1000000"' '"0.00000000000000000000000000001"' "\"$OVER_SCALE_ONE_ZEROS\"" "\"$OVER_SCALE_ZERO_ZEROS\"" "\"$LONG_ZEROS\"" '"170141183460469231731687303715884105728"' '"-170141183460469231731687303715884105729"'; do
+# Reject integer-like typed decimal strings without '.', quoted scientific notation "1.5e1", pathological exponents, raw fractional scale > 28, i128::MAX+1, and i128::MIN-1
+for bad_amt in '"1"' '"-1"' '"0"' '"1.5e1"' '1e1000000' '"1e1000000"' '"0.00000000000000000000000000001"' "\"$OVER_SCALE_ONE_ZEROS\"" "\"$OVER_SCALE_ZERO_ZEROS\"" "\"$LONG_ZEROS\"" '"170141183460469231731687303715884105728.0"' '"-170141183460469231731687303715884105729.0"'; do
   HOOK_RC=0
   HANDFEST_POLICY_MAP="$PAY_MAP" HANDFEST_LEDGER="$PAY_LEDGER" HANDFEST_CHAIN="$PAY_SIGNED" \
     "$HOOK" <<<"{\"tool_name\":\"charge_card\",\"tool_input\":{\"currency\":\"USD\",\"approved\":true,\"scheduled_at\":\"2026-11-24T18:30:00Z\",\"amount\":$bad_amt}}" \
@@ -956,27 +956,37 @@ HANDFEST_LEDGER="$DEL_LEDGER" "$HOOK" <<<"$VALID_PAYLOAD" >"$TMP_DIR/stdout.txt"
 assert_eq "quota-reset call 3 exhausted rc" "$HOOK_RC" "2"
 assert_strict_rfc8259_json_line "quota-reset call 3 exhausted stderr" "$TMP_DIR/stderr.txt" "d['verdict'] == 'deny' and d['code'] == 'mandate_denied' and 'quota' in d['reason'].lower()"
 
-# (a) Truncating exhausted ledger to 0 bytes must fail closed (exit 2) and NOT reset quota or initialize tables
+# (a) Truncating exhausted ledger to 0 bytes must fail closed (gate_error, exit 2) and NOT reset quota or initialize tables
 : > "$DEL_LEDGER"
 HOOK_RC=0
 HANDFEST_LEDGER="$DEL_LEDGER" "$HOOK" <<<"$VALID_PAYLOAD" >"$TMP_DIR/stdout.txt" 2>"$TMP_DIR/stderr.txt" || HOOK_RC=$?
 assert_eq "0-byte truncated ledger rc" "$HOOK_RC" "2"
-assert_strict_rfc8259_json_line "0-byte truncated ledger stderr" "$TMP_DIR/stderr.txt" "d['verdict'] == 'deny' and d['code'] == 'missing_ledger'"
+assert_strict_rfc8259_json_line "0-byte truncated ledger stderr" "$TMP_DIR/stderr.txt" "d['verdict'] == 'deny' and d['code'] == 'gate_error'"
 ZERO_SIZE="$(python3 -I -c 'import os, sys; print(os.path.getsize(sys.argv[1]))' "$DEL_LEDGER")"
 assert_eq "0-byte ledger remained 0 bytes" "$ZERO_SIZE" "0"
 
 # (b) Replacing exhausted ledger with an empty SQLite DB (valid header, no Handfest tables) must fail closed
-#     with exit 2 and NOT initialize fresh tables or reset quota
+#     with gate_error (exit 2) and NOT initialize fresh tables or reset quota
 rm -f "$DEL_LEDGER"
 python3 -I -c 'import sqlite3, sys; c = sqlite3.connect(sys.argv[1]); c.execute("VACUUM"); c.close()' "$DEL_LEDGER"
 HOOK_RC=0
 HANDFEST_LEDGER="$DEL_LEDGER" "$HOOK" <<<"$VALID_PAYLOAD" >"$TMP_DIR/stdout.txt" 2>"$TMP_DIR/stderr.txt" || HOOK_RC=$?
 assert_eq "empty-schema sqlite ledger rc" "$HOOK_RC" "2"
-assert_strict_rfc8259_json_line "empty-schema sqlite ledger stderr" "$TMP_DIR/stderr.txt" "d['verdict'] == 'deny' and d['code'] == 'missing_ledger'"
+assert_strict_rfc8259_json_line "empty-schema sqlite ledger stderr" "$TMP_DIR/stderr.txt" "d['verdict'] == 'deny' and d['code'] == 'gate_error'"
 SCHEMA_COUNT="$(python3 -I -c 'import sqlite3, sys; c = sqlite3.connect(sys.argv[1]); print(c.execute("SELECT count(*) FROM sqlite_master").fetchone()[0]); c.close()' "$DEL_LEDGER")"
 assert_eq "empty-schema sqlite remained uninitialized" "$SCHEMA_COUNT" "0"
 
-# (c) Deleting ledger must fail closed (exit 2) and NOT recreate it
+# (c) Corrupt non-SQLite ledger must fail closed (gate_error, exit 2) without modifying the file
+rm -f "$DEL_LEDGER"
+python3 -I -c 'import pathlib, sys; pathlib.Path(sys.argv[1]).write_bytes(b"X" * 256)' "$DEL_LEDGER"
+HOOK_RC=0
+HANDFEST_LEDGER="$DEL_LEDGER" "$HOOK" <<<"$VALID_PAYLOAD" >"$TMP_DIR/stdout.txt" 2>"$TMP_DIR/stderr.txt" || HOOK_RC=$?
+assert_eq "corrupt ledger rc" "$HOOK_RC" "2"
+assert_strict_rfc8259_json_line "corrupt ledger stderr" "$TMP_DIR/stderr.txt" "d['verdict'] == 'deny' and d['code'] == 'gate_error'"
+CORRUPT_OK="$(python3 -I -c 'import pathlib, sys; print(pathlib.Path(sys.argv[1]).read_bytes() == b"X" * 256)' "$DEL_LEDGER")"
+assert_eq "corrupt ledger untouched" "$CORRUPT_OK" "True"
+
+# (d) Deleting ledger must fail closed (missing_ledger, exit 2) and NOT recreate it
 rm -f "$DEL_LEDGER"
 HOOK_RC=0
 HANDFEST_LEDGER="$DEL_LEDGER" "$HOOK" <<<"$VALID_PAYLOAD" >"$TMP_DIR/stdout.txt" 2>"$TMP_DIR/stderr.txt" || HOOK_RC=$?

@@ -765,14 +765,11 @@ fn minimal_empty_sqlite_db_bytes() -> Vec<u8> {
     page
 }
 
-#[test]
-fn check_require_existing_ledger_rejects_missing_zero_byte_and_empty_schema_and_accepts_initialized(
-) {
-    let dir = TempDir::new().unwrap();
-    let (root_key_path, root_key) = keygen_to(dir.path(), "root.key.json");
-    let (_agent_key_path, agent_key) = keygen_to(dir.path(), "agent.key.json");
+fn setup_merge_mandate_fixture(dir: &Path) -> (PathBuf, String) {
+    let (root_key_path, root_key) = keygen_to(dir, "root.key.json");
+    let (_agent_key_path, agent_key) = keygen_to(dir, "agent.key.json");
 
-    let mandate_path = dir.path().join("root.hf");
+    let mandate_path = dir.join("root.hf");
     fs::write(
         &mandate_path,
         format!(
@@ -790,7 +787,7 @@ fn check_require_existing_ledger_rejects_missing_zero_byte_and_empty_schema_and_
         ),
     )
     .unwrap();
-    let signed_path = dir.path().join("root.signed.json");
+    let signed_path = dir.join("root.signed.json");
     sign_to(
         &mandate_path,
         &root_key_path,
@@ -798,34 +795,46 @@ fn check_require_existing_ledger_rejects_missing_zero_byte_and_empty_schema_and_
         "2026-11-26T00:00:00Z",
         &signed_path,
     );
+    (signed_path, agent_key)
+}
 
-    let check_with_flag = |ledger: &Path, require_existing: bool| {
-        let mut args = vec![
-            "check",
-            "--ledger",
-            path_str(ledger),
-            "--chain",
-            path_str(&signed_path),
-            "--actor-key",
-            &agent_key,
-            "--action",
-            "git.pr.merge",
-            "--resource-kind",
-            "repo",
-            "--resource-id",
-            "feedback-loop-ai/handfest",
-            "--now",
-            "2026-11-24T12:00:00Z",
-        ];
-        if require_existing {
-            args.push("--require-existing-ledger");
-        }
-        run_raw(&args)
-    };
+fn run_check_on_ledger(
+    signed_path: &Path,
+    agent_key: &str,
+    ledger: &Path,
+    require_existing: bool,
+) -> Output {
+    let mut args = vec![
+        "check",
+        "--ledger",
+        path_str(ledger),
+        "--chain",
+        path_str(signed_path),
+        "--actor-key",
+        agent_key,
+        "--action",
+        "git.pr.merge",
+        "--resource-kind",
+        "repo",
+        "--resource-id",
+        "feedback-loop-ai/handfest",
+        "--now",
+        "2026-11-24T12:00:00Z",
+    ];
+    if require_existing {
+        args.push("--require-existing-ledger");
+    }
+    run_raw(&args)
+}
+
+#[test]
+fn check_require_existing_ledger_rejects_missing_zero_byte_and_empty_schema() {
+    let dir = TempDir::new().unwrap();
+    let (signed_path, agent_key) = setup_merge_mandate_fixture(dir.path());
 
     // 1. Missing ledger fails closed without creating the file.
     let missing = dir.path().join("missing.sqlite");
-    let out = check_with_flag(&missing, true);
+    let out = run_check_on_ledger(&signed_path, &agent_key, &missing, true);
     assert!(!out.status.success(), "missing ledger must fail closed");
     assert!(
         String::from_utf8_lossy(&out.stderr).contains("failed to open ledger"),
@@ -837,7 +846,7 @@ fn check_require_existing_ledger_rejects_missing_zero_byte_and_empty_schema_and_
     // 2. 0-byte ledger fails closed without initializing tables.
     let zero_byte = dir.path().join("zero.sqlite");
     fs::write(&zero_byte, b"").unwrap();
-    let out = check_with_flag(&zero_byte, true);
+    let out = run_check_on_ledger(&signed_path, &agent_key, &zero_byte, true);
     assert!(!out.status.success(), "0-byte ledger must fail closed");
     assert!(
         String::from_utf8_lossy(&out.stderr).contains("failed to open ledger"),
@@ -854,7 +863,7 @@ fn check_require_existing_ledger_rejects_missing_zero_byte_and_empty_schema_and_
     let empty_schema = dir.path().join("empty_schema.sqlite");
     let empty_bytes = minimal_empty_sqlite_db_bytes();
     fs::write(&empty_schema, &empty_bytes).unwrap();
-    let out = check_with_flag(&empty_schema, true);
+    let out = run_check_on_ledger(&signed_path, &agent_key, &empty_schema, true);
     assert!(
         !out.status.success(),
         "empty-schema SQLite DB must fail closed under --require-existing-ledger"
@@ -869,10 +878,18 @@ fn check_require_existing_ledger_rejects_missing_zero_byte_and_empty_schema_and_
         empty_bytes,
         "empty-schema SQLite DB must not be modified or initialized"
     );
+}
 
-    // 4. Without --require-existing-ledger, that same empty-schema SQLite DB initializes cleanly,
-    //    and subsequent --require-existing-ledger checks succeed on the initialized ledger.
-    let init_out = check_with_flag(&empty_schema, false);
+#[test]
+fn check_require_existing_ledger_accepts_initialized_ledger_and_audits() {
+    let dir = TempDir::new().unwrap();
+    let (signed_path, agent_key) = setup_merge_mandate_fixture(dir.path());
+    let empty_schema = dir.path().join("empty_schema.sqlite");
+    fs::write(&empty_schema, minimal_empty_sqlite_db_bytes()).unwrap();
+
+    // Without --require-existing-ledger, an empty-schema SQLite DB initializes cleanly,
+    // and subsequent --require-existing-ledger checks succeed on the initialized ledger.
+    let init_out = run_check_on_ledger(&signed_path, &agent_key, &empty_schema, false);
     assert!(
         init_out.status.success(),
         "initial check without --require-existing-ledger failed: {}",
@@ -881,7 +898,7 @@ fn check_require_existing_ledger_rejects_missing_zero_byte_and_empty_schema_and_
     let init_json: Value = serde_json::from_slice(&init_out.stdout).unwrap();
     assert_eq!(init_json["verdict"], "permit");
 
-    let existing_out = check_with_flag(&empty_schema, true);
+    let existing_out = run_check_on_ledger(&signed_path, &agent_key, &empty_schema, true);
     assert!(
         existing_out.status.success(),
         "check with --require-existing-ledger on initialized ledger failed: {}",

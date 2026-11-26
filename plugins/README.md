@@ -4,7 +4,7 @@ Thin, declarative, configuration-over-code integrations for vesting bounded `HAN
 
 > **Prerequisites & binary availability:**
 > - The `handfest` CLI (`handfest keygen`, `fmt`, `sign`, `verify`, `check`, `audit`) ships in this workspace (`crates/handfest-cli`).
-> - The `handfest-mcp` stdio JSON-RPC 2.0 proxy (`crates/handfest-mcp`, provided by the `feat/slice-3-handfest-mcp` crate) is built from the workspace with `cargo build --release -p handfest-mcp`; the `mcp.example.json` and `codex/config.example.toml` templates target its CLI contract.
+> - The `handfest-mcp` stdio JSON-RPC 2.0 proxy (`crates/handfest-mcp`) is built from the workspace with `cargo build --release -p handfest-mcp`; running that command requires a checkout containing the `handfest-mcp` workspace crate (provided by the companion `feat/slice-3-handfest-mcp` branch/PR once merged into `main`). The `mcp.example.json` and `codex/config.example.toml` templates target its CLI contract.
 > - **Python 3.10+** (`python3`, standard library only, invoked via `python3 -I` isolated mode) is required on `PATH` to run `plugins/claude-code/hooks/pre-tool-use.sh`, and **Python 3.11+** (standard library only, including `tomllib`) is required to run `plugins/tests/test-hooks.sh`.
 
 ## Architecture & Trust Boundary

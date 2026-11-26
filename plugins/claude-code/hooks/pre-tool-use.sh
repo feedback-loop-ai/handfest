@@ -37,7 +37,7 @@ import datetime, json, os, re, shutil, subprocess, unicodedata
 IDENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_-]*\Z", re.ASCII)
 RFC3339_RE = re.compile(r"^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})Z\Z", re.ASCII)
 DECIMAL_NUM_RE = re.compile(r"^-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?\Z", re.ASCII)
-DECIMAL_STR_RE = re.compile(r"^-?\d+(?:\.\d+)?\Z", re.ASCII)
+DECIMAL_STR_RE = re.compile(r"^-?\d+\.\d+\Z", re.ASCII)
 RECEIPT_HASH_RE = re.compile(r"^sha256:[0-9a-f]{64}\Z", re.ASCII)
 I64_MIN, I64_MAX = -(1 << 63), (1 << 63) - 1
 I128_MIN, I128_MAX = -(1 << 127), (1 << 127) - 1
@@ -551,7 +551,7 @@ def parse_gate_deny(stdout_bytes: bytes) -> tuple[str, str | None] | None:
     return reason_str, rhash
 
 
-def handle_gate_result(proc: subprocess.CompletedProcess, require_existing_ledger: bool) -> None:
+def handle_gate_result(proc: subprocess.CompletedProcess) -> None:
     if proc.returncode == 0:
         try:
             stdout_text = proc.stdout.decode("utf-8", errors="strict")
@@ -575,8 +575,6 @@ def handle_gate_result(proc: subprocess.CompletedProcess, require_existing_ledge
 
     stderr_text = proc.stderr.decode("utf-8", errors="replace")
     detail = (stderr_text or stdout_text or f"exit status {proc.returncode}").strip()
-    if require_existing_ledger and "failed to open ledger" in stderr_text:
-        raise HookError("missing_ledger", detail)
     raise HookError("gate_error", detail)
 
 
@@ -602,6 +600,11 @@ def main() -> None:
     resource_id, facts = extract_resource_and_facts(tool_name, tool_input, pol)
 
     require_existing_ledger = not allow_create_ledger
+    if require_existing_ledger and not os.path.exists(ledger_path):
+        raise HookError(
+            "missing_ledger",
+            f"HANDFEST_LEDGER '{ledger_path}' does not exist; initialize it first or set HANDFEST_ALLOW_CREATE_LEDGER=1",
+        )
     cmd = [
         handfest_bin, "check",
         f"--ledger={ledger_path}",
@@ -620,7 +623,7 @@ def main() -> None:
     except OSError as exc:
         raise HookError("gate_error", f"failed to invoke handfest check: {exc}")
 
-    handle_gate_result(proc, require_existing_ledger)
+    handle_gate_result(proc)
 
 
 try:

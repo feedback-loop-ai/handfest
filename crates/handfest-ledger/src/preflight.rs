@@ -155,6 +155,23 @@ where
         inspect_sqlite_header(&canonical)?;
     }
     let conn = open_conn(&canonical)?;
+    let post_id = match FileIdentity::from_path(&canonical) {
+        Ok(post_id) => post_id,
+        Err(err) => {
+            drop(conn);
+            return Err(LedgerError::Integrity(format!(
+                "existing ledger '{}' disappeared or became inaccessible after open: {err}",
+                canonical.display()
+            )));
+        }
+    };
+    if post_id != id {
+        drop(conn);
+        return Err(LedgerError::Integrity(format!(
+            "existing ledger '{}' was replaced concurrently during open",
+            canonical.display()
+        )));
+    }
     *map.entry(id.clone()).or_insert(0) += 1;
     Ok((conn, ActiveHandleGuard(id)))
 }
@@ -498,5 +515,87 @@ mod tests {
             check_rollback_journal_sidecar_with_budget(&stuck, Duration::from_millis(15)),
             Err(LedgerError::Integrity(_))
         ));
+    }
+
+    #[test]
+    fn open_existing_writable_guarded_rejects_concurrent_replacement_and_unlink() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+
+        struct DropTracker(Arc<AtomicBool>);
+        impl Drop for DropTracker {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+
+        let write_fake_sqlite = |path: &Path| {
+            let mut fake = [0u8; SQLITE_HEADER_LEN];
+            fake[..SQLITE_HEADER_MAGIC.len()].copy_from_slice(SQLITE_HEADER_MAGIC);
+            fake[18] = 1;
+            fake[19] = 1;
+            fs::write(path, fake).unwrap();
+        };
+
+        let dir = TempDir::new().unwrap();
+
+        #[cfg(unix)]
+        {
+            let target = dir.path().join("replaced.sqlite");
+            let old_alias = dir.path().join("replaced_old_inode.sqlite");
+            let replacement = dir.path().join("replacement.sqlite");
+            write_fake_sqlite(&target);
+            fs::hard_link(&target, &old_alias).unwrap();
+            write_fake_sqlite(&replacement);
+
+            let dropped = Arc::new(AtomicBool::new(false));
+            let dropped_for_cb = Arc::clone(&dropped);
+            let res = open_existing_writable_guarded(&target, |canonical| {
+                fs::rename(&replacement, canonical).unwrap();
+                Ok(DropTracker(dropped_for_cb))
+            });
+            assert!(
+                matches!(res, Err(LedgerError::Integrity(_))),
+                "concurrent pathname replacement must fail closed with LedgerError::Integrity"
+            );
+            assert!(
+                dropped.load(Ordering::SeqCst),
+                "connection handle must be dropped immediately on inode mismatch"
+            );
+            assert_eq!(active_handle_count(&fs::canonicalize(&target).unwrap()), 0);
+            assert_eq!(
+                active_handle_count(&fs::canonicalize(&old_alias).unwrap()),
+                0
+            );
+        }
+
+        let vanished = dir.path().join("vanished.sqlite");
+        write_fake_sqlite(&vanished);
+        #[cfg(unix)]
+        let vanished_old_alias = {
+            let alias = dir.path().join("vanished_old_inode.sqlite");
+            fs::hard_link(&vanished, &alias).unwrap();
+            alias
+        };
+
+        let dropped = Arc::new(AtomicBool::new(false));
+        let dropped_for_cb = Arc::clone(&dropped);
+        let res = open_existing_writable_guarded(&vanished, |canonical| {
+            fs::remove_file(canonical).unwrap();
+            Ok(DropTracker(dropped_for_cb))
+        });
+        assert!(
+            matches!(res, Err(LedgerError::Integrity(_))),
+            "concurrent unlink during open must fail closed with LedgerError::Integrity"
+        );
+        assert!(
+            dropped.load(Ordering::SeqCst),
+            "connection handle must be dropped immediately when path disappears"
+        );
+        #[cfg(unix)]
+        assert_eq!(
+            active_handle_count(&fs::canonicalize(&vanished_old_alias).unwrap()),
+            0
+        );
     }
 }
