@@ -1,0 +1,26 @@
+[package]
+name = "handfest-mcp"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Drop-in MCP stdio JSON-RPC proxy enforcing HANDFEST v1 mandate chains and ledger receipts"
+
+[[bin]]
+name = "handfest-mcp"
+path = "src/main.rs"
+
+[dependencies]
+handfest-core.workspace = true    # internal workspace crate: AST, lattice, gate, and receipts
+handfest-anchors.workspace = true # internal workspace crate: AnchorVerifier trait and Ed25519 verifier
+handfest-ledger.workspace = true  # internal workspace crate: ReceiptLedger trait and SQLite ledger
+clap.workspace = true             # CLI argument parsing for `handfest-mcp` binary (prototyping debt)
+serde.workspace = true            # typed config deserialization for ToolPolicyMap schema (prototyping debt)
+serde_json.workspace = true       # JSON parsing for policy maps and SignedMandate files (prototyping debt)
+
+[dev-dependencies]
+tempfile.workspace = true         # test-only ephemeral directories for SQLite ledger and subprocess tests
+
+[lints]
+workspace = true

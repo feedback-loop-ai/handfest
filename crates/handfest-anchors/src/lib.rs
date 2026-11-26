@@ -1,13 +1,14 @@
 //! Pluggable cryptographic and regulatory trust-anchor verifiers for `handfest`.
 
+use std::collections::BTreeMap;
 use std::fmt;
 
 use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
-use handfest_core::ast::{
-    is_valid_quoted_str, is_valid_timestamp, KeyId, MAX_RFC3339_TIMESTAMP, MIN_RFC3339_TIMESTAMP,
+use handfest_core::ast::{KeyId, MAX_RFC3339_TIMESTAMP, MIN_RFC3339_TIMESTAMP};
+use handfest_core::cnl::{parse_canonical, try_render_canonical, ParseError};
+use handfest_core::gate::{
+    validate_proof_shape, ProofShapeError, VerifiedAnchorProof, VerifiedMandate,
 };
-use handfest_core::cnl::{parse_canonical, ParseError};
-use handfest_core::gate::{VerifiedAnchorProof, VerifiedMandate};
 use handfest_core::ActorKind;
 use rand_core::OsRng;
 use serde::{Deserialize, Serialize};
@@ -17,6 +18,22 @@ pub use handfest_core::AssuranceLevel;
 /// Domain-separation prefix prepended to length-prefixed envelope metadata and canonical
 /// `HANDFEST v1` text before Ed25519 signing.
 pub const SIGNING_DOMAIN_PREFIX: &[u8] = b"handfest-v1-envelope\0";
+
+/// Source of the expected identity value when a verifier proof disagrees with its input.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProofIdentitySource {
+    Envelope,
+    Mandate,
+}
+
+impl ProofIdentitySource {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Envelope => "envelope",
+            Self::Mandate => "mandate FROM",
+        }
+    }
+}
 
 /// Errors returned while loading keys, signing, or verifying trust-anchor envelopes.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -29,7 +46,17 @@ pub enum AnchorError {
         expected: String,
         actual: String,
     },
+    ProofSignerMismatch {
+        source: ProofIdentitySource,
+        expected: String,
+        actual: String,
+    },
     ActorKindMismatch {
+        expected: ActorKind,
+        actual: ActorKind,
+    },
+    ProofActorKindMismatch {
+        source: ProofIdentitySource,
         expected: ActorKind,
         actual: ActorKind,
     },
@@ -45,10 +72,17 @@ pub enum AnchorError {
         valid_from: i64,
         valid_until: i64,
     },
+    ValidityWindowMismatch {
+        expected_from: i64,
+        expected_until: i64,
+        actual_from: i64,
+        actual_until: i64,
+    },
     KeyIdMismatch {
         expected: String,
         actual: String,
     },
+    UnsupportedKeyScheme(String),
     EmptyChain,
     ChainHop {
         hop: usize,
@@ -59,21 +93,39 @@ pub enum AnchorError {
 impl fmt::Display for AnchorError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::InvalidSecretKey(msg) => write!(f, "invalid Ed25519 secret key: {msg}"),
-            Self::InvalidPublicKey(msg) => write!(f, "invalid Ed25519 public key: {msg}"),
-            Self::InvalidSignature(msg) => write!(f, "invalid Ed25519 signature: {msg}"),
+            Self::InvalidSecretKey(msg) => write!(f, "invalid anchor secret key: {msg}"),
+            Self::InvalidPublicKey(msg) => write!(f, "invalid anchor public key: {msg}"),
+            Self::InvalidSignature(msg) => write!(f, "invalid anchor signature: {msg}"),
             Self::NonCanonicalMandate(err) => write!(f, "invalid or non-canonical mandate: {err}"),
             Self::SignerMismatch { expected, actual } => {
                 write!(f, "signer key mismatch: mandate FROM is '{expected}', envelope has '{actual}'")
             }
+            Self::ProofSignerMismatch {
+                source,
+                expected,
+                actual,
+            } => write!(
+                f,
+                "signer key mismatch: {} is '{expected}', proof has '{actual}'",
+                source.label()
+            ),
             Self::ActorKindMismatch { expected, actual } => {
                 write!(f, "actor kind mismatch: mandate FROM is {expected:?}, envelope has {actual:?}")
             }
+            Self::ProofActorKindMismatch {
+                source,
+                expected,
+                actual,
+            } => write!(
+                f,
+                "actor kind mismatch: {} is {expected:?}, proof has {actual:?}",
+                source.label()
+            ),
             Self::InvalidActorKind(raw) => write!(f, "unknown actor kind '{raw}'"),
             Self::InvalidAssurance(raw) => write!(f, "unknown assurance level '{raw}'"),
             Self::UnsupportedAssurance { expected, actual } => write!(
                 f,
-                "unsupported assurance level for Ed25519 verifier: expected {expected:?}, got {actual:?}"
+                "unsupported assurance level: expected {expected:?}, got {actual:?}"
             ),
             Self::InvalidAnchorId(msg) => write!(f, "invalid anchor_id: {msg}"),
             Self::InvalidTimestamp(ts) => write!(
@@ -87,8 +139,20 @@ impl fmt::Display for AnchorError {
                 f,
                 "invalid validity window [{valid_from}..{valid_until}): valid_from must be less than or equal to valid_until"
             ),
+            Self::ValidityWindowMismatch {
+                expected_from,
+                expected_until,
+                actual_from,
+                actual_until,
+            } => write!(
+                f,
+                "validity window mismatch: envelope has [{expected_from}..{expected_until}), proof has [{actual_from}..{actual_until})"
+            ),
             Self::KeyIdMismatch { expected, actual } => {
                 write!(f, "key_id mismatch in key file: derived '{expected}', file has '{actual}'")
+            }
+            Self::UnsupportedKeyScheme(scheme) => {
+                write!(f, "unsupported anchor key scheme '{scheme}'")
             }
             Self::EmptyChain => f.write_str("mandate chain must contain at least one mandate"),
             Self::ChainHop { hop, source } => write!(f, "chain hop {hop}: {source}"),
@@ -226,8 +290,7 @@ impl Ed25519Keypair {
     ) -> Result<SignedMandate, AnchorError> {
         let ast = parse_canonical(canonical_words).map_err(AnchorError::NonCanonicalMandate)?;
         let anchor_id = anchor_id.into();
-        validate_anchor_id(&anchor_id)?;
-        validate_validity_window(valid_from, valid_until)?;
+        validate_proof_shape(&anchor_id, valid_from, valid_until).map_err(map_proof_shape_error)?;
 
         let my_key_id = self.key_id();
         if ast.from().key() != &my_key_id {
@@ -269,11 +332,162 @@ impl AnchorVerifier for Ed25519Verifier {
     }
 }
 
+/// Additive registry mapping `KeyId` schemes to pluggable [`AnchorVerifier`] implementations.
+///
+/// Fails closed with [`AnchorError::UnsupportedKeyScheme`] for any unregistered scheme and
+/// [`AnchorError::InvalidPublicKey`] for malformed `signer_key` values.
+#[derive(Default)]
+pub struct AnchorRegistry {
+    verifiers: BTreeMap<String, Box<dyn AnchorVerifier + Send + Sync>>,
+}
+
+impl fmt::Debug for AnchorRegistry {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let schemes: Vec<&str> = self.verifiers.keys().map(String::as_str).collect();
+        f.debug_struct("AnchorRegistry")
+            .field("schemes", &schemes)
+            .finish()
+    }
+}
+
+impl AnchorRegistry {
+    /// Creates an empty, fail-closed [`AnchorRegistry`].
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Creates a registry pre-populated with the built-in trust-anchor verifiers (`ed25519`).
+    #[must_use]
+    pub fn default_registry() -> Self {
+        let mut registry = Self::new();
+        registry.register("ed25519", Ed25519Verifier);
+        registry
+    }
+
+    /// Registers a verifier for `KeyId` `scheme`, replacing any prior verifier for that scheme.
+    pub fn register<V>(&mut self, scheme: impl Into<String>, verifier: V) -> &mut Self
+    where
+        V: AnchorVerifier + Send + Sync + 'static,
+    {
+        self.verifiers.insert(scheme.into(), Box::new(verifier));
+        self
+    }
+}
+
+impl AnchorVerifier for AnchorRegistry {
+    fn verify(&self, signed: &SignedMandate) -> Result<VerifiedMandate, AnchorError> {
+        let key_id = KeyId::parse(&signed.signer_key).map_err(|err| {
+            AnchorError::InvalidPublicKey(format!("invalid KeyId '{}': {err}", signed.signer_key))
+        })?;
+        let verifier = self
+            .verifiers
+            .get(key_id.scheme())
+            .ok_or_else(|| AnchorError::UnsupportedKeyScheme(key_id.scheme().to_string()))?;
+        let vm = verifier.verify(signed)?;
+        verify_verifier_postconditions(signed, &vm)?;
+        Ok(vm)
+    }
+}
+
+/// Enforces the Liskov substitution postconditions required of every [`AnchorVerifier`] output:
+/// proof identity, actor kind, assurance level, valid `anchor_id`, RFC 3339 validity window
+/// (`valid_from <= valid_until`) matching the signed envelope, and canonical AST equality.
+pub fn verify_verifier_postconditions(
+    signed: &SignedMandate,
+    vm: &VerifiedMandate,
+) -> Result<(), AnchorError> {
+    let expected_key = KeyId::parse(&signed.signer_key).map_err(|err| {
+        AnchorError::InvalidPublicKey(format!("invalid KeyId '{}': {err}", signed.signer_key))
+    })?;
+    enforce_proof_identity_postconditions(signed, &expected_key, vm)?;
+    enforce_proof_window_and_ast_postconditions(signed, vm)?;
+    Ok(())
+}
+
+fn enforce_proof_identity_postconditions(
+    signed: &SignedMandate,
+    expected_key: &KeyId,
+    vm: &VerifiedMandate,
+) -> Result<(), AnchorError> {
+    if &vm.proof.signer_key != expected_key {
+        return Err(AnchorError::ProofSignerMismatch {
+            source: ProofIdentitySource::Envelope,
+            expected: expected_key.to_string(),
+            actual: vm.proof.signer_key.to_string(),
+        });
+    }
+    if &vm.proof.signer_key != vm.ast.from().key() {
+        return Err(AnchorError::ProofSignerMismatch {
+            source: ProofIdentitySource::Mandate,
+            expected: vm.ast.from().key().to_string(),
+            actual: vm.proof.signer_key.to_string(),
+        });
+    }
+    let expected_actor_kind = parse_actor_kind(&signed.actor_kind)?;
+    if vm.proof.actor_kind != expected_actor_kind {
+        return Err(AnchorError::ProofActorKindMismatch {
+            source: ProofIdentitySource::Envelope,
+            expected: expected_actor_kind,
+            actual: vm.proof.actor_kind,
+        });
+    }
+    if vm.proof.actor_kind != vm.ast.from().kind() {
+        return Err(AnchorError::ProofActorKindMismatch {
+            source: ProofIdentitySource::Mandate,
+            expected: vm.ast.from().kind(),
+            actual: vm.proof.actor_kind,
+        });
+    }
+    let expected_assurance = parse_assurance(&signed.assurance)?;
+    if vm.proof.assurance != expected_assurance {
+        return Err(AnchorError::UnsupportedAssurance {
+            expected: expected_assurance,
+            actual: vm.proof.assurance,
+        });
+    }
+    validate_proof_shape(
+        &vm.proof.anchor_id,
+        vm.proof.valid_from,
+        vm.proof.valid_until,
+    )
+    .map_err(map_proof_shape_error)?;
+    if vm.proof.anchor_id != signed.anchor_id {
+        return Err(AnchorError::InvalidAnchorId(format!(
+            "proof anchor_id '{}' does not match envelope '{}'",
+            vm.proof.anchor_id, signed.anchor_id
+        )));
+    }
+    Ok(())
+}
+
+fn enforce_proof_window_and_ast_postconditions(
+    signed: &SignedMandate,
+    vm: &VerifiedMandate,
+) -> Result<(), AnchorError> {
+    if vm.proof.valid_from != signed.valid_from || vm.proof.valid_until != signed.valid_until {
+        return Err(AnchorError::ValidityWindowMismatch {
+            expected_from: signed.valid_from,
+            expected_until: signed.valid_until,
+            actual_from: vm.proof.valid_from,
+            actual_until: vm.proof.valid_until,
+        });
+    }
+    let rendered = try_render_canonical(&vm.ast)
+        .map_err(|error| AnchorError::NonCanonicalMandate(ParseError::Ast { line: 0, error }))?;
+    if rendered != signed.canonical_words {
+        return Err(AnchorError::NonCanonicalMandate(ParseError::NonCanonical {
+            expected: rendered,
+        }));
+    }
+    Ok(())
+}
+
 /// Verifies a single Ed25519 [`SignedMandate`] envelope and returns a [`VerifiedMandate`].
 pub fn verify_ed25519(signed: &SignedMandate) -> Result<VerifiedMandate, AnchorError> {
     let ast = parse_canonical(&signed.canonical_words).map_err(AnchorError::NonCanonicalMandate)?;
-    validate_anchor_id(&signed.anchor_id)?;
-    validate_validity_window(signed.valid_from, signed.valid_until)?;
+    validate_proof_shape(&signed.anchor_id, signed.valid_from, signed.valid_until)
+        .map_err(map_proof_shape_error)?;
 
     let actor_kind = parse_actor_kind(&signed.actor_kind)?;
     if actor_kind != ast.from().kind() {
@@ -420,34 +634,23 @@ pub const fn format_assurance(level: AssuranceLevel) -> &'static str {
     }
 }
 
-fn validate_anchor_id(anchor_id: &str) -> Result<(), AnchorError> {
-    if anchor_id.is_empty() {
-        return Err(AnchorError::InvalidAnchorId(
-            "anchor_id must not be empty".to_string(),
-        ));
-    }
-    if !is_valid_quoted_str(anchor_id) {
-        return Err(AnchorError::InvalidAnchorId(
+fn map_proof_shape_error(err: ProofShapeError) -> AnchorError {
+    match err {
+        ProofShapeError::EmptyAnchorId => {
+            AnchorError::InvalidAnchorId("anchor_id must not be empty".to_string())
+        }
+        ProofShapeError::InvalidAnchorIdChars => AnchorError::InvalidAnchorId(
             "anchor_id must not contain control characters".to_string(),
-        ));
-    }
-    Ok(())
-}
-
-fn validate_validity_window(valid_from: i64, valid_until: i64) -> Result<(), AnchorError> {
-    if !is_valid_timestamp(valid_from) {
-        return Err(AnchorError::InvalidTimestamp(valid_from));
-    }
-    if !is_valid_timestamp(valid_until) {
-        return Err(AnchorError::InvalidTimestamp(valid_until));
-    }
-    if valid_from > valid_until {
-        return Err(AnchorError::InvalidValidityWindow {
+        ),
+        ProofShapeError::TimestampOutOfRange(ts) => AnchorError::InvalidTimestamp(ts),
+        ProofShapeError::InvertedValidityWindow {
             valid_from,
             valid_until,
-        });
+        } => AnchorError::InvalidValidityWindow {
+            valid_from,
+            valid_until,
+        },
     }
-    Ok(())
 }
 
 fn parse_ed25519_key_id(raw: &str) -> Result<KeyId, AnchorError> {

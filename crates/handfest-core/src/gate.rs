@@ -1,5 +1,6 @@
 //! Deterministic chain evaluator and hash-chained `DecisionReceipt`.
 
+use alloc::boxed::Box;
 use alloc::collections::BTreeMap;
 use alloc::format;
 use alloc::string::{String, ToString};
@@ -11,7 +12,9 @@ use crate::ast::{
     is_valid_ident, is_valid_quoted_str, is_valid_timestamp, try_format_rfc3339_utc, AstError,
     Decimal, HandfestAst, KeyId, MandateId, Predicate, PredicateOp, Quota, Scalar,
 };
-use crate::lattice::{scalar_satisfies, subsumes};
+use crate::gate_errors::ProofMetaError;
+pub use crate::gate_errors::{ChainStructureError, ProofShapeError, RuntimeChainError};
+use crate::lattice::{scalar_satisfies, subsumes_with_parent_id, NarrowError};
 use crate::{ActorKind, AssuranceLevel, Verdict};
 
 /// Normalized cryptographic / regulatory verification proof supplied by an external trust anchor.
@@ -365,6 +368,75 @@ fn build_receipt(
     receipt
 }
 
+/// Verifies static structural invariants of a mandate chain: non-empty chain, root absence of
+/// `PARENT`, valid canonical ASTs (returning per-hop [`MandateId`]s), and monotonic lattice
+/// attenuation (`subsumes`) across every adjacent hop.
+pub fn verify_chain_structure(
+    chain: &[VerifiedMandate],
+) -> Result<Vec<MandateId>, ChainStructureError> {
+    if chain.is_empty() {
+        return Err(ChainStructureError::EmptyChain);
+    }
+    if chain[0].ast.parent().is_some() {
+        return Err(ChainStructureError::RootHasParent);
+    }
+    let mut chain_ids = Vec::with_capacity(chain.len());
+    for (hop, vm) in chain.iter().enumerate() {
+        let mid = vm
+            .ast
+            .try_mandate_id()
+            .map_err(|source| ChainStructureError::InvalidMandateAst { hop, source })?;
+        chain_ids.push(mid);
+    }
+    verify_attenuation_with_ids(chain, Some(&chain_ids))?;
+    Ok(chain_ids)
+}
+
+/// Verifies runtime chain validity at `now` for `actor_key` in canonical evaluation order:
+/// AST validity, non-empty chain, valid RFC 3339 `now`, root `PARENT` absence, per-hop anchor
+/// proof bindings/timestamp bounds/validity windows, monotonic attenuation, and leaf `TO` key.
+pub fn verify_chain_runtime(
+    chain: &[VerifiedMandate],
+    actor_key: &KeyId,
+    now: i64,
+) -> Result<(), RuntimeChainError> {
+    for (hop, vm) in chain.iter().enumerate() {
+        vm.ast
+            .validate()
+            .map_err(|source| ChainStructureError::InvalidMandateAst { hop, source })?;
+    }
+    verify_chain_runtime_prevalidated(chain, None, actor_key, now)
+}
+
+fn verify_chain_runtime_prevalidated(
+    chain: &[VerifiedMandate],
+    chain_ids: Option<&[MandateId]>,
+    actor_key: &KeyId,
+    now: i64,
+) -> Result<(), RuntimeChainError> {
+    if chain.is_empty() {
+        return Err(ChainStructureError::EmptyChain.into());
+    }
+    if !is_valid_timestamp(now) {
+        return Err(RuntimeChainError::InvalidTimestamp { timestamp: now });
+    }
+    if chain[0].ast.parent().is_some() {
+        return Err(ChainStructureError::RootHasParent.into());
+    }
+
+    verify_proofs(chain, now)?;
+    verify_attenuation_with_ids(chain, chain_ids)?;
+
+    let leaf = &chain[chain.len() - 1];
+    if leaf.ast.to().key() != actor_key {
+        return Err(RuntimeChainError::ActorKeyMismatch {
+            expected: leaf.ast.to().key().clone(),
+            actual: actor_key.clone(),
+        });
+    }
+    Ok(())
+}
+
 fn evaluate_chain(
     chain: &[VerifiedMandate],
     chain_ids: &[MandateId],
@@ -373,29 +445,8 @@ fn evaluate_chain(
     usage: &QuotaSnapshot,
     now: i64,
 ) -> Result<(), String> {
-    if chain.is_empty() {
-        return Err("empty mandate chain".into());
-    }
-    if !is_valid_timestamp(now) {
-        return Err(format!(
-            "timestamp {now} outside 0000-01-01T00:00:00Z..=9999-12-31T23:59:59Z"
-        ));
-    }
-    if chain[0].ast.parent().is_some() {
-        return Err("root mandate must not declare a PARENT digest".into());
-    }
-
-    verify_proofs(chain, now)?;
-    verify_attenuation(chain)?;
-
-    let leaf = &chain[chain.len() - 1];
-    if leaf.ast.to().key() != &request.actor_key {
-        return Err(format!(
-            "request actor key {} does not match leaf mandate TO key {}",
-            request.actor_key,
-            leaf.ast.to().key()
-        ));
-    }
+    verify_chain_runtime_prevalidated(chain, Some(chain_ids), &request.actor_key, now)
+        .map_err(|err| err.to_string())?;
 
     if !is_valid_concrete_action(&request.action) {
         return Err(format!(
@@ -420,48 +471,138 @@ fn evaluate_chain(
     Ok(())
 }
 
-fn verify_proofs(chain: &[VerifiedMandate], now: i64) -> Result<(), String> {
+fn validate_proof_meta(
+    anchor_id: &str,
+    valid_from: i64,
+    valid_until: i64,
+) -> Result<(), ProofMetaError> {
+    if anchor_id.is_empty() {
+        return Err(ProofMetaError::EmptyAnchorId);
+    }
+    if !is_valid_quoted_str(anchor_id) {
+        return Err(ProofMetaError::InvalidAnchorIdChars);
+    }
+    if !is_valid_timestamp(valid_from) {
+        return Err(ProofMetaError::TimestampOutOfRange(valid_from));
+    }
+    if !is_valid_timestamp(valid_until) {
+        return Err(ProofMetaError::TimestampOutOfRange(valid_until));
+    }
+    Ok(())
+}
+
+/// Validates shared anchor proof shape invariants: non-empty control-free `anchor_id`,
+/// RFC 3339 4-digit-year bounds for `valid_from`/`valid_until`, and `valid_from <= valid_until`.
+pub fn validate_proof_shape(
+    anchor_id: &str,
+    valid_from: i64,
+    valid_until: i64,
+) -> Result<(), ProofShapeError> {
+    validate_proof_meta(anchor_id, valid_from, valid_until)?;
+    if valid_from > valid_until {
+        return Err(ProofShapeError::InvertedValidityWindow {
+            valid_from,
+            valid_until,
+        });
+    }
+    Ok(())
+}
+
+fn verify_proofs(chain: &[VerifiedMandate], now: i64) -> Result<(), RuntimeChainError> {
     for (i, vm) in chain.iter().enumerate() {
         if &vm.proof.signer_key != vm.ast.from().key() {
-            return Err(format!(
-                "hop {i}: proof signer key {} does not match mandate FROM key {}",
-                vm.proof.signer_key,
-                vm.ast.from().key()
-            ));
+            return Err(RuntimeChainError::ProofSignerMismatch {
+                hop: i,
+                proof_key: vm.proof.signer_key.clone(),
+                mandate_key: vm.ast.from().key().clone(),
+            });
         }
         if vm.proof.actor_kind != vm.ast.from().kind() {
-            return Err(format!(
-                "hop {i}: proof actor kind {:?} does not match mandate FROM kind {:?}",
-                vm.proof.actor_kind,
-                vm.ast.from().kind()
-            ));
+            return Err(RuntimeChainError::ProofActorKindMismatch {
+                hop: i,
+                proof_kind: vm.proof.actor_kind,
+                mandate_kind: vm.ast.from().kind(),
+            });
         }
         if vm.proof.valid_from >= vm.proof.valid_until {
-            return Err(format!(
-                "hop {i}: invalid anchor proof validity window [{}..{})",
-                vm.proof.valid_from, vm.proof.valid_until
-            ));
+            return Err(RuntimeChainError::InvalidProofValidityWindow {
+                hop: i,
+                valid_from: vm.proof.valid_from,
+                valid_until: vm.proof.valid_until,
+            });
         }
+        validate_proof_meta(
+            &vm.proof.anchor_id,
+            vm.proof.valid_from,
+            vm.proof.valid_until,
+        )
+        .map_err(|err| match err {
+            ProofMetaError::EmptyAnchorId | ProofMetaError::InvalidAnchorIdChars => {
+                RuntimeChainError::InvalidAnchorId { hop: i }
+            }
+            ProofMetaError::TimestampOutOfRange(_) => RuntimeChainError::ProofTimestampOutOfRange {
+                hop: i,
+                valid_from: vm.proof.valid_from,
+                valid_until: vm.proof.valid_until,
+            },
+        })?;
         if now < vm.proof.valid_from || now >= vm.proof.valid_until {
-            return Err(format!(
-                "hop {i}: timestamp {now} outside anchor proof validity window [{}..{})",
-                vm.proof.valid_from, vm.proof.valid_until
-            ));
+            return Err(RuntimeChainError::OutsideProofValidityWindow {
+                hop: i,
+                now,
+                valid_from: vm.proof.valid_from,
+                valid_until: vm.proof.valid_until,
+            });
         }
     }
     Ok(())
 }
 
-fn verify_attenuation(chain: &[VerifiedMandate]) -> Result<(), String> {
+fn verify_attenuation_with_ids(
+    chain: &[VerifiedMandate],
+    chain_ids: Option<&[MandateId]>,
+) -> Result<(), ChainStructureError> {
     for i in 0..chain.len().saturating_sub(1) {
-        if let Err(err) = subsumes(&chain[i].ast, &chain[i + 1].ast) {
-            return Err(format!(
-                "hop {i} -> {}: attenuation check failed: {err}",
-                i + 1
-            ));
+        let parent_id = match chain_ids {
+            Some(ids) => ids[i],
+            None => chain[i]
+                .ast
+                .try_mandate_id()
+                .map_err(|source| ChainStructureError::InvalidMandateAst { hop: i, source })?,
+        };
+        if let Err(err) = subsumes_with_parent_id(&chain[i].ast, parent_id, &chain[i + 1].ast) {
+            return Err(match err {
+                NarrowError::HopOverflow {
+                    parent_max_hops,
+                    child_max_hops,
+                } => ChainStructureError::MaxHopsExceeded {
+                    hop: i,
+                    parent_max_hops,
+                    child_max_hops,
+                },
+                source => ChainStructureError::AttenuationFailed {
+                    hop: i,
+                    source: Box::new(source),
+                },
+            });
         }
     }
     Ok(())
+}
+
+/// Evaluates `pred` when its field is `context.time` or present in `facts`, returning `None` if
+/// the referenced fact is not yet known (e.g. dynamic call-time arguments during tool discovery).
+#[must_use]
+pub fn evaluate_predicate_if_known(
+    pred: &Predicate,
+    facts: &VerifiedFacts,
+    now: i64,
+) -> Option<bool> {
+    if pred.field_path() == "context.time" || facts.get(pred.field_path()).is_some() {
+        Some(evaluate_predicate(0, pred, facts, now).is_ok())
+    } else {
+        None
+    }
 }
 
 fn evaluate_mandate(

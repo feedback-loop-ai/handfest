@@ -4,6 +4,7 @@ members = [
     "crates/handfest-core",
     "crates/handfest-anchors",
     "crates/handfest-ledger",
+    "crates/handfest-mcp",
     "crates/handfest-cli",
 ]
 
