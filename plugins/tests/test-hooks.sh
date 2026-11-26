@@ -1167,4 +1167,94 @@ assert_eq "surrogate top-level key rc" "$HOOK_RC" "2"
 assert_strict_rfc8259_json_line "surrogate top-level key stderr" "$TMP_DIR/stderr.txt" "d['verdict'] == 'deny' and d['code'] == 'invalid_input' and 'key' in d['reason'].lower()"
 pass "Non-UTF-8 HANDFEST_* env vars (zero lone surrogates in RFC 8259 JSON) and lone surrogate in top-level JSON key all failed closed (exit 2)"
 
+# Test 31: Hardened PY_CODE heredoc loading (unset + sentinel check + env inheritance + ulimit -f 0)
+DENY_PAYLOAD='{"hook_event_name":"PreToolUse","tool_name":"Bash","tool_input":{"command":"id"}}'
+
+for poisoned_py in "" "import sys; sys.exit(0)" "import sys; sys.exit(0) # HANDFEST_PY_SENTINEL_EOF"; do
+  HOOK_RC=0
+  printf '%s' "$DENY_PAYLOAD" \
+    | env PY_CODE="$poisoned_py" "$HOOK" >"$TMP_DIR/stdout.txt" 2>"$TMP_DIR/stderr.txt" || HOOK_RC=$?
+  assert_eq "inherited PY_CODE deny rc" "$HOOK_RC" "2"
+  assert_eq "inherited PY_CODE deny stdout" "$(cat "$TMP_DIR/stdout.txt")" ""
+  assert_strict_rfc8259_json_line "inherited PY_CODE deny stderr" "$TMP_DIR/stderr.txt" "d['verdict'] == 'deny' and d['code'] == 'unmapped_tool'"
+done
+
+# Exercise the sentinel failure branch deterministically (even when bash uses pipes for <64KiB heredocs):
+# a hook copy whose heredoc misses the sentinel MUST ignore inherited PY_CODE (even containing sentinel)
+# and fail closed with exit 2 + internal_error.
+BROKEN_HOOK="$TMP_DIR/broken-sentinel-hook.sh"
+python3 -I - "$HOOK" "$BROKEN_HOOK" <<'PY_STRIP_SENTINEL'
+import pathlib, sys
+src = pathlib.Path(sys.argv[1]).read_text(encoding="utf-8")
+marker = "# HANDFEST_PY_SENTINEL_EOF\nPY\n"
+assert marker in src, "expected sentinel marker at end of heredoc"
+pathlib.Path(sys.argv[2]).write_text(src.replace(marker, "PY\n", 1), encoding="utf-8")
+PY_STRIP_SENTINEL
+chmod +x "$BROKEN_HOOK"
+
+HOOK_RC=0
+printf '%s' "$DENY_PAYLOAD" \
+  | env PY_CODE="import sys; sys.exit(0) # HANDFEST_PY_SENTINEL_EOF" "$BROKEN_HOOK" >"$TMP_DIR/stdout.txt" 2>"$TMP_DIR/stderr.txt" || HOOK_RC=$?
+assert_eq "missing sentinel with poisoned PY_CODE rc" "$HOOK_RC" "2"
+assert_eq "missing sentinel with poisoned PY_CODE stdout" "$(cat "$TMP_DIR/stdout.txt")" ""
+assert_strict_rfc8259_json_line "missing sentinel with poisoned PY_CODE stderr" "$TMP_DIR/stderr.txt" "d['verdict'] == 'deny' and d['code'] == 'internal_error' and 'validator' in d['reason']"
+
+# Also simulate heredoc redirection failure (e.g. ENOSPC/EFBIG/unwritable TMPDIR on bash versions
+# that back heredocs with temp files): proves `unset PY_CODE` clears inherited env BEFORE `read`
+# so poisoned `PY_CODE` containing the sentinel can NEVER survive a failed redirection.
+REDIR_FAIL_HOOK="$TMP_DIR/redir-fail-hook.sh"
+python3 -I - "$HOOK" "$REDIR_FAIL_HOOK" "$TMP_DIR/does-not-exist-heredoc" <<'PY_REDIR_FAIL'
+import pathlib, sys
+src = pathlib.Path(sys.argv[1]).read_text(encoding="utf-8")
+start = "IFS= read -r -d '' PY_CODE <<'PY' || true\n"
+end = "# HANDFEST_PY_SENTINEL_EOF\nPY\n"
+s_idx = src.index(start)
+e_idx = src.index(end, s_idx) + len(end)
+mutated = src[:s_idx] + f"IFS= read -r -d '' PY_CODE < '{sys.argv[3]}' || true\n" + src[e_idx:]
+pathlib.Path(sys.argv[2]).write_text(mutated, encoding="utf-8")
+PY_REDIR_FAIL
+chmod +x "$REDIR_FAIL_HOOK"
+
+HOOK_RC=0
+printf '%s' "$DENY_PAYLOAD" \
+  | env PY_CODE="import sys; sys.exit(0) # HANDFEST_PY_SENTINEL_EOF" "$REDIR_FAIL_HOOK" >"$TMP_DIR/stdout.txt" 2>"$TMP_DIR/stderr.txt" || HOOK_RC=$?
+assert_eq "redirection failure with poisoned PY_CODE rc" "$HOOK_RC" "2"
+assert_eq "redirection failure with poisoned PY_CODE stdout" "$(cat "$TMP_DIR/stdout.txt")" ""
+tail -n 1 "$TMP_DIR/stderr.txt" >"$TMP_DIR/stderr_last.txt"
+assert_strict_rfc8259_json_line "redirection failure with poisoned PY_CODE stderr" "$TMP_DIR/stderr_last.txt" "d['verdict'] == 'deny' and d['code'] == 'internal_error' and 'validator' in d['reason']"
+
+# Test inherited PY_CODE under ulimit -f 0 (RLIMIT_FSIZE=0) when supported, capturing via pipes
+# so stderr capture itself does not hit file-size limit.
+if ( ulimit -f 0 ) 2>/dev/null; then
+  python3 -I - "$HOOK" "$DENY_PAYLOAD" <<'PY_ULIMIT'
+import json, os, resource, subprocess, sys
+hook, payload = sys.argv[1], sys.argv[2].encode("utf-8")
+
+def set_fsize_zero():
+    resource.setrlimit(resource.RLIMIT_FSIZE, (0, 0))
+
+for poisoned in ("", "import sys; sys.exit(0)", "import sys; sys.exit(0) # HANDFEST_PY_SENTINEL_EOF"):
+    env = dict(os.environ)
+    env["PY_CODE"] = poisoned
+    proc = subprocess.run(
+        [hook],
+        input=payload,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        env=env,
+        preexec_fn=set_fsize_zero,
+    )
+    assert proc.returncode == 2, f"ulimit -f 0 expected rc 2 for PY_CODE={poisoned!r}, got {proc.returncode}; stderr={proc.stderr!r}"
+    assert proc.stdout == b"", f"ulimit -f 0 expected empty stdout, got {proc.stdout!r}"
+    lines = proc.stderr.decode("utf-8", errors="strict").splitlines()
+    assert len(lines) >= 1, f"ulimit -f 0 expected JSON deny line on stderr, got {proc.stderr!r}"
+    # If bash wrote a redirection error before the sentinel JSON, the final line is our strict deny JSON.
+    data = json.loads(lines[-1])
+    assert data.get("verdict") == "deny" and data.get("code") in ("unmapped_tool", "internal_error"), (
+        f"unexpected deny payload under ulimit -f 0: {data!r}"
+    )
+PY_ULIMIT
+fi
+pass "PY_CODE heredoc hardening (unset + sentinel + env inheritance + ulimit -f 0) failed closed (exit 2)"
+
 echo "ALL $PASS_COUNT HOOK & PLUGIN TESTS PASSED."

@@ -1026,3 +1026,42 @@ fn check_require_existing_ledger_rejects_readonly_0444_ledger_with_storage_error
     let out = run_check_on_ledger(&signed_path, &agent_key, &ledger, true);
     assert_existing_ledger_open_error(&out, "storage_error", "read-only 0444 ledger");
 }
+
+#[cfg(unix)]
+#[test]
+fn check_require_existing_ledger_maps_symlink_cycle_and_0000_ledger_to_storage_error() {
+    use std::os::unix::fs::{symlink, PermissionsExt};
+
+    struct RestoreMode(std::path::PathBuf);
+    impl Drop for RestoreMode {
+        fn drop(&mut self) {
+            let _ = fs::set_permissions(&self.0, fs::Permissions::from_mode(0o644));
+        }
+    }
+
+    let dir = TempDir::new().unwrap();
+    let (signed_path, agent_key) = setup_merge_mandate_fixture(dir.path());
+
+    // 1. 2-symlink cycle (ELOOP) must fail with `storage_error`, NOT `missing_ledger`.
+    let loop_a = dir.path().join("cli_cycle_a.sqlite");
+    let loop_b = dir.path().join("cli_cycle_b.sqlite");
+    symlink(&loop_b, &loop_a).unwrap();
+    symlink(&loop_a, &loop_b).unwrap();
+    let cycle_out = run_check_on_ledger(&signed_path, &agent_key, &loop_a, true);
+    assert_existing_ledger_open_error(&cycle_out, "storage_error", "2-symlink cycle ledger");
+
+    // 2. Existing 0o000 ledger must fail with `storage_error`, NOT `missing_ledger`
+    //    (skip when running as root / with CAP_DAC_OVERRIDE).
+    let ledger = dir.path().join("mode_0000_ledger.sqlite");
+    let init_out = run_check_on_ledger(&signed_path, &agent_key, &ledger, false);
+    assert!(init_out.status.success(), "initial check must succeed");
+
+    let _restore = RestoreMode(ledger.clone());
+    fs::set_permissions(&ledger, fs::Permissions::from_mode(0o000)).unwrap();
+    if fs::File::open(&ledger).is_ok() || fs::OpenOptions::new().write(true).open(&ledger).is_ok() {
+        return;
+    }
+
+    let mode000_out = run_check_on_ledger(&signed_path, &agent_key, &ledger, true);
+    assert_existing_ledger_open_error(&mode000_out, "storage_error", "0o000 existing ledger");
+}

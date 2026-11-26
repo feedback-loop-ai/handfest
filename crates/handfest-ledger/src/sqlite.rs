@@ -310,8 +310,6 @@ fn load_latest_receipt_hash(tx: &Transaction<'_>) -> Result<Option<MandateId>, L
     }
 }
 
-const SQLITE_CANTOPEN_ISDIR: std::os::raw::c_int = 526;
-
 fn map_open_existing_error(path: &Path, err: rusqlite::Error) -> LedgerError {
     if let rusqlite::Error::SqliteFailure(
         rusqlite::ffi::Error {
@@ -321,10 +319,12 @@ fn map_open_existing_error(path: &Path, err: rusqlite::Error) -> LedgerError {
         _,
     ) = err
     {
-        if extended_code == SQLITE_CANTOPEN_ISDIR || fs::metadata(path).is_ok_and(|m| m.is_dir()) {
-            return LedgerError::Storage(err.to_string());
+        if extended_code != rusqlite::ffi::SQLITE_CANTOPEN_ISDIR
+            && matches!(fs::metadata(path), Err(ref io_err) if io_err.kind() == std::io::ErrorKind::NotFound)
+        {
+            return LedgerError::NotFound(err.to_string());
         }
-        return LedgerError::NotFound(err.to_string());
+        return LedgerError::Storage(err.to_string());
     }
     LedgerError::from(err)
 }

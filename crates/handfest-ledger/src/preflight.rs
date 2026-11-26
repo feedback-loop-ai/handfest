@@ -637,19 +637,19 @@ fn check_rollback_journal_sidecar_with_budget_in(
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 thread_local! {
     static RAW_OPEN_CALLS: std::sync::atomic::AtomicUsize =
         const { std::sync::atomic::AtomicUsize::new(0) };
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 fn raw_open_calls() -> usize {
     RAW_OPEN_CALLS.with(|c| c.load(std::sync::atomic::Ordering::SeqCst))
 }
 
 fn open_no_follow_read_only(path: &Path) -> io::Result<File> {
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     RAW_OPEN_CALLS.with(|c| c.fetch_add(1, std::sync::atomic::Ordering::SeqCst));
     let mut opts = fs::OpenOptions::new();
     opts.read(true);

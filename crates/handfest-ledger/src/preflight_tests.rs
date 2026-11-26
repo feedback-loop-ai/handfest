@@ -403,6 +403,48 @@ fn assert_duplicate_inode_cap_and_journal_guard(
     assert!(reg.lock().unwrap().deferred_fds.is_empty());
 }
 #[cfg(unix)]
+fn assert_supported_unix_open_flag(flag: Option<i32>, name: &str) -> bool {
+    if cfg!(any(
+        all(
+            any(target_os = "linux", target_os = "android"),
+            any(
+                target_arch = "x86_64",
+                target_arch = "x86",
+                target_arch = "aarch64",
+                target_arch = "arm",
+                target_arch = "riscv32",
+                target_arch = "riscv64",
+                target_arch = "powerpc",
+                target_arch = "powerpc64",
+                target_arch = "s390x",
+                target_arch = "loongarch64",
+                target_arch = "m68k",
+                target_arch = "mips",
+                target_arch = "mips32r6",
+                target_arch = "mips64",
+                target_arch = "mips64r6",
+                target_arch = "sparc",
+                target_arch = "sparc64"
+            )
+        ),
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "freebsd",
+        target_os = "openbsd",
+        target_os = "netbsd",
+        target_os = "dragonfly"
+    )) {
+        assert!(
+            flag.is_some(),
+            "{name} must be defined on all supported Unix targets"
+        );
+        true
+    } else {
+        false
+    }
+}
+
+#[cfg(unix)]
 #[test]
 fn open_no_follow_read_only_rejects_symlinks_atomically() {
     use std::os::unix::fs::symlink;
@@ -417,7 +459,7 @@ fn open_no_follow_read_only_rejects_symlinks_atomically() {
     ok_file.read_to_end(&mut buf).unwrap();
     assert_eq!(buf, b"rollback-payload");
 
-    if UNIX_O_NOFOLLOW.is_none() {
+    if !assert_supported_unix_open_flag(UNIX_O_NOFOLLOW, "UNIX_O_NOFOLLOW") {
         return;
     }
 
@@ -587,7 +629,7 @@ fn post_open_non_file_guards_and_nonblock_fifo_reject_without_blocking() {
         "non-regular file must never be inserted into deferred_fds"
     );
 
-    if UNIX_O_NONBLOCK.is_none() {
+    if !assert_supported_unix_open_flag(UNIX_O_NONBLOCK, "UNIX_O_NONBLOCK") {
         return;
     }
 
@@ -655,7 +697,7 @@ fn probe_rollback_journal_once_and_header_inspect_reject_symlinks_via_o_nofollow
         "expected not a regular file error from stat_read_only_regular_file on symlink, got: {stat_err:?}"
     );
 
-    if UNIX_O_NOFOLLOW.is_some() {
+    if assert_supported_unix_open_flag(UNIX_O_NOFOLLOW, "UNIX_O_NOFOLLOW") {
         let mut reg_state = ActiveHandleRegistry::default();
         let hdr_err = inspect_sqlite_header_locked(&mut reg_state, &sym_db).unwrap_err();
         assert!(

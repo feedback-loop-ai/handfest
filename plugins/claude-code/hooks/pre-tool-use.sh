@@ -31,6 +31,7 @@ if ! command -v python3 >/dev/null 2>&1; then
   exit 2
 fi
 
+unset PY_CODE
 IFS= read -r -d '' PY_CODE <<'PY' || true
 import datetime, json, os, re, shutil, subprocess, unicodedata
 
@@ -643,7 +644,13 @@ except HookError as err:
     emit_deny(err.code, err.reason, receipt_hash=err.receipt_hash)
 except BaseException as exc:
     emit_deny("internal_error", f"unexpected hook error: {exc}")
+# HANDFEST_PY_SENTINEL_EOF
 PY
+
+if [[ "${PY_CODE:-}" != *"# HANDFEST_PY_SENTINEL_EOF"* ]]; then
+  printf '%s\n' '{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"deny","permissionDecisionReason":"handfest hook failed to load embedded validator (fail closed)"},"verdict":"deny","code":"internal_error","reason":"embedded python validator failed to load"}' >&2 || true
+  exit 2
+fi
 
 rc=0
 python3 -I -c "$PY_CODE" || rc=$?
