@@ -8,12 +8,21 @@ unset HANDFEST_ALLOW_CREATE_LEDGER
 
 REPO_ROOT="$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd)"
 HOOK="$REPO_ROOT/plugins/claude-code/hooks/pre-tool-use.sh"
-HANDFEST_BIN="${HANDFEST_BIN:-$REPO_ROOT/target/debug/handfest}"
-HANDFEST_MCP_BIN="${HANDFEST_MCP_BIN:-$REPO_ROOT/target/debug/handfest-mcp}"
+DEFAULT_HANDFEST_BIN="$REPO_ROOT/target/debug/handfest"
+DEFAULT_HANDFEST_MCP_BIN="$REPO_ROOT/target/debug/handfest-mcp"
+HANDFEST_BIN="${HANDFEST_BIN:-$DEFAULT_HANDFEST_BIN}"
+HANDFEST_MCP_BIN="${HANDFEST_MCP_BIN:-$DEFAULT_HANDFEST_MCP_BIN}"
 
-if [[ ! -x "$HANDFEST_BIN" || ! -x "$HANDFEST_MCP_BIN" ]]; then
-  echo "Building handfest and handfest-mcp binaries..."
-  (cd "$REPO_ROOT" && cargo build --bin handfest --bin handfest-mcp --locked --offline >/dev/null)
+BUILD_BINS=()
+if [[ "$HANDFEST_BIN" == "$DEFAULT_HANDFEST_BIN" ]]; then
+  BUILD_BINS+=(--bin handfest)
+fi
+if [[ "$HANDFEST_MCP_BIN" == "$DEFAULT_HANDFEST_MCP_BIN" ]]; then
+  BUILD_BINS+=(--bin handfest-mcp)
+fi
+if [[ "${#BUILD_BINS[@]}" -gt 0 ]]; then
+  echo "Ensuring up-to-date handfest binaries (${BUILD_BINS[*]})..."
+  (cd "$REPO_ROOT" && cargo build "${BUILD_BINS[@]}" --locked --offline >/dev/null)
 fi
 
 if [[ ! -x "$HANDFEST_BIN" ]]; then
@@ -909,7 +918,21 @@ HOOK_RC=0
 HANDFEST_BIN="$FAKE_BIN" "$HOOK" <<<"$VALID_PAYLOAD" >"$TMP_DIR/stdout.txt" 2>"$TMP_DIR/stderr.txt" || HOOK_RC=$?
 assert_eq "non-zero deny garbage receipt_hash rc" "$HOOK_RC" "2"
 assert_json "non-zero deny garbage receipt_hash omitted" "$(cat "$TMP_DIR/stderr.txt")" "d['verdict'] == 'deny' and d['code'] == 'mandate_denied' and 'receipt_hash' not in d"
-pass "Defense-in-depth rejected exit-0 non-Permit/malformed receipt_hash and stripped garbage receipt_hash on non-zero deny"
+for fake_err in \
+  '{"error":"policy_mapping_failed","code":["unmapped_tool"],"message":"malformed array code"}' \
+  '{"error":"policy_mapping_failed","code":{"nested":"unmapped_tool"},"message":"malformed object code"}'; do
+  cat <<FAKE_ERR_EOF >"$FAKE_BIN"
+#!/usr/bin/env bash
+printf '%s\n' '$fake_err' >&2
+exit 1
+FAKE_ERR_EOF
+  chmod +x "$FAKE_BIN"
+  HOOK_RC=0
+  HANDFEST_BIN="$FAKE_BIN" "$HOOK" <<<"$VALID_PAYLOAD" >"$TMP_DIR/stdout.txt" 2>"$TMP_DIR/stderr.txt" || HOOK_RC=$?
+  assert_eq "malformed mapping error code rc" "$HOOK_RC" "2"
+  assert_strict_rfc8259_json_line "malformed mapping error code stderr" "$TMP_DIR/stderr.txt" "d['verdict'] == 'deny' and d['code'] == 'gate_error'"
+done
+pass "Defense-in-depth rejected exit-0 non-Permit/malformed receipt_hash, stripped garbage receipt_hash on non-zero deny, and classified non-string mapping error codes as gate_error"
 
 # Test 21: python3 -I isolation blocks malicious ./json.py in CWD and PYTHONPATH
 EVIL_CWD="$TMP_DIR/evil-cwd"

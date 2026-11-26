@@ -1,3 +1,6 @@
+#[cfg(unix)]
+mod common;
+
 use std::fs;
 
 use handfest_core::ast::{
@@ -1116,54 +1119,16 @@ fn open_existing_accepts_valid_initialized_ledger_and_persists_receipts() {
 #[cfg(unix)]
 #[test]
 fn open_existing_lock_probe_helper() {
-    let Ok(db_path) = std::env::var("HANDFEST_OPEN_EXISTING_LOCK_DB") else {
-        return;
-    };
-    let mode = std::env::var("HANDFEST_OPEN_EXISTING_PROBE_MODE").unwrap_or_default();
-    let sql = match mode.as_str() {
-        "exclusive" => "BEGIN EXCLUSIVE; ROLLBACK;",
-        "immediate" => "BEGIN IMMEDIATE; ROLLBACK;",
-        other => panic!("unexpected probe mode: {other}"),
-    };
-    let conn = Connection::open(&db_path).expect("probe open");
-    conn.busy_timeout(std::time::Duration::ZERO).unwrap();
-    let res = conn.execute_batch(sql);
-    let expect_locked = std::env::var("HANDFEST_OPEN_EXISTING_EXPECT_LOCKED").as_deref() == Ok("1");
-    if expect_locked {
-        match res {
-            Err(rusqlite::Error::SqliteFailure(err, _))
-                if err.code == rusqlite::ErrorCode::DatabaseBusy => {}
-            other => panic!(
-                "expected parent POSIX lock ({mode}) to fail with DatabaseBusy, got: {other:?}"
-            ),
-        }
-    } else {
-        res.expect("expected child lock probe to succeed after parent released transaction");
-    }
+    common::run_lock_probe_helper();
 }
 
 #[cfg(unix)]
 fn assert_cross_process_lock(db_path: &std::path::Path, mode: &str, expect_locked: bool) {
-    let exe = std::env::current_exe().expect("current test exe");
-    let output = std::process::Command::new(&exe)
-        .args(["--exact", "open_existing_lock_probe_helper", "--quiet"])
-        .env("HANDFEST_OPEN_EXISTING_LOCK_DB", db_path)
-        .env("HANDFEST_OPEN_EXISTING_PROBE_MODE", mode)
-        .env(
-            "HANDFEST_OPEN_EXISTING_EXPECT_LOCKED",
-            if expect_locked { "1" } else { "0" },
-        )
-        .output()
-        .expect("spawn cross-process lock probe");
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        output.status.success(),
-        "cross-process lock probe failed (mode={mode}, expect_locked={expect_locked})\nstdout:\n{stdout}\nstderr:\n{stderr}"
-    );
-    assert!(
-        stdout.contains("1 passed"),
-        "cross-process lock probe did not execute helper test (mode={mode}, expect_locked={expect_locked}); stdout:\n{stdout}"
+    common::assert_cross_process_lock(
+        "open_existing_lock_probe_helper",
+        db_path,
+        mode,
+        expect_locked,
     );
 }
 

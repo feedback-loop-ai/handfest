@@ -307,7 +307,7 @@ def parse_gate_stderr_error(stderr_bytes: bytes) -> tuple[str, str] | None:
     if not isinstance(out, dict):
         return None
     err_kind, code, msg = out.get("error"), out.get("code"), out.get("message")
-    if type(msg) is not str or not msg:
+    if type(err_kind) is not str or type(code) is not str or type(msg) is not str or not msg:
         return None
     if err_kind == "policy_mapping_failed" and code in MAPPING_ERROR_CODES:
         return code, msg
