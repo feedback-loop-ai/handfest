@@ -1581,3 +1581,157 @@ stderr:
 {stdout}"
     );
 }
+
+#[cfg(unix)]
+#[test]
+fn second_reader_on_renamed_db_after_writer_drop_preserves_lock_helper() {
+    use std::path::PathBuf;
+
+    let Ok(dir) = std::env::var("HANDFEST_SECOND_RO_LOCK_DIR") else {
+        return;
+    };
+    let dir = PathBuf::from(dir);
+    let db_a = dir.join("db_a.sqlite");
+    let db_b = dir.join("db_b.sqlite");
+    let db_c = dir.join("db_c.sqlite");
+    let db_c_moved = dir.join("db_c_moved.sqlite");
+
+    // Keep Handfest reader ro_a on db_a and Handfest writer w_b on db_b.
+    let ro_a = SqliteLedger::open_read_only(&db_a).unwrap();
+    let w_b = SqliteLedger::open_existing(&db_b).unwrap();
+
+    // Hold BEGIN IMMEDIATE on db_c (untracked by Handfest) and rename it to db_c_moved.
+    let writer_tx = Connection::open(&db_c).unwrap();
+    writer_tx.execute_batch("BEGIN IMMEDIATE;").unwrap();
+    fs::rename(&db_c, &db_c_moved).unwrap();
+
+    // Open & drop first reader ro_c1 on renamed db_c_moved while w_b is active, retaining db_c in
+    // deferred_fds.
+    let ro_c1 = SqliteLedger::open_read_only(&db_c_moved).unwrap();
+    assert_eq!(ro_c1.verify_integrity().unwrap(), 1);
+    drop(ro_c1);
+
+    // Drop w_b while ro_a stays open, then open & drop a SECOND reader ro_c2 on renamed
+    // db_c_moved: dropping ro_c2 MUST NOT remove db_c's inode from deferred_fds while ro_a lives.
+    drop(w_b);
+    let ro_c2 = SqliteLedger::open_read_only(&db_c_moved).unwrap();
+    assert_eq!(ro_c2.verify_integrity().unwrap(), 1);
+    drop(ro_c2);
+
+    assert_cross_process_lock(&db_c_moved, "exclusive", true);
+    assert_cross_process_lock(&db_c_moved, "immediate", true);
+
+    assert_eq!(ro_a.verify_integrity().unwrap(), 1);
+    writer_tx.execute_batch("ROLLBACK;").unwrap();
+    drop(writer_tx);
+    drop(ro_a);
+    assert_cross_process_lock(&db_c_moved, "exclusive", false);
+}
+
+#[cfg(unix)]
+#[test]
+fn second_reader_on_renamed_db_after_writer_drop_preserves_posix_lock() {
+    let dir = TempDir::new().unwrap();
+    for name in ["db_a.sqlite", "db_b.sqlite", "db_c.sqlite"] {
+        init_single_permit_ledger(&dir.path().join(name));
+    }
+
+    let exe = std::env::current_exe().expect("current test exe");
+    let output = std::process::Command::new(&exe)
+        .args([
+            "--exact",
+            "second_reader_on_renamed_db_after_writer_drop_preserves_lock_helper",
+            "--quiet",
+        ])
+        .env("HANDFEST_SECOND_RO_LOCK_DIR", dir.path())
+        .output()
+        .expect("spawn second-reader lock preservation helper");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "second-reader lock preservation helper failed\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(
+        stdout.contains("1 passed"),
+        "second-reader lock preservation helper did not run; stdout:\n{stdout}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn saturated_deferred_fds_after_writer_drop_allows_fresh_audit_helper() {
+    use std::path::PathBuf;
+
+    let Ok(dir) = std::env::var("HANDFEST_SATURATED_RO_DIR") else {
+        return;
+    };
+    let dir = PathBuf::from(dir);
+    let db_a = dir.join("db_a.sqlite");
+    let db_b = dir.join("db_b.sqlite");
+    let db_new = dir.join("db_new.sqlite");
+
+    let ro_a = SqliteLedger::open_read_only(&db_a).unwrap();
+    let w_b = SqliteLedger::open_existing(&db_b).unwrap();
+
+    // Saturate deferred_fds to MAX_DEFERRED_FDS (64) while ro_a and w_b are active.
+    for i in 0..64 {
+        let fill = dir.join(format!("fill_{i}.sqlite"));
+        let ro_fill = SqliteLedger::open_read_only(&fill)
+            .unwrap_or_else(|err| panic!("fill open_read_only failed at {i}: {err:?}"));
+        drop(ro_fill);
+    }
+
+    // Confirm the 64-entry cap is actively saturated while w_b is still open.
+    assert!(matches!(
+        SqliteLedger::open_read_only(&db_new),
+        Err(LedgerError::Storage(ref m)) if m.contains("deferred raw-open fd cap (64)")
+    ));
+
+    // Drop w_b while keeping ro_a open: deferred_fds stays at 64, yet fresh uncounted db_new
+    // (including its clean rollback journal) MUST succeed because should_defer_inode is false.
+    drop(w_b);
+    let ro_new = SqliteLedger::open_read_only(&db_new)
+        .unwrap_or_else(|err| panic!("fresh open_read_only after writer drop failed: {err:?}"));
+    assert_eq!(ro_new.verify_integrity().unwrap(), 1);
+    drop(ro_new);
+
+    assert_eq!(ro_a.verify_integrity().unwrap(), 1);
+    drop(ro_a);
+}
+
+#[cfg(unix)]
+#[test]
+fn saturated_deferred_fds_after_writer_drop_allows_fresh_read_only_audit() {
+    let dir = TempDir::new().unwrap();
+    let db_a = dir.path().join("db_a.sqlite");
+    init_single_permit_ledger(&db_a);
+    fs::copy(&db_a, dir.path().join("db_b.sqlite")).unwrap();
+    for i in 0..64 {
+        fs::copy(&db_a, dir.path().join(format!("fill_{i}.sqlite"))).unwrap();
+    }
+    let db_new = dir.path().join("db_new.sqlite");
+    fs::copy(&db_a, &db_new).unwrap();
+    fs::write(dir.path().join("db_new.sqlite-journal"), [0u8; 28]).unwrap();
+
+    let exe = std::env::current_exe().expect("current test exe");
+    let output = std::process::Command::new(&exe)
+        .args([
+            "--exact",
+            "saturated_deferred_fds_after_writer_drop_allows_fresh_audit_helper",
+            "--quiet",
+        ])
+        .env("HANDFEST_SATURATED_RO_DIR", dir.path())
+        .output()
+        .expect("spawn saturated-deferred-fds audit helper");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "saturated-deferred-fds audit helper failed\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(
+        stdout.contains("1 passed"),
+        "saturated-deferred-fds audit helper did not run; stdout:\n{stdout}"
+    );
+}

@@ -191,8 +191,19 @@ impl ActiveHandleRegistry {
     }
 
     #[cfg(unix)]
-    fn ensure_deferred_fd_capacity(&self) -> Result<(), LedgerError> {
-        if self.has_active_handles() && self.total_deferred_fds() >= MAX_DEFERRED_FDS {
+    fn cached_deferred_fd(&mut self, key: (u64, u64)) -> Option<&mut File> {
+        self.deferred_fds
+            .get_mut(&key)
+            .and_then(|files| files.first_mut())
+    }
+
+    #[cfg(unix)]
+    fn ensure_deferred_fd_capacity(&self, key: Option<(u64, u64)>) -> Result<(), LedgerError> {
+        let will_defer = match key {
+            Some(id) => self.should_defer_inode(id),
+            None => self.active_writers > 0,
+        };
+        if will_defer && self.total_deferred_fds() >= MAX_DEFERRED_FDS {
             return Err(LedgerError::Storage(format!(
                 "deferred raw-open fd cap ({MAX_DEFERRED_FDS}) reached while ledger handles are active"
             )));
@@ -272,10 +283,10 @@ impl Drop for PendingWriterGuard {
 /// deferred in `deferred_fds` by `(st_dev, st_ino)` (reusing the first retained `File` via
 /// `SeekFrom::Start(0)` and appending duplicates) whenever `active_writers > 0` or the probed inode
 /// is currently tracked in `counts`. With `active_writers == 0`, uncounted header/journal probes
-/// close immediately so a long-lived reader never exhausts the fd cap. On guard drop when
-/// `active_writers == 0`, `deferred_fds` is cleared only once `counts` is completely empty; while
-/// other handles remain active, only `self.id`'s own entry is removed when its count reaches zero
-/// so uncounted fds retained while a writer was active are never swept prematurely.
+/// close immediately so a long-lived reader never exhausts the fd cap. `deferred_fds` is cleared
+/// only when BOTH `active_writers == 0` and `counts.is_empty()` (never removing individual entries
+/// while any handle remains active, so an fd retained for an inode holding an external POSIX lock
+/// is never closed prematurely by a subsequent reader open/drop).
 pub(crate) struct ActiveHandleGuard {
     registry: &'static Mutex<ActiveHandleRegistry>,
     id: FileIdentity,
@@ -285,27 +296,19 @@ pub(crate) struct ActiveHandleGuard {
 impl Drop for ActiveHandleGuard {
     fn drop(&mut self) {
         let mut state = lock_registry(self.registry);
-        let mut removed_self = false;
         if let Some(count) = state.counts.get_mut(&self.id) {
             *count -= 1;
             if *count == 0 {
                 state.counts.remove(&self.id);
-                removed_self = true;
             }
         }
         if self.is_writer {
             state.active_writers = state.active_writers.saturating_sub(1);
         }
         #[cfg(unix)]
-        if state.active_writers == 0 {
-            if state.counts.is_empty() {
-                state.deferred_fds.clear();
-            } else if removed_self {
-                state.deferred_fds.remove(&(self.id.dev, self.id.ino));
-            }
+        if state.active_writers == 0 && state.counts.is_empty() {
+            state.deferred_fds.clear();
         }
-        #[cfg(not(unix))]
-        let _ = removed_self;
     }
 }
 
@@ -463,19 +466,10 @@ fn stat_read_only_regular_file(canonical: &Path) -> Result<fs::Metadata, LedgerE
 }
 
 #[cfg(unix)]
-fn cached_deferred_fd<'a>(
-    state: &'a mut ActiveHandleRegistry,
-    path: &Path,
-) -> Option<&'a mut File> {
+fn regular_file_key(path: &Path) -> Option<(u64, u64)> {
     use std::os::unix::fs::MetadataExt;
     let meta = fs::symlink_metadata(path).ok()?;
-    if !meta.file_type().is_file() {
-        return None;
-    }
-    state
-        .deferred_fds
-        .get_mut(&(meta.dev(), meta.ino()))
-        .and_then(|files| files.first_mut())
+    meta.file_type().is_file().then(|| (meta.dev(), meta.ino()))
 }
 
 fn validate_regular_ledger_metadata(
@@ -503,18 +497,19 @@ fn inspect_sqlite_header_locked(
     canonical: &Path,
 ) -> Result<FileIdentity, LedgerError> {
     #[cfg(unix)]
-    if let Some(cached) = cached_deferred_fd(state, canonical) {
-        cached.seek(SeekFrom::Start(0)).map_err(|err| {
-            LedgerError::Integrity(format!(
-                "failed to rewind cached read-only ledger '{}': {err}",
-                canonical.display()
-            ))
-        })?;
-        return inspect_sqlite_header_from_file(cached, canonical);
+    {
+        let key = regular_file_key(canonical);
+        if let Some(cached) = key.and_then(|k| state.cached_deferred_fd(k)) {
+            cached.seek(SeekFrom::Start(0)).map_err(|err| {
+                LedgerError::Integrity(format!(
+                    "failed to rewind cached read-only ledger '{}': {err}",
+                    canonical.display()
+                ))
+            })?;
+            return inspect_sqlite_header_from_file(cached, canonical);
+        }
+        state.ensure_deferred_fd_capacity(key)?;
     }
-
-    #[cfg(unix)]
-    state.ensure_deferred_fd_capacity()?;
     #[cfg(not(unix))]
     let _ = state;
 
@@ -711,8 +706,11 @@ fn probe_rollback_journal_open(
     let _ = registry;
 
     #[cfg(unix)]
-    if !is_symlink {
-        if let Some(cached) = cached_deferred_fd(&mut state, journal_path) {
+    {
+        let key = (!is_symlink)
+            .then(|| regular_file_key(journal_path))
+            .flatten();
+        if let Some(cached) = key.and_then(|k| state.cached_deferred_fd(k)) {
             cached.seek(SeekFrom::Start(0)).map_err(|err| {
                 LedgerError::Integrity(format!(
                     "cannot rewind cached rollback journal '{}': {err}",
@@ -721,10 +719,8 @@ fn probe_rollback_journal_open(
             })?;
             return read_rollback_journal_from_file(cached, journal_path);
         }
+        state.ensure_deferred_fd_capacity(key)?;
     }
-
-    #[cfg(unix)]
-    state.ensure_deferred_fd_capacity()?;
     let mut file = match open_no_follow_read_only(journal_path) {
         Ok(file) => file,
         Err(err) if !is_symlink && err.kind() == io::ErrorKind::NotFound => {

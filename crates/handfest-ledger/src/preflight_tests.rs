@@ -556,7 +556,7 @@ fn open_no_follow_read_only_rejects_symlinks_atomically() {
 
 #[cfg(unix)]
 #[test]
-fn reader_only_deferred_fds_prune_on_last_inode_drop_and_clear_on_final_reader_drop() {
+fn reader_only_deferred_fds_retain_until_final_reader_drop() {
     static REG: OnceLock<Mutex<ActiveHandleRegistry>> = OnceLock::new();
     let reg = REG.get_or_init(|| Mutex::new(ActiveHandleRegistry::default()));
 
@@ -582,7 +582,8 @@ fn reader_only_deferred_fds_prune_on_last_inode_drop_and_clear_on_final_reader_d
     assert!(reg.lock().unwrap().deferred_fds.is_empty());
 
     // Hard-linked journal probe on tracked inode db_b MUST defer db_b's fd while db_b is active,
-    // keep it when ro_b1 drops (counts[db_b] == 1), and prune it when ro_b2 drops while ro_a lives.
+    // and retain it even after ro_b1 and ro_b2 drop while ro_a remains active (never removing an
+    // individual inode while any handle remains open).
     let db_b_hl_journal = dir.path().join("hl_db_b.sqlite-journal");
     fs::hard_link(&db_b, &db_b_hl_journal).unwrap();
     assert!(matches!(
@@ -598,7 +599,7 @@ fn reader_only_deferred_fds_prune_on_last_inode_drop_and_clear_on_final_reader_d
         let state = reg.lock().unwrap();
         assert_eq!(state.active_writers, 0);
         assert_eq!(state.counts.len(), 1);
-        assert!(state.deferred_fds.is_empty());
+        assert_eq!(state.deferred_fds.len(), 1);
     }
 
     // 70 distinct failed header probes + 70 distinct journal probes while ro_a is active must NOT
@@ -623,7 +624,7 @@ fn reader_only_deferred_fds_prune_on_last_inode_drop_and_clear_on_final_reader_d
             JournalProbe::Clean
         );
     }
-    assert!(reg.lock().unwrap().deferred_fds.is_empty());
+    assert_eq!(reg.lock().unwrap().deferred_fds.len(), 1);
     let ((), ro_after) = open_read_only_guarded_in(reg, &db_b, |_| Ok(())).unwrap();
     drop(ro_after);
 
@@ -634,6 +635,68 @@ fn reader_only_deferred_fds_prune_on_last_inode_drop_and_clear_on_final_reader_d
         assert!(state.counts.is_empty());
         assert!(state.deferred_fds.is_empty());
     }
+}
+
+#[cfg(unix)]
+#[test]
+fn saturated_deferred_fds_after_writer_drop_allows_uncounted_and_caps_tracked_probes() {
+    static REG: OnceLock<Mutex<ActiveHandleRegistry>> = OnceLock::new();
+    let reg = REG.get_or_init(|| Mutex::new(ActiveHandleRegistry::default()));
+
+    let dir = TempDir::new().unwrap();
+    let db_a = write_valid_header_file(&dir.path().join("cap_a.sqlite"));
+    let db_b = write_valid_header_file(&dir.path().join("cap_b.sqlite"));
+    let db_new = write_valid_header_file(&dir.path().join("cap_new.sqlite"));
+    let db_new_journal = dir.path().join("cap_new.sqlite-journal");
+    fs::write(&db_new_journal, [0u8; ROLLBACK_JOURNAL_HDR_LEN]).unwrap();
+
+    let ((), ro_a) = open_read_only_guarded_in(reg, &db_a, |_| Ok(())).unwrap();
+    let ((), w_b) = open_writable_guarded_in(reg, &db_b, || Ok(())).unwrap();
+
+    for i in 0..MAX_DEFERRED_FDS {
+        let fill = write_valid_header_file(&dir.path().join(format!("cap_fill_{i}.sqlite")));
+        let ((), ro_fill) = open_read_only_guarded_in(reg, &fill, |_| Ok(())).unwrap();
+        drop(ro_fill);
+    }
+    assert_eq!(reg.lock().unwrap().total_deferred_fds(), MAX_DEFERRED_FDS);
+
+    // While writer w_b is active, uncounted probes must be blocked by the cap.
+    assert!(matches!(
+        open_read_only_guarded_in(reg, &db_new, |_| Ok(())),
+        Err(LedgerError::Storage(_))
+    ));
+
+    // After w_b drops (ro_a still active), deferred_fds stays saturated at 64, yet uncounted
+    // header and journal probes do not defer and MUST succeed without growing deferred_fds.
+    drop(w_b);
+    assert_eq!(reg.lock().unwrap().total_deferred_fds(), MAX_DEFERRED_FDS);
+
+    let ((), ro_new) = open_read_only_guarded_in(reg, &db_new, |_| Ok(())).unwrap();
+    drop(ro_new);
+    assert_eq!(
+        probe_rollback_journal_once(reg, &db_new_journal).unwrap(),
+        JournalProbe::Clean
+    );
+    assert_eq!(reg.lock().unwrap().total_deferred_fds(), MAX_DEFERRED_FDS);
+
+    // A hard-linked journal pointing at tracked inode db_a (should_defer_inode == true) MUST
+    // still fail closed before calling open_no_follow_read_only while saturated at 64.
+    let db_a_hl_journal = dir.path().join("cap_hl_a.sqlite-journal");
+    fs::hard_link(&db_a, &db_a_hl_journal).unwrap();
+    let calls_before = raw_open_calls();
+    assert!(matches!(
+        probe_rollback_journal_once(reg, &db_a_hl_journal),
+        Err(LedgerError::Storage(_))
+    ));
+    assert_eq!(
+        raw_open_calls(),
+        calls_before,
+        "cap check for tracked inode must reject before calling open_no_follow_read_only"
+    );
+    fs::remove_file(&db_a_hl_journal).unwrap();
+
+    drop(ro_a);
+    assert!(reg.lock().unwrap().deferred_fds.is_empty());
 }
 
 #[cfg(unix)]

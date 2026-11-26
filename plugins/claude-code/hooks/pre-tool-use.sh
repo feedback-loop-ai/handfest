@@ -372,7 +372,7 @@ def validate_static_facts(tool: str, raw, c: str) -> dict:
 
 def validate_policy(tool: str, pol) -> dict:
     c = "invalid_policy_map"
-    if not tool or has_ctrl(tool) or not isinstance(pol, dict):
+    if type(tool) is not str or not tool or not isinstance(pol, dict):
         raise HookError(c, f"tool '{tool}': invalid policy entry")
     unknown = set(pol.keys()) - POLICY_KEYS
     if unknown:

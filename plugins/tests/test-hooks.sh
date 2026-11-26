@@ -599,6 +599,7 @@ assert_mcp_args_safe(
 for bad_label, bad_args in (
     ("dup-ledger", base_valid[:6] + ["--ledger", "/path/to/handfest-config/state/other.sqlite"] + base_valid[6:]),
     ("dup-now", base_valid[:8] + ["--now=2026-11-24T18:00:00Z", "--now", "2026-11-24T19:00:00Z"] + base_valid[8:]),
+    ("dup-now-eq", base_valid[:8] + ["--now=2026-11-24T18:00:00Z", "--now=2026-11-24T19:00:00Z"] + base_valid[8:]),
     ("empty-eq-now", base_valid[:8] + ["--now="] + base_valid[8:]),
     ("whitespace-now", base_valid[:8] + ["--now=2026-11-24 18:00:00Z"] + base_valid[8:]),
     ("missing-now-value", base_valid[:8] + ["--now"] + base_valid[8:]),
@@ -1660,5 +1661,59 @@ for label, nested, expect_depth_error in (
     )
 PY_DEPTH
 pass "MAX_JSON_DEPTH=128 enforced on stdin and HANDFEST_POLICY_MAP for both arrays and objects (exit 2)"
+
+# Test: Policy map with unused tool name containing \n or \t (valid in handfest-mcp) must not reject valid mapped tool, while empty tool name still fails closed.
+CTRL_TOOL_MAP="$TMP_DIR/ctrl-tool-policy-map.json"
+cat <<'CTRL_MAP_EOF' >"$CTRL_TOOL_MAP"
+{
+  "tools": {
+    "unused\ntool": {
+      "action": "git.pr.merge",
+      "resource_kind": "repo",
+      "resource_id_arg": "repo"
+    },
+    "unused\ttool": {
+      "action": "git.pr.merge",
+      "resource_kind": "repo",
+      "resource_id_arg": "repo"
+    },
+    "merge_pull_request": {
+      "action": "git.pr.merge",
+      "resource_kind": "repo",
+      "resource_id_arg": "repo",
+      "arg_facts": {
+        "owner": { "field": "resource.owner", "type": "str" },
+        "pullNumber": { "field": "resource.pr", "type": "int" }
+      },
+      "static_facts": {
+        "resource.environment": { "str": "staging" }
+      }
+    }
+  }
+}
+CTRL_MAP_EOF
+CTRL_TOOL_LEDGER="$TMP_DIR/ctrl-tool.sqlite"
+HOOK_RC=0
+HANDFEST_POLICY_MAP="$CTRL_TOOL_MAP" HANDFEST_LEDGER="$CTRL_TOOL_LEDGER" HANDFEST_ALLOW_CREATE_LEDGER=1 "$HOOK" <<<"$VALID_PAYLOAD" >"$TMP_DIR/stdout.txt" 2>"$TMP_DIR/stderr.txt" || HOOK_RC=$?
+assert_eq "policy map with unused newline/tab tool name rc" "$HOOK_RC" "0"
+assert_json "policy map with unused newline/tab tool name stdout" "$(cat "$TMP_DIR/stdout.txt")" "d['verdict'] == 'permit' and d['hookSpecificOutput']['permissionDecision'] == 'allow'"
+
+EMPTY_TOOL_MAP="$TMP_DIR/empty-tool-policy-map.json"
+cat <<'EMPTY_MAP_EOF' >"$EMPTY_TOOL_MAP"
+{
+  "tools": {
+    "": {
+      "action": "git.pr.merge",
+      "resource_kind": "repo",
+      "resource_id_arg": "repo"
+    }
+  }
+}
+EMPTY_MAP_EOF
+HOOK_RC=0
+HANDFEST_POLICY_MAP="$EMPTY_TOOL_MAP" "$HOOK" <<<"$VALID_PAYLOAD" >"$TMP_DIR/stdout.txt" 2>"$TMP_DIR/stderr.txt" || HOOK_RC=$?
+assert_eq "policy map with empty tool name rc" "$HOOK_RC" "2"
+assert_json "policy map with empty tool name stderr" "$(cat "$TMP_DIR/stderr.txt")" "d['verdict'] == 'deny' and d['code'] == 'invalid_policy_map'"
+pass "Policy map tool-name validation matches handfest-mcp (unused \\n/\\t tool accepted; empty tool rejected)"
 
 echo "ALL $PASS_COUNT HOOK & PLUGIN TESTS PASSED."
