@@ -4,7 +4,7 @@ use std::collections::BTreeMap;
 use std::fmt;
 
 use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
-use handfest_core::ast::{KeyId, MAX_RFC3339_TIMESTAMP, MIN_RFC3339_TIMESTAMP};
+use handfest_core::ast::{HandfestAst, KeyId, MAX_RFC3339_TIMESTAMP, MIN_RFC3339_TIMESTAMP};
 use handfest_core::cnl::{parse_canonical, try_render_canonical, ParseError};
 use handfest_core::gate::{
     validate_proof_shape, ProofShapeError, VerifiedAnchorProof, VerifiedMandate,
@@ -13,10 +13,29 @@ use handfest_core::ActorKind;
 use rand_core::OsRng;
 use serde::{Deserialize, Serialize};
 
+mod base64;
+mod fido2;
+mod openpgp;
+mod piv;
 mod signer;
 mod ssh_sk;
 
+pub use fido2::{
+    discover_fido2_device, format_fido2_ed25519_key_id, verify_fido2_ed25519,
+    Fido2AssertionEnvelope, Fido2CredentialFile, Fido2Ed25519Signer, Fido2Ed25519Verifier,
+    DEFAULT_FIDO2_RP_ID, FIDO2_ED25519_SCHEME, FIDO2_ENVELOPE_VERSION, FIDO2_FLAG_UP,
+    MIN_AUTH_DATA_LEN,
+};
 pub use handfest_core::AssuranceLevel;
+pub use openpgp::{
+    extract_ed25519_public_key, extract_ed25519_public_key_for_fingerprint, openpgp_ed25519_key_id,
+    verify_openpgp_ed25519, OpenPgpEd25519Signer, OpenPgpEd25519Verifier, OPENPGP_ED25519_SCHEME,
+};
+pub use piv::{
+    parse_ed25519_spki_der, parse_ed25519_spki_pem, piv_ed25519_key_id, verify_piv_ed25519,
+    PivEd25519Signer, PivEd25519Verifier, PivPinSource, PivSignerConfig, DEFAULT_PIV_KEY_ID,
+    DEFAULT_PIV_PIN_ENV, DEFAULT_PKCS11_MODULE, ED25519_SPKI_DER_PREFIX, PIV_ED25519_SCHEME,
+};
 pub use signer::{
     sign_mandate_with, CommandOutput, CommandRunner, MandateSigner, SystemCommandRunner,
 };
@@ -51,6 +70,7 @@ pub enum AnchorError {
     InvalidSecretKey(String),
     InvalidPublicKey(String),
     InvalidSignature(String),
+    InvalidConfig(String),
     NonCanonicalMandate(ParseError),
     SignerMismatch {
         expected: String,
@@ -107,6 +127,7 @@ pub enum AnchorError {
         status: Option<i32>,
         stderr: String,
     },
+    InvalidCredential(String),
 }
 
 impl fmt::Display for AnchorError {
@@ -115,6 +136,7 @@ impl fmt::Display for AnchorError {
             Self::InvalidSecretKey(msg) => write!(f, "invalid anchor secret key: {msg}"),
             Self::InvalidPublicKey(msg) => write!(f, "invalid anchor public key: {msg}"),
             Self::InvalidSignature(msg) => write!(f, "invalid anchor signature: {msg}"),
+            Self::InvalidConfig(msg) => write!(f, "invalid anchor configuration: {msg}"),
             Self::NonCanonicalMandate(err) => write!(f, "invalid or non-canonical mandate: {err}"),
             Self::SignerMismatch { expected, actual } => {
                 write!(f, "signer key mismatch: mandate FROM is '{expected}', envelope has '{actual}'")
@@ -188,6 +210,7 @@ impl fmt::Display for AnchorError {
                 (None, true) => write!(f, "'{program}' terminated by signal"),
                 (None, false) => write!(f, "'{program}' terminated by signal: {stderr}"),
             },
+            Self::InvalidCredential(msg) => write!(f, "invalid anchor credential: {msg}"),
         }
     }
 }
@@ -380,12 +403,15 @@ impl AnchorRegistry {
     }
 
     /// Creates a registry pre-populated with the built-in trust-anchor verifiers
-    /// (`ed25519`, `ssh-sk-ed25519`).
+    /// (`ed25519`, `ssh-sk-ed25519`, `fido2-ed25519`, `openpgp-ed25519`, `piv-ed25519`).
     #[must_use]
     pub fn default_registry() -> Self {
         let mut registry = Self::new();
         registry.register("ed25519", Ed25519Verifier);
         registry.register(SSH_SK_ED25519_SCHEME, SshSkEd25519Verifier);
+        registry.register(FIDO2_ED25519_SCHEME, Fido2Ed25519Verifier);
+        registry.register(OPENPGP_ED25519_SCHEME, OpenPgpEd25519Verifier);
+        registry.register(PIV_ED25519_SCHEME, PivEd25519Verifier);
         registry
     }
 
@@ -508,7 +534,7 @@ fn enforce_proof_window_and_ast_postconditions(
 }
 
 pub(crate) struct ValidatedEnvelopeHeader {
-    pub(crate) ast: handfest_core::ast::HandfestAst,
+    pub(crate) ast: HandfestAst,
     pub(crate) actor_kind: ActorKind,
     pub(crate) assurance: AssuranceLevel,
     pub(crate) signer_key: KeyId,
@@ -578,7 +604,15 @@ pub(crate) fn parse_canonical_ed25519_verifying_key(
 
 /// Verifies a single Ed25519 [`SignedMandate`] envelope and returns a [`VerifiedMandate`].
 pub fn verify_ed25519(signed: &SignedMandate) -> Result<VerifiedMandate, AnchorError> {
-    let header = validate_envelope_header(signed, "ed25519", AssuranceLevel::LocalKey)?;
+    verify_ed25519_for_scheme(signed, "ed25519", AssuranceLevel::LocalKey)
+}
+
+pub(crate) fn verify_ed25519_for_scheme(
+    signed: &SignedMandate,
+    expected_scheme: &str,
+    expected_assurance: AssuranceLevel,
+) -> Result<VerifiedMandate, AnchorError> {
+    let header = validate_envelope_header(signed, expected_scheme, expected_assurance)?;
     let sig_bytes = decode_lower_hex_fixed::<64>(&signed.signature_hex)
         .map_err(AnchorError::InvalidSignature)?;
     let signature = Signature::from_bytes(&sig_bytes);
@@ -737,7 +771,10 @@ pub(crate) fn map_proof_shape_error(err: ProofShapeError) -> AnchorError {
     }
 }
 
-fn parse_hex32_key_id(raw: &str, expected_scheme: &str) -> Result<(KeyId, [u8; 32]), AnchorError> {
+pub(crate) fn parse_hex32_key_id(
+    raw: &str,
+    expected_scheme: &str,
+) -> Result<(KeyId, [u8; 32]), AnchorError> {
     let key_id = KeyId::parse(raw)
         .map_err(|err| AnchorError::InvalidPublicKey(format!("invalid KeyId '{raw}': {err}")))?;
     if key_id.scheme() != expected_scheme {
@@ -761,7 +798,7 @@ fn ensure_lower_hex_digits(input: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn decode_lower_hex_fixed<const N: usize>(input: &str) -> Result<[u8; N], String> {
+pub(crate) fn decode_lower_hex_fixed<const N: usize>(input: &str) -> Result<[u8; N], String> {
     let expected_len = N * 2;
     if input.len() != expected_len {
         return Err(format!(
@@ -783,6 +820,26 @@ pub(crate) fn decode_lower_hex_vec(input: &str) -> Result<Vec<u8>, String> {
         return Err(format!(
             "expected even-length lowercase hex string, got {} chars",
             input.len()
+        ));
+    }
+    ensure_lower_hex_digits(input)?;
+    hex::decode(input).map_err(|err| err.to_string())
+}
+
+pub(crate) fn decode_lower_hex_var(input: &str, max_bytes: usize) -> Result<Vec<u8>, String> {
+    if input.is_empty() {
+        return Err("expected non-empty lowercase hex string".to_string());
+    }
+    if !input.len().is_multiple_of(2) {
+        return Err(format!(
+            "expected even-length lowercase hex string, got {} chars",
+            input.len()
+        ));
+    }
+    let byte_len = input.len() / 2;
+    if byte_len > max_bytes {
+        return Err(format!(
+            "hex payload length {byte_len} bytes exceeds maximum {max_bytes} bytes"
         ));
     }
     ensure_lower_hex_digits(input)?;

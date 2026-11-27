@@ -2,6 +2,7 @@
 
 mod facts;
 mod policy_check;
+mod sign;
 
 use std::fs;
 use std::io::Write;
@@ -9,10 +10,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
-use handfest_anchors::{
-    sign_mandate_with, verify_chain, Ed25519KeyFile, Ed25519Keypair, MandateSigner, SignedMandate,
-    SshSkPublicKey, SshSkSigner, SystemCommandRunner,
-};
+use handfest_anchors::{verify_chain, Ed25519Keypair, SignedMandate, SshSkPublicKey};
 use handfest_core::ast::{is_valid_timestamp, parse_rfc3339_utc, KeyId};
 use handfest_core::cnl::{parse_mandate, try_render_canonical};
 use handfest_core::gate::ActionRequest;
@@ -23,6 +21,7 @@ use serde_json::json;
 
 use crate::facts::parse_facts_arg;
 use crate::policy_check::resolve_policy_map_request;
+use crate::sign::{build_piv_signer_config, cmd_sign, SignArgs, SignerConfig};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -60,11 +59,64 @@ enum Commands {
         #[arg(long)]
         mandate: PathBuf,
         /// Path to the Ed25519 secret key JSON file created by `handfest keygen`.
-        #[arg(long, required_unless_present = "ssh_key", conflicts_with = "ssh_key")]
+        #[arg(
+            long,
+            required_unless_present_any = ["ssh_key", "fido2_cred", "gpg_key", "piv_pubkey"],
+            conflicts_with_all = ["ssh_key", "fido2_cred", "fido2_device", "gpg_key", "piv_pubkey", "piv_module", "piv_id"]
+        )]
         key: Option<PathBuf>,
         /// Path to an OpenSSH FIDO2 key handle or `.pub` file (`sk-ssh-ed25519@openssh.com`).
-        #[arg(long, required_unless_present = "key", conflicts_with = "key")]
+        #[arg(
+            long,
+            required_unless_present_any = ["key", "fido2_cred", "gpg_key", "piv_pubkey"],
+            conflicts_with_all = ["key", "fido2_cred", "fido2_device", "gpg_key", "piv_pubkey", "piv_module", "piv_id"]
+        )]
         ssh_key: Option<PathBuf>,
+        /// Path to a FIDO2 Ed25519 credential metadata JSON file
+        /// (`rp_id`, `credential_id_b64`, `key_id`).
+        #[arg(
+            long,
+            required_unless_present_any = ["key", "ssh_key", "gpg_key", "piv_pubkey"],
+            conflicts_with_all = ["key", "ssh_key", "gpg_key", "piv_pubkey", "piv_module", "piv_id"]
+        )]
+        fido2_cred: Option<PathBuf>,
+        /// Optional FIDO2 HID device path (e.g. `/dev/hidraw0`); auto-discovered via
+        /// `fido2-token -L` when omitted.
+        #[arg(
+            long,
+            requires = "fido2_cred",
+            conflicts_with_all = ["key", "ssh_key", "gpg_key", "piv_pubkey", "piv_module", "piv_id"]
+        )]
+        fido2_device: Option<String>,
+        /// OpenPGP / GPG smartcard Ed25519 key fingerprint (40-hex or 64-hex).
+        #[arg(
+            long,
+            required_unless_present_any = ["key", "ssh_key", "fido2_cred", "piv_pubkey"],
+            conflicts_with_all = ["key", "ssh_key", "fido2_cred", "fido2_device", "piv_pubkey", "piv_module", "piv_id"]
+        )]
+        gpg_key: Option<String>,
+        /// Path to a PEM-encoded RFC 8410 Ed25519 SubjectPublicKeyInfo file exported from a
+        /// YubiKey PIV slot (e.g. slot 9c).
+        #[arg(
+            long,
+            required_unless_present_any = ["key", "ssh_key", "fido2_cred", "gpg_key"],
+            conflicts_with_all = ["key", "ssh_key", "fido2_cred", "fido2_device", "gpg_key"]
+        )]
+        piv_pubkey: Option<PathBuf>,
+        /// Path to the PKCS#11 shared library (used with --piv-pubkey).
+        #[arg(
+            long,
+            requires = "piv_pubkey",
+            conflicts_with_all = ["key", "ssh_key", "fido2_cred", "fido2_device", "gpg_key"]
+        )]
+        piv_module: Option<String>,
+        /// PKCS#11 hex key ID for the PIV slot (default: "02" for slot 9c).
+        #[arg(
+            long,
+            requires = "piv_pubkey",
+            conflicts_with_all = ["key", "ssh_key", "fido2_cred", "fido2_device", "gpg_key"]
+        )]
+        piv_id: Option<String>,
         /// Anchor validity start timestamp (RFC 3339 UTC or Unix seconds).
         #[arg(long)]
         valid_from: String,
@@ -72,7 +124,7 @@ enum Commands {
         #[arg(long)]
         valid_until: String,
         /// Trust anchor identifier recorded in the SignedMandate envelope
-        /// (defaults to `local-ed25519` with `--key` or `yubikey-ssh-sk` with `--ssh-key`).
+        /// (defaults to `local-ed25519`, `yubikey-ssh-sk`, `yubikey-fido2`, `yubikey-openpgp`, or `yubikey-piv`).
         #[arg(long)]
         anchor_id: Option<String>,
         /// Optional path to write the SignedMandate JSON (prints JSON to stdout if omitted).
@@ -168,24 +220,45 @@ fn run(cli: Cli) -> Result<ExitCode, String> {
             mandate,
             key,
             ssh_key,
+            fido2_cred,
+            fido2_device,
+            gpg_key,
+            piv_pubkey,
+            piv_module,
+            piv_id,
             valid_from,
             valid_until,
             anchor_id,
             out,
         } => {
-            let signer = match (key, ssh_key) {
-                (Some(key_path), None) => SignerConfig::LocalEd25519 { key_path },
-                (None, Some(key_path)) => SignerConfig::SshSkEd25519 { key_path },
-                _ => return Err("exactly one of --key or --ssh-key must be supplied".to_string()),
+            let signer = match (key, ssh_key, fido2_cred, gpg_key, piv_pubkey) {
+                (Some(key_path), None, None, None, None) => SignerConfig::LocalEd25519 { key_path },
+                (None, Some(key_path), None, None, None) => SignerConfig::SshSkEd25519 { key_path },
+                (None, None, Some(cred_path), None, None) => SignerConfig::Fido2Ed25519 {
+                    cred_path,
+                    device_path: fido2_device,
+                },
+                (None, None, None, Some(fingerprint), None) => {
+                    SignerConfig::OpenPgpEd25519 { fingerprint }
+                }
+                (None, None, None, None, Some(pubkey_path)) => SignerConfig::PivEd25519 {
+                    pubkey_path,
+                    config: build_piv_signer_config(piv_module, piv_id)?,
+                },
+                _ => {
+                    return Err(
+                        "exactly one of --key, --ssh-key, --fido2-cred, --gpg-key, or --piv-pubkey must be supplied"
+                            .to_string(),
+                    );
+                }
             };
-            let resolved_anchor_id =
-                anchor_id.unwrap_or_else(|| signer.default_anchor_id().to_string());
+            let anchor_id = anchor_id.unwrap_or_else(|| signer.default_anchor_id().to_string());
             cmd_sign(&SignArgs {
                 mandate_path: mandate,
                 signer,
                 valid_from,
                 valid_until,
-                anchor_id: resolved_anchor_id,
+                anchor_id,
                 out,
             })
         }
@@ -232,30 +305,6 @@ fn run(cli: Cli) -> Result<ExitCode, String> {
         }
         Commands::Audit { ledger, actor_key } => cmd_audit(&ledger, actor_key.as_deref()),
     }
-}
-
-#[derive(Debug, PartialEq, Eq)]
-enum SignerConfig {
-    LocalEd25519 { key_path: PathBuf },
-    SshSkEd25519 { key_path: PathBuf },
-}
-
-impl SignerConfig {
-    const fn default_anchor_id(&self) -> &'static str {
-        match self {
-            Self::LocalEd25519 { .. } => "local-ed25519",
-            Self::SshSkEd25519 { .. } => "yubikey-ssh-sk",
-        }
-    }
-}
-
-struct SignArgs {
-    mandate_path: PathBuf,
-    signer: SignerConfig,
-    valid_from: String,
-    valid_until: String,
-    anchor_id: String,
-    out: Option<PathBuf>,
 }
 
 enum CheckSource {
@@ -311,69 +360,6 @@ fn cmd_keyid(ssh_key_path: &Path) -> Result<ExitCode, String> {
     println!("{}", pub_key.key_id());
     Ok(ExitCode::SUCCESS)
 }
-
-fn resolve_signer(config: &SignerConfig) -> Result<Box<dyn MandateSigner>, String> {
-    match config {
-        SignerConfig::LocalEd25519 { key_path } => {
-            let key_raw = fs::read_to_string(key_path)
-                .map_err(|err| format!("failed to read '{}': {err}", key_path.display()))?;
-            let key_file: Ed25519KeyFile = serde_json::from_str(&key_raw)
-                .map_err(|err| format!("invalid key file JSON: {err}"))?;
-            let keypair = Ed25519Keypair::from_key_file(&key_file)
-                .map_err(|err| format!("failed to load Ed25519 key: {err}"))?;
-            Ok(Box::new(keypair))
-        }
-        SignerConfig::SshSkEd25519 { key_path } => {
-            let signer = SshSkSigner::from_key_path(key_path, SystemCommandRunner)
-                .map_err(|err| format!("failed to load SSH security key: {err}"))?;
-            Ok(Box::new(signer))
-        }
-    }
-}
-
-fn sign_canonical_with_signer(
-    canonical: &str,
-    signer: &dyn MandateSigner,
-    valid_from_raw: &str,
-    valid_until_raw: &str,
-    anchor_id: &str,
-) -> Result<SignedMandate, String> {
-    let valid_from = parse_timestamp_arg("valid-from", valid_from_raw)?;
-    let valid_until = parse_timestamp_arg("valid-until", valid_until_raw)?;
-    sign_mandate_with(signer, canonical, anchor_id, valid_from, valid_until)
-        .map_err(|err| format!("failed to sign mandate: {err}"))
-}
-
-fn cmd_sign(args: &SignArgs) -> Result<ExitCode, String> {
-    let mandate_raw = fs::read_to_string(&args.mandate_path)
-        .map_err(|err| format!("failed to read '{}': {err}", args.mandate_path.display()))?;
-    let ast = parse_mandate(&mandate_raw).map_err(|err| format!("invalid mandate: {err}"))?;
-    let canonical = try_render_canonical(&ast).map_err(|err| format!("render error: {err}"))?;
-
-    let signer = resolve_signer(&args.signer)?;
-    let signed = sign_canonical_with_signer(
-        &canonical,
-        signer.as_ref(),
-        &args.valid_from,
-        &args.valid_until,
-        &args.anchor_id,
-    )?;
-    let mandate_id = ast
-        .try_mandate_id()
-        .map_err(|err| format!("failed to hash mandate: {err}"))?;
-    let json_text =
-        serde_json::to_string_pretty(&signed).map_err(|err| format!("serialize error: {err}"))?;
-
-    if let Some(path) = args.out.as_deref() {
-        fs::write(path, format!("{json_text}\n"))
-            .map_err(|err| format!("failed to write '{}': {err}", path.display()))?;
-        println!("{mandate_id}");
-    } else {
-        println!("{json_text}");
-    }
-    Ok(ExitCode::SUCCESS)
-}
-
 fn cmd_verify(paths: &[PathBuf]) -> Result<ExitCode, String> {
     let signed = load_signed_mandates(paths)?;
     let verified =
@@ -560,7 +546,7 @@ fn load_signed_mandates(paths: &[PathBuf]) -> Result<Vec<SignedMandate>, String>
     Ok(mandates)
 }
 
-fn parse_timestamp_arg(flag: &str, raw: &str) -> Result<i64, String> {
+pub(crate) fn parse_timestamp_arg(flag: &str, raw: &str) -> Result<i64, String> {
     if let Ok(ts) = parse_rfc3339_utc(raw) {
         return Ok(ts);
     }
@@ -647,6 +633,11 @@ fn write_secret_file(path: &Path, content: &str) -> Result<(), String> {
     file.write_all(content.as_bytes())
         .map_err(|err| format!("failed to write '{}': {err}", path.display()))
 }
+
+#[cfg(test)]
+use crate::sign::{resolve_signer, sign_canonical_with_signer};
+#[cfg(test)]
+use handfest_anchors::MandateSigner;
 
 #[cfg(test)]
 #[path = "main_tests.rs"]
