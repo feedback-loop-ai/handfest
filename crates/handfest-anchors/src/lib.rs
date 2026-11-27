@@ -13,7 +13,6 @@ use handfest_core::ActorKind;
 use rand_core::OsRng;
 use serde::{Deserialize, Serialize};
 
-mod base64;
 mod fido2;
 mod openpgp;
 mod p256;

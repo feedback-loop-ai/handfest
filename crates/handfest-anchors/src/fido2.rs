@@ -7,13 +7,13 @@ use handfest_core::gate::{VerifiedAnchorProof, VerifiedMandate, VerifiedRevocati
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::base64::{decode_standard, encode_standard};
 use crate::{
     decode_lower_hex_var, parse_hex32_key_id,
     revocation::{revocation_signing_payload, validate_revocation_header},
     signing_payload, validate_envelope_header, AnchorError, AnchorVerifier, AssuranceLevel,
     CommandRunner, MandateSigner, SignedMandate, SignedRevocation,
 };
+use handfest_core::base64::{decode_standard, encode_standard};
 
 /// Canonical `KeyId` scheme for FIDO2 / WebAuthn Ed25519 (`COSE alg = -8`) keys.
 pub const FIDO2_ED25519_SCHEME: &str = "fido2-ed25519";

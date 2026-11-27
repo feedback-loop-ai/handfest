@@ -1453,3 +1453,73 @@ fn saturated_deferred_fds_after_writer_drop_classifies_symlink_and_fifo_journal_
     drop(ro_a);
     assert!(reg.lock().unwrap().deferred_fds.is_empty());
 }
+
+#[test]
+fn map_read_only_stat_error_distinguishes_permission_denied_from_other_errors() {
+    let path = Path::new("/tmp/ledger.sqlite");
+    let perm_err = map_read_only_stat_error(
+        path,
+        &io::Error::new(io::ErrorKind::PermissionDenied, "denied"),
+    );
+    assert!(
+        matches!(perm_err, LedgerError::Storage(ref msg) if msg.contains("permission denied stating read-only ledger")),
+        "expected Storage for PermissionDenied stat error, got: {perm_err:?}"
+    );
+    let missing_err =
+        map_read_only_stat_error(path, &io::Error::new(io::ErrorKind::NotFound, "missing"));
+    assert!(
+        matches!(missing_err, LedgerError::Integrity(ref msg) if msg.contains("failed to stat read-only ledger")),
+        "expected Integrity for non-permission stat error, got: {missing_err:?}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn stat_read_only_regular_file_maps_permission_denied_at_symlink_metadata_to_storage() {
+    use std::os::unix::fs::PermissionsExt;
+
+    struct RestoreMode(PathBuf, u32);
+    impl Drop for RestoreMode {
+        fn drop(&mut self) {
+            let _ = fs::set_permissions(&self.0, fs::Permissions::from_mode(self.1));
+        }
+    }
+
+    static REG: OnceLock<Mutex<ActiveHandleRegistry>> = OnceLock::new();
+    let reg = REG.get_or_init(|| Mutex::new(ActiveHandleRegistry::default()));
+
+    let dir = TempDir::new().unwrap();
+    let restricted_dir = dir.path().join("stat_restricted_dir");
+    fs::create_dir(&restricted_dir).unwrap();
+    let db = write_valid_header_file(&restricted_dir.join("ledger.sqlite"));
+    let canonical = fs::canonicalize(&db).unwrap();
+
+    let restore = RestoreMode(restricted_dir.clone(), 0o700);
+    fs::set_permissions(&restricted_dir, fs::Permissions::from_mode(0o000)).unwrap();
+    match fs::symlink_metadata(&canonical) {
+        Ok(_) => return, // Root / CAP_DAC_OVERRIDE bypasses 0o000 parent dir permissions.
+        Err(err) => assert_eq!(err.kind(), io::ErrorKind::PermissionDenied),
+    }
+
+    let stat_err = stat_read_only_regular_file(&canonical).unwrap_err();
+    assert!(
+        matches!(stat_err, LedgerError::Storage(ref msg) if msg.contains("permission denied stating read-only ledger")),
+        "stat_read_only_regular_file must map symlink_metadata PermissionDenied to Storage, got: {stat_err:?}"
+    );
+
+    let Err(open_err) = open_read_only_guarded_in(reg, &canonical, |_| Ok(())) else {
+        panic!("open_read_only_guarded_in must fail on 0o000 parent dir");
+    };
+    assert!(
+        matches!(open_err, LedgerError::Storage(ref msg) if msg.contains("permission denied stating read-only ledger")),
+        "open_read_only_guarded_in must surface stat PermissionDenied as Storage, got: {open_err:?}"
+    );
+
+    drop(restore);
+    fs::remove_file(&canonical).unwrap();
+    let missing_err = stat_read_only_regular_file(&canonical).unwrap_err();
+    assert!(
+        matches!(missing_err, LedgerError::Integrity(ref msg) if msg.contains("failed to stat read-only ledger")),
+        "missing canonical path at stat must remain Integrity, got: {missing_err:?}"
+    );
+}

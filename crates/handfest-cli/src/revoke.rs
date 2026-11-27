@@ -2,6 +2,7 @@
 
 use std::collections::BTreeMap;
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -16,11 +17,12 @@ use handfest_core::revocation::{
     render_canonical_revocation, try_render_canonical_revocation, RevocationAst, RevocationTarget,
 };
 use handfest_core::ActorKind;
-use handfest_ledger::{SqliteLedger, StoredRevocation};
+use handfest_ledger::{open_no_follow_write_no_trunc, SqliteLedger, StoredRevocation};
 use serde_json::json;
 
 use crate::parse_timestamp_arg;
 use crate::sign::{resolve_signer, SignerConfig};
+use crate::witness::{record_revocation_with_witness, validate_witness_mode, WitnessMode};
 
 pub(crate) enum RevokeTargetArg {
     MandateFile(PathBuf),
@@ -40,9 +42,18 @@ pub(crate) struct RevokeArgs {
     pub(crate) valid_until: Option<String>,
     pub(crate) ledger: Option<PathBuf>,
     pub(crate) out: Option<PathBuf>,
+    pub(crate) witness: WitnessMode,
 }
 
 pub(crate) fn cmd_revoke(args: &RevokeArgs) -> Result<ExitCode, String> {
+    if args.witness != WitnessMode::None && args.ledger.is_none() {
+        return Err("--witness requires --ledger to anchor recorded revocations".to_string());
+    }
+    validate_witness_mode(args.witness)?;
+    if let (Some(ledger_path), Some(out_path)) = (args.ledger.as_deref(), args.out.as_deref()) {
+        reject_ledger_or_sidecar_out_path(ledger_path, out_path)?;
+    }
+
     let signer = resolve_signer(&args.signer)?;
     let signer_key = signer.key_id();
 
@@ -62,20 +73,6 @@ pub(crate) fn cmd_revoke(args: &RevokeArgs) -> Result<ExitCode, String> {
     };
 
     let effective_at = parse_effective_arg(&args.effective)?;
-    if let (Some(ledger_path), Some(out_path)) = (args.ledger.as_deref(), args.out.as_deref()) {
-        let same_raw = ledger_path == out_path;
-        let same_canon = match (fs::canonicalize(ledger_path), fs::canonicalize(out_path)) {
-            (Ok(a), Ok(b)) => a == b,
-            _ => false,
-        };
-        if same_raw || same_canon {
-            return Err(format!(
-                "--out '{}' must not point to the same file as --ledger '{}'",
-                out_path.display(),
-                ledger_path.display()
-            ));
-        }
-    }
 
     let valid_from = match args.valid_from.as_deref() {
         Some(raw) => parse_timestamp_arg("valid-from", raw)?,
@@ -116,18 +113,21 @@ pub(crate) fn cmd_revoke(args: &RevokeArgs) -> Result<ExitCode, String> {
 
     // Write --out before committing to --ledger so a failed file write never wedges retries.
     if let Some(path) = args.out.as_deref() {
-        fs::write(path, format!("{json_text}\n"))
-            .map_err(|err| format!("failed to write '{}': {err}", path.display()))?;
+        write_revocation_out_file(path, args.ledger.as_deref(), &format!("{json_text}\n"))?;
     }
 
     let recorded_in_ledger = if let Some(ledger_path) = args.ledger.as_deref() {
         let verified = verify_revocation(&signed)
             .map_err(|err| format!("signed revocation failed self-verification: {err}"))?;
-        let mut ledger = SqliteLedger::open(ledger_path)
+        let ledger = SqliteLedger::open(ledger_path)
             .map_err(|err| format!("failed to open ledger '{}': {err}", ledger_path.display()))?;
-        ledger
-            .record_revocation(&verified, &signed.signature_hex)
-            .map_err(|err| format!("failed to record revocation in ledger: {err}"))?;
+        record_revocation_with_witness(
+            ledger,
+            ledger_path,
+            args.witness,
+            &verified,
+            &signed.signature_hex,
+        )?;
         true
     } else {
         false
@@ -372,6 +372,9 @@ pub(crate) struct RevokeCliArgs {
     /// Optional path to write the SignedRevocation JSON (prints JSON to stdout if omitted).
     #[arg(long)]
     pub(crate) out: Option<PathBuf>,
+    /// Optional external checkpoint witness backend (`none` default, or `ots` with feature `witness-ots`).
+    #[arg(long, value_enum, default_value_t = WitnessMode::None)]
+    pub(crate) witness: WitnessMode,
 }
 
 pub(crate) fn run_revoke_cli(cli: RevokeCliArgs) -> Result<ExitCode, String> {
@@ -411,5 +414,188 @@ pub(crate) fn run_revoke_cli(cli: RevokeCliArgs) -> Result<ExitCode, String> {
         valid_until: cli.valid_until,
         ledger: cli.ledger,
         out: cli.out,
+        witness: cli.witness,
     })
+}
+
+const FORBIDDEN_LEDGER_OUT_SUFFIXES: &[&str] =
+    &["", ".checkpoints.jsonl", "-wal", "-shm", "-journal"];
+const MAX_SYMLINK_HOPS: usize = 40;
+
+fn append_path_suffix(path: &Path, suffix: &str) -> PathBuf {
+    let mut os = path.as_os_str().to_os_string();
+    os.push(suffix);
+    PathBuf::from(os)
+}
+
+fn resolve_path_without_leaf(path: &Path) -> Option<PathBuf> {
+    let file_name = path.file_name()?;
+    let parent = match path.parent() {
+        Some(dir) if !dir.as_os_str().is_empty() => dir,
+        _ => Path::new("."),
+    };
+    Some(fs::canonicalize(parent).ok()?.join(file_name))
+}
+
+fn resolve_path_following_symlinks(path: &Path) -> Result<PathBuf, String> {
+    let mut current = path.to_path_buf();
+    for _ in 0..MAX_SYMLINK_HOPS {
+        if let Some(normalized) = resolve_path_without_leaf(&current) {
+            current = normalized;
+        }
+        match fs::symlink_metadata(&current) {
+            Ok(meta) if meta.file_type().is_symlink() => {
+                let target = fs::read_link(&current).map_err(|err| {
+                    format!("failed to read symlink '{}': {err}", current.display())
+                })?;
+                current = if target.is_absolute() {
+                    target
+                } else {
+                    let parent = match current.parent() {
+                        Some(dir) if !dir.as_os_str().is_empty() => dir,
+                        _ => Path::new("."),
+                    };
+                    parent.join(target)
+                };
+            }
+            Ok(_) => {
+                return Ok(fs::canonicalize(&current).unwrap_or(current));
+            }
+            Err(_) => {
+                return Ok(current);
+            }
+        }
+    }
+    Err(format!(
+        "path '{}' exceeds maximum symlink depth ({MAX_SYMLINK_HOPS}) or contains a symlink cycle",
+        path.display()
+    ))
+}
+
+fn collect_path_forms(path: &Path) -> Result<Vec<PathBuf>, String> {
+    let mut forms = vec![path.to_path_buf()];
+    let resolved = resolve_path_following_symlinks(path)?;
+    if !forms.contains(&resolved) {
+        forms.push(resolved);
+    }
+    if let Some(no_leaf) = resolve_path_without_leaf(path) {
+        if !forms.contains(&no_leaf) {
+            forms.push(no_leaf);
+        }
+    }
+    Ok(forms)
+}
+
+#[cfg(unix)]
+fn file_inode_identity(path: &Path) -> Option<(u64, u64)> {
+    use std::os::unix::fs::MetadataExt;
+    fs::metadata(path).ok().map(|m| (m.dev(), m.ino()))
+}
+
+#[cfg(unix)]
+fn open_file_inode_identity(file: &fs::File) -> Option<(u64, u64)> {
+    use std::os::unix::fs::MetadataExt;
+    file.metadata().ok().map(|m| (m.dev(), m.ino()))
+}
+
+fn collect_forbidden_ledger_paths(ledger_path: &Path) -> Result<Vec<PathBuf>, String> {
+    let ledger_bases = collect_path_forms(ledger_path)?;
+    let mut forbidden_all = Vec::new();
+    for base in &ledger_bases {
+        for suffix in FORBIDDEN_LEDGER_OUT_SUFFIXES {
+            let candidate = append_path_suffix(base, suffix);
+            if !forbidden_all.contains(&candidate) {
+                forbidden_all.push(candidate.clone());
+            }
+            if let Ok(resolved) = resolve_path_following_symlinks(&candidate) {
+                if !forbidden_all.contains(&resolved) {
+                    forbidden_all.push(resolved);
+                }
+            }
+        }
+    }
+    Ok(forbidden_all)
+}
+
+fn reject_ledger_or_sidecar_out_path(ledger_path: &Path, out_path: &Path) -> Result<(), String> {
+    let out_forms = collect_path_forms(out_path)?;
+    let forbidden_paths = collect_forbidden_ledger_paths(ledger_path)?;
+    #[cfg(unix)]
+    let out_inode = file_inode_identity(out_path);
+
+    for forbidden in &forbidden_paths {
+        if out_forms.contains(forbidden) {
+            return Err(format!(
+                "--out '{}' must not point to --ledger '{}' or its sidecar files",
+                out_path.display(),
+                ledger_path.display()
+            ));
+        }
+        #[cfg(unix)]
+        if let (Some(out_id), Some(forbidden_id)) = (out_inode, file_inode_identity(forbidden)) {
+            if out_id == forbidden_id {
+                return Err(format!(
+                    "--out '{}' must not point to --ledger '{}' or its sidecar files (hardlink alias)",
+                    out_path.display(),
+                    ledger_path.display()
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn write_revocation_out_file(
+    out_path: &Path,
+    ledger_path: Option<&Path>,
+    content: &str,
+) -> Result<(), String> {
+    let mut file = open_no_follow_write_no_trunc(out_path).map_err(|err| {
+        if fs::symlink_metadata(out_path)
+            .map(|m| m.file_type().is_symlink())
+            .unwrap_or(false)
+        {
+            format!(
+                "refusing to write --out '{}' through symlink: {err}",
+                out_path.display()
+            )
+        } else {
+            format!("failed to open '{}' for writing: {err}", out_path.display())
+        }
+    })?;
+
+    let meta = file
+        .metadata()
+        .map_err(|err| format!("failed to fstat '{}': {err}", out_path.display()))?;
+    if !meta.is_file() {
+        return Err(format!(
+            "--out '{}' must be a regular file",
+            out_path.display()
+        ));
+    }
+
+    #[cfg(unix)]
+    if let Some(lp) = ledger_path {
+        if let Some(open_id) = open_file_inode_identity(&file) {
+            for forbidden in collect_forbidden_ledger_paths(lp)? {
+                if file_inode_identity(&forbidden) == Some(open_id) {
+                    return Err(format!(
+                        "--out '{}' must not point to --ledger '{}' or its sidecar files (hardlink alias)",
+                        out_path.display(),
+                        lp.display()
+                    ));
+                }
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = ledger_path;
+
+    file.set_len(0)
+        .map_err(|err| format!("failed to truncate '{}': {err}", out_path.display()))?;
+    file.write_all(content.as_bytes())
+        .map_err(|err| format!("failed to write '{}': {err}", out_path.display()))?;
+    file.flush()
+        .map_err(|err| format!("failed to flush '{}': {err}", out_path.display()))?;
+    Ok(())
 }

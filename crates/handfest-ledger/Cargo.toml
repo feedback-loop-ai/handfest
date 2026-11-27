@@ -7,6 +7,10 @@ license.workspace = true
 repository.workspace = true
 description = "Hash-chained receipt store, atomic chain-wide quota tracking, and offline audit replay for handfest"
 
+[features]
+default = []
+witness-ots = []
+
 [dependencies]
 handfest-core.workspace = true
 rusqlite.workspace = true

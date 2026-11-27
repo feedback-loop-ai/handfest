@@ -955,6 +955,9 @@ fn authorize_at_mismatched_actor_propagates_ledger_integrity_error() {
         ) -> Result<(usize, Option<TrackRecord>), LedgerError> {
             unimplemented!()
         }
+        fn verified_chain_hashes(&self) -> Result<handfest_ledger::LedgerChainHashes, LedgerError> {
+            unimplemented!()
+        }
     }
 
     let human = Ed25519Keypair::from_secret_bytes([71u8; 32]);

@@ -368,7 +368,7 @@ pub(crate) fn parse_openssh_pub_line_fields(
     let b64_blob = std::str::from_utf8(b64_bytes).map_err(|_| {
         AnchorError::InvalidPublicKey("base64 key blob is not valid UTF-8".to_string())
     })?;
-    let blob = crate::base64::decode_standard(b64_blob)
+    let blob = handfest_core::base64::decode_standard(b64_blob)
         .map_err(|err| AnchorError::InvalidPublicKey(format!("invalid base64 key blob: {err}")))?;
 
     Ok((key_type, blob))
@@ -616,7 +616,7 @@ pub(crate) fn decode_sshsig_pem(pem_bytes: &[u8]) -> Result<Vec<u8>, AnchorError
         ));
     }
     let body: String = body_lines.concat();
-    crate::base64::decode_standard(&body)
+    handfest_core::base64::decode_standard(&body)
         .map_err(|err| AnchorError::InvalidSignature(format!("invalid SSHSIG PEM base64: {err}")))
 }
 

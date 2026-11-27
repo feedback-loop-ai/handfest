@@ -976,6 +976,12 @@ impl handfest_ledger::ReceiptLedger for FailingLedger {
     ) -> Result<(usize, Option<handfest_ledger::TrackRecord>), handfest_ledger::LedgerError> {
         Err(handfest_ledger::LedgerError::Storage("disk full".into()))
     }
+
+    fn verified_chain_hashes(
+        &self,
+    ) -> Result<handfest_ledger::LedgerChainHashes, handfest_ledger::LedgerError> {
+        Err(handfest_ledger::LedgerError::Storage("disk full".into()))
+    }
 }
 
 #[test]

@@ -23,14 +23,11 @@ const HOT_JOURNAL_MAX_BACKOFF: Duration = Duration::from_millis(100);
 #[cfg(unix)]
 const MAX_DEFERRED_FDS: usize = 64;
 
-#[path = "preflight_open.rs"]
-mod preflight_open;
-
-use preflight_open::open_no_follow_read_only;
+use crate::preflight_open::open_no_follow_read_only;
 #[cfg(unix)]
-use preflight_open::UNIX_O_NOFOLLOW;
+use crate::preflight_open::UNIX_O_NOFOLLOW;
 #[cfg(all(test, unix))]
-use preflight_open::{combine_unix_open_flags, raw_open_calls, UNIX_O_NONBLOCK};
+use crate::preflight_open::{combine_unix_open_flags, raw_open_calls, UNIX_O_NONBLOCK};
 
 /// Process-local file identity for POSIX `fcntl` lock preservation and post-open identity checks.
 ///
@@ -391,13 +388,23 @@ fn verify_post_open_canonical_identity(
     Ok(())
 }
 
-fn stat_read_only_regular_file(canonical: &Path) -> Result<fs::Metadata, LedgerError> {
-    let meta = fs::symlink_metadata(canonical).map_err(|err| {
+fn map_read_only_stat_error(canonical: &Path, err: &io::Error) -> LedgerError {
+    if err.kind() == io::ErrorKind::PermissionDenied {
+        LedgerError::Storage(format!(
+            "permission denied stating read-only ledger '{}': {err}",
+            canonical.display()
+        ))
+    } else {
         LedgerError::Integrity(format!(
             "failed to stat read-only ledger '{}': {err}",
             canonical.display()
         ))
-    })?;
+    }
+}
+
+fn stat_read_only_regular_file(canonical: &Path) -> Result<fs::Metadata, LedgerError> {
+    let meta =
+        fs::symlink_metadata(canonical).map_err(|err| map_read_only_stat_error(canonical, &err))?;
     validate_regular_ledger_metadata(&meta, canonical)?;
     Ok(meta)
 }
@@ -472,10 +479,17 @@ fn inspect_sqlite_header_with_opener(
     let _ = state;
 
     let mut file = open(canonical).map_err(|err| {
-        LedgerError::Integrity(format!(
-            "failed to open read-only ledger '{}': {err}",
-            canonical.display()
-        ))
+        if err.kind() == io::ErrorKind::PermissionDenied {
+            LedgerError::Storage(format!(
+                "permission denied opening read-only ledger '{}': {err}",
+                canonical.display()
+            ))
+        } else {
+            LedgerError::Integrity(format!(
+                "failed to open read-only ledger '{}': {err}",
+                canonical.display()
+            ))
+        }
     })?;
     let res = inspect_sqlite_header_from_file(&mut file, canonical);
     #[cfg(unix)]

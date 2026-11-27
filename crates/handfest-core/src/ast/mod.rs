@@ -104,15 +104,25 @@ pub(crate) fn sha256_bytes(bytes: &[u8]) -> [u8; 32] {
     out
 }
 
-pub(crate) fn parse_sha256_digest(input: &str) -> Result<[u8; 32], String> {
-    let Some(hex) = input.strip_prefix("sha256:") else {
-        return Err("must start with 'sha256:'".to_string());
-    };
-    if hex.len() != 64 {
-        return Err("expected 64 lowercase hex characters".to_string());
+/// Encodes arbitrary bytes as lowercase hexadecimal ASCII.
+#[must_use]
+pub fn encode_lower_hex(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for &b in bytes {
+        out.push(HEX[(b >> 4) as usize] as char);
+        out.push(HEX[(b & 0x0f) as usize] as char);
+    }
+    out
+}
+
+/// Decodes exactly 64 lowercase hexadecimal ASCII characters into a 32-byte digest.
+pub fn decode_lower_hex_32(input: &str) -> Result<[u8; 32], &'static str> {
+    if input.len() != 64 {
+        return Err("expected 64 lowercase hex characters");
     }
     let mut bytes = [0u8; 32];
-    let raw = hex.as_bytes();
+    let raw = input.as_bytes();
     for (i, slot) in bytes.iter_mut().enumerate() {
         let hi = decode_lower_hex(raw[i * 2])?;
         let lo = decode_lower_hex(raw[i * 2 + 1])?;
@@ -121,11 +131,18 @@ pub(crate) fn parse_sha256_digest(input: &str) -> Result<[u8; 32], String> {
     Ok(bytes)
 }
 
-fn decode_lower_hex(b: u8) -> Result<u8, String> {
+pub(crate) fn parse_sha256_digest(input: &str) -> Result<[u8; 32], String> {
+    let Some(hex) = input.strip_prefix("sha256:") else {
+        return Err("must start with 'sha256:'".to_string());
+    };
+    decode_lower_hex_32(hex).map_err(str::to_string)
+}
+
+fn decode_lower_hex(b: u8) -> Result<u8, &'static str> {
     match b {
         b'0'..=b'9' => Ok(b - b'0'),
         b'a'..=b'f' => Ok(b - b'a' + 10),
-        _ => Err("digest must contain only lowercase hex digits".to_string()),
+        _ => Err("digest must contain only lowercase hex digits"),
     }
 }
 
@@ -637,4 +654,25 @@ fn split_glob_collapsed(pattern: &str) -> Vec<&str> {
     }
     parts.push(&pattern[start..]);
     parts
+}
+
+#[cfg(test)]
+mod hex_tests {
+    use super::*;
+
+    #[test]
+    fn lower_hex_roundtrip_and_rejection() {
+        let bytes: [u8; 32] = core::array::from_fn(|i| (i as u8).wrapping_mul(7).wrapping_add(3));
+        let hex = encode_lower_hex(&bytes);
+        assert_eq!(hex.len(), 64);
+        assert_eq!(decode_lower_hex_32(&hex), Ok(bytes));
+        assert_eq!(
+            decode_lower_hex_32("abcd"),
+            Err("expected 64 lowercase hex characters")
+        );
+        assert_eq!(
+            decode_lower_hex_32(&hex.to_uppercase()),
+            Err("digest must contain only lowercase hex digits")
+        );
+    }
 }

@@ -137,7 +137,7 @@ pub(crate) fn record_revocation_tx(
     tx: &Transaction<'_>,
     verified: &VerifiedRevocation,
     signature_hex: &str,
-) -> Result<RevocationId, LedgerError> {
+) -> Result<(RevocationId, Option<[u8; 32]>), LedgerError> {
     let revocation_id = validate_verified_revocation(verified)
         .map_err(|err| LedgerError::Integrity(format!("invalid revocation: {err}")))?;
     validate_signature_hex(signature_hex)?;
@@ -161,7 +161,7 @@ pub(crate) fn record_revocation_tx(
                 signature_hex.to_string(),
             );
         if same_envelope {
-            return Ok(revocation_id);
+            return Ok((revocation_id, None));
         }
         return Err(LedgerError::Integrity(format!(
             "revocation {revocation_id} already recorded with conflicting envelope metadata"
@@ -205,7 +205,7 @@ pub(crate) fn record_revocation_tx(
             signature_hex,
         ],
     )?;
-    Ok(revocation_id)
+    Ok((revocation_id, Some(*entry_hash.as_bytes())))
 }
 
 type ExistingEnvelopeTuple = (String, String, String, String, String, i64, i64, String);
@@ -259,6 +259,13 @@ fn load_latest_revocation_hash(tx: &Transaction<'_>) -> Result<Option<MandateId>
 pub(crate) fn verify_and_load_revocations(
     conn: &Connection,
 ) -> Result<(Vec<StoredRevocation>, RevocationSnapshot), LedgerError> {
+    verify_and_load_revocations_inner(conn, None)
+}
+
+pub(crate) fn verify_and_load_revocations_inner(
+    conn: &Connection,
+    mut collect_entry_hashes: Option<&mut Vec<[u8; 32]>>,
+) -> Result<(Vec<StoredRevocation>, RevocationSnapshot), LedgerError> {
     let mut stmt = conn.prepare(
         "SELECT seq, prev_entry_hash, entry_hash, revocation_id, canonical_words,
                 anchor_id, assurance, actor_kind, signer_key,
@@ -286,6 +293,9 @@ pub(crate) fn verify_and_load_revocations(
             ))
         })?;
         stored.push(record);
+        if let Some(hashes) = collect_entry_hashes.as_deref_mut() {
+            hashes.push(*entry_hash.as_bytes());
+        }
         expected_prev = Some(entry_hash);
         expected_seq += 1;
     }

@@ -171,6 +171,22 @@ impl ReceiptLedger for RecordingLedger {
         });
         Ok((self.receipts.len(), rec))
     }
+
+    fn verified_chain_hashes(&self) -> Result<handfest_ledger::LedgerChainHashes, LedgerError> {
+        self.audit_snapshot(None)?;
+        let last_permit_seq = self.receipts.iter().enumerate().rev().find_map(|(i, r)| {
+            (r.verdict == Verdict::Permit).then_some(u64::try_from(i + 1).unwrap())
+        });
+        Ok(handfest_ledger::LedgerChainHashes {
+            receipt_hashes: self
+                .receipts
+                .iter()
+                .map(|r| *r.receipt_hash.as_bytes())
+                .collect(),
+            revocation_hashes: Vec::new(),
+            last_permit_seq,
+        })
+    }
 }
 
 #[derive(Clone, Default)]

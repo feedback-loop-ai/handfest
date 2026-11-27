@@ -8,12 +8,12 @@ use handfest_core::Verdict;
 use sha2::{Digest, Sha256, Sha512};
 
 use super::*;
-use crate::base64::encode_standard;
 use crate::p256::{test_public_key_from_secret, test_sign_prehash_with_nonce};
 use crate::{
     sign_mandate_with, sign_revocation_with, verify_chain, verify_revocation, CommandOutput,
     Ed25519Keypair,
 };
+use handfest_core::base64::encode_standard;
 
 fn ts(s: &str) -> i64 {
     parse_rfc3339_utc(s).expect("valid RFC 3339 timestamp")

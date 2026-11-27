@@ -1,12 +1,16 @@
-//! Strict RFC 4648 standard Base64 codec (zero external dependencies).
+//! Strict RFC 4648 standard Base64 codec (zero external dependencies, `no_std + alloc`).
 //!
 //! Fails closed on non-alphabet bytes, whitespace, missing or misplaced `=` padding,
 //! wrong lengths, and non-canonical trailing padding bits.
 
+use alloc::string::String;
+use alloc::vec::Vec;
+
 const ENCODE_TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
 /// Encodes arbitrary bytes into canonical RFC 4648 standard Base64 with `=` padding.
-pub(crate) fn encode_standard(input: &[u8]) -> String {
+#[must_use]
+pub fn encode_standard(input: &[u8]) -> String {
     if input.is_empty() {
         return String::new();
     }
@@ -36,7 +40,7 @@ pub(crate) fn encode_standard(input: &[u8]) -> String {
 }
 
 /// Decodes strictly canonical RFC 4648 standard Base64 with `=` padding.
-pub(crate) fn decode_standard(input: &str) -> Result<Vec<u8>, &'static str> {
+pub fn decode_standard(input: &str) -> Result<Vec<u8>, &'static str> {
     let bytes = input.as_bytes();
     if bytes.is_empty() {
         return Ok(Vec::new());
@@ -153,6 +157,12 @@ mod tests {
         assert_eq!(decode_standard("Zm 9"), Err("invalid base64 character"));
         assert_eq!(decode_standard("Zm-9"), Err("invalid base64 character"));
         assert_eq!(decode_standard("Zm_9"), Err("invalid base64 character"));
-        assert_eq!(decode_standard("Zm9\n"), Err("invalid base64 character"));
+        assert_eq!(
+            decode_standard(
+                "Zm9
+"
+            ),
+            Err("invalid base64 character")
+        );
     }
 }

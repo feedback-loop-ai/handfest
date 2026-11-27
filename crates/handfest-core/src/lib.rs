@@ -6,6 +6,7 @@
 extern crate alloc;
 
 pub mod ast;
+pub mod base64;
 pub mod cnl;
 pub mod exact_json;
 pub mod gate;

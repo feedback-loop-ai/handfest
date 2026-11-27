@@ -23,6 +23,235 @@ fn classify_existing_ledger_open_error_maps_all_variants() {
         classify_existing_ledger_open_error(&LedgerError::QuotaAccounting("overflow".into())),
         "storage_error"
     );
+    assert_eq!(
+        classify_existing_ledger_open_error(&LedgerError::Witness(
+            handfest_ledger::WitnessError::Backend("offline".into())
+        )),
+        "witness_error"
+    );
+}
+
+#[test]
+fn cmd_audit_with_registry_verifies_witness_and_detects_rollback() {
+    use handfest_core::ast::parse_rfc3339_utc;
+    use handfest_core::base64::encode_standard;
+    use handfest_core::cnl::parse_mandate;
+    use handfest_core::gate::VerifiedFacts;
+    use handfest_ledger::{
+        default_checkpoint_sidecar_path, AnchoredLedger, CheckpointWitness, LedgerCheckpoint,
+        ReceiptLedger, WitnessError, WitnessPolicy, WitnessProof,
+    };
+
+    #[derive(Clone)]
+    struct StubMockWitness;
+    impl CheckpointWitness for StubMockWitness {
+        fn witness_kind(&self) -> &str {
+            "mock"
+        }
+        fn anchor(&self, cp: &LedgerCheckpoint) -> Result<WitnessProof, WitnessError> {
+            Ok(WitnessProof {
+                witness_kind: "mock".to_string(),
+                checkpoint_digest_hex: cp.checkpoint_digest_hex(),
+                proof_bytes_b64: encode_standard(&cp.checkpoint_digest()),
+                anchored_at: cp.timestamp,
+            })
+        }
+        fn verify(&self, cp: &LedgerCheckpoint, proof: &WitnessProof) -> Result<(), WitnessError> {
+            let expected = encode_standard(&cp.checkpoint_digest());
+            if proof.proof_bytes_b64 == expected {
+                Ok(())
+            } else {
+                Err(WitnessError::VerificationFailed("bad proof".to_string()))
+            }
+        }
+    }
+
+    let dir = tempfile::TempDir::new().unwrap();
+    let db_path = dir.path().join("audit_witness.sqlite");
+    let sidecar = default_checkpoint_sidecar_path(&db_path);
+
+    let root_kp = Ed25519Keypair::from_secret_bytes([0x11; 32]);
+    let actor_kp = Ed25519Keypair::from_secret_bytes([0x22; 32]);
+    let now = parse_rfc3339_utc("2026-11-24T18:00:00Z").unwrap();
+    let raw = format!(
+        "HANDFEST v1\nFROM human \"alice\" (key: {})\nTO agent \"bot\" (key: {})\nDELEGATION max 0 hops\nALLOW git.pr.merge\nON repo \"org/*\"\n",
+        root_kp.key_id(),
+        actor_kp.key_id()
+    );
+    let canonical = handfest_core::cnl::render_canonical(&parse_mandate(&raw).unwrap());
+    let signed = root_kp
+        .sign_mandate(&canonical, "local-ed25519", now - 60, now + 3600)
+        .unwrap();
+    let verified = handfest_anchors::verify_chain(&[signed]).unwrap();
+    let req = ActionRequest {
+        actor_key: actor_kp.key_id(),
+        action: "git.pr.merge".to_string(),
+        resource_kind: "repo".to_string(),
+        resource_id: "org/app".to_string(),
+    };
+
+    let sql = SqliteLedger::open(&db_path).unwrap();
+    let mut anchored = AnchoredLedger::with_checkpoint_file(
+        sql,
+        StubMockWitness,
+        WitnessPolicy::SyncStrict,
+        &sidecar,
+    )
+    .unwrap();
+    let (verdict, _) = anchored
+        .evaluate_and_record(&verified, &req, &VerifiedFacts::new(), now)
+        .unwrap();
+    assert_eq!(verdict, Verdict::Permit);
+    drop(anchored);
+
+    let sidecar_raw = fs::read_to_string(&sidecar).unwrap();
+    let stored: handfest_ledger::StoredCheckpoint =
+        serde_json::from_str(sidecar_raw.lines().last().unwrap()).unwrap();
+
+    let mut reg = handfest_ledger::WitnessRegistry::new();
+    reg.register(StubMockWitness).unwrap();
+    assert_eq!(
+        crate::witness::cmd_audit_with_registry(&db_path, None, true, None, &reg).unwrap(),
+        ExitCode::SUCCESS
+    );
+    assert_eq!(
+        crate::witness::cmd_audit_with_registry(
+            &db_path,
+            Some(&actor_kp.key_id().to_string()),
+            true,
+            Some(&stored.record_hash),
+            &reg,
+        )
+        .unwrap(),
+        ExitCode::SUCCESS
+    );
+
+    // --expected-checkpoint without --verify-witness is rejected.
+    let err = crate::witness::cmd_audit_with_registry(
+        &db_path,
+        None,
+        false,
+        Some(&stored.record_hash),
+        &reg,
+    )
+    .unwrap_err();
+    assert!(err.contains("--expected-checkpoint requires --verify-witness"));
+
+    // Wrong expected checkpoint head fails closed with structured code.
+    let wrong_head = format!("sha256:{}", "0".repeat(64));
+    assert_eq!(
+        crate::witness::cmd_audit_with_registry(&db_path, None, true, Some(&wrong_head), &reg)
+            .unwrap(),
+        ExitCode::FAILURE
+    );
+
+    // Unknown witness kind in empty registry fails closed with structured code.
+    let empty_reg = handfest_ledger::WitnessRegistry::new();
+    let ro = SqliteLedger::open_read_only(&db_path).unwrap();
+    let kind_err =
+        crate::witness::audit_snapshot_with_witness(&ro, &db_path, None, &empty_reg, None)
+            .unwrap_err();
+    assert_eq!(kind_err.code, "unsupported_witness_kind");
+    assert!(
+        kind_err.message.contains("unsupported witness kind 'mock'"),
+        "got: {}",
+        kind_err.message
+    );
+    assert_eq!(
+        crate::witness::cmd_audit_with_registry(&db_path, None, true, None, &empty_reg).unwrap(),
+        ExitCode::FAILURE
+    );
+
+    // Missing sidecar fails closed with structured code.
+    fs::remove_file(&sidecar).unwrap();
+    let missing_err =
+        crate::witness::audit_snapshot_with_witness(&ro, &db_path, None, &reg, None).unwrap_err();
+    assert_eq!(missing_err.code, "missing_sidecar");
+    assert!(
+        missing_err.message.contains("not found"),
+        "got: {}",
+        missing_err.message
+    );
+    assert_eq!(
+        crate::witness::cmd_audit_with_registry(&db_path, None, true, None, &reg).unwrap(),
+        ExitCode::FAILURE
+    );
+}
+
+#[test]
+fn classify_witness_audit_error_maps_all_variants() {
+    use crate::witness::classify_witness_audit_error;
+    use handfest_ledger::WitnessError;
+
+    assert_eq!(
+        classify_witness_audit_error(&LedgerError::NotFound("missing".into())),
+        "missing_sidecar"
+    );
+    assert_eq!(
+        classify_witness_audit_error(&LedgerError::Integrity("rollback".into())),
+        "integrity_or_rollback_mismatch"
+    );
+    assert_eq!(
+        classify_witness_audit_error(&LedgerError::Witness(WitnessError::DigestMismatch {
+            expected: "aa".into(),
+            actual: "bb".into(),
+        })),
+        "digest_mismatch"
+    );
+    assert_eq!(
+        classify_witness_audit_error(&LedgerError::Witness(WitnessError::UnsupportedWitnessKind(
+            "custom".into()
+        ))),
+        "unsupported_witness_kind"
+    );
+    assert_eq!(
+        classify_witness_audit_error(&LedgerError::Witness(WitnessError::VerificationFailed(
+            "bad".into()
+        ))),
+        "proof_verification_failed"
+    );
+    assert_eq!(
+        classify_witness_audit_error(&LedgerError::Witness(WitnessError::CommandFailed {
+            program: "ots".into(),
+            status: Some(1),
+            stderr: "err".into(),
+        })),
+        "proof_verification_failed"
+    );
+    assert_eq!(
+        classify_witness_audit_error(&LedgerError::Witness(WitnessError::InvalidProof(
+            "truncated".into()
+        ))),
+        "invalid_checkpoint_or_proof"
+    );
+    assert_eq!(
+        classify_witness_audit_error(&LedgerError::Storage("io".into())),
+        "storage_error"
+    );
+
+    use crate::witness::classify_ledger_open_audit_error;
+    assert_eq!(
+        classify_ledger_open_audit_error(&LedgerError::NotFound("missing".into())),
+        "missing_ledger"
+    );
+    assert_eq!(
+        classify_ledger_open_audit_error(&LedgerError::Integrity("corrupt".into())),
+        "invalid_or_corrupt_ledger"
+    );
+    assert_eq!(
+        classify_ledger_open_audit_error(&LedgerError::Storage("io".into())),
+        "storage_error"
+    );
+    assert_eq!(
+        classify_ledger_open_audit_error(&LedgerError::QuotaAccounting("overflow".into())),
+        "storage_error"
+    );
+    assert_eq!(
+        classify_ledger_open_audit_error(&LedgerError::Witness(WitnessError::InvalidProof(
+            "bad".into()
+        ))),
+        "invalid_checkpoint_or_proof"
+    );
 }
 
 #[test]
@@ -445,4 +674,308 @@ fn resolve_signer_supports_ssh_sk_p256_pub_and_companion_handle() {
         from_handle.assurance(),
         handfest_anchors::AssuranceLevel::Passkey
     );
+}
+
+#[derive(Clone)]
+struct StubMockWitness;
+
+impl handfest_ledger::CheckpointWitness for StubMockWitness {
+    fn witness_kind(&self) -> &str {
+        "mock"
+    }
+    fn anchor(
+        &self,
+        cp: &handfest_ledger::LedgerCheckpoint,
+    ) -> Result<handfest_ledger::WitnessProof, handfest_ledger::WitnessError> {
+        Ok(handfest_ledger::WitnessProof {
+            witness_kind: "mock".to_string(),
+            checkpoint_digest_hex: cp.checkpoint_digest_hex(),
+            proof_bytes_b64: handfest_core::base64::encode_standard(&cp.checkpoint_digest()),
+            anchored_at: cp.timestamp,
+        })
+    }
+    fn verify(
+        &self,
+        cp: &handfest_ledger::LedgerCheckpoint,
+        proof: &handfest_ledger::WitnessProof,
+    ) -> Result<(), handfest_ledger::WitnessError> {
+        if proof.proof_bytes_b64 == handfest_core::base64::encode_standard(&cp.checkpoint_digest())
+        {
+            Ok(())
+        } else {
+            Err(handfest_ledger::WitnessError::VerificationFailed(
+                "bad proof".to_string(),
+            ))
+        }
+    }
+}
+
+fn make_signed_test_revocation(
+    root_kp: &Ed25519Keypair,
+    seed: &[u8],
+    reason: &str,
+    now: i64,
+) -> (handfest_core::gate::VerifiedRevocation, String) {
+    use handfest_core::ast::{ActorDecl, MandateId};
+    use handfest_core::revocation::{render_canonical_revocation, RevocationAst, RevocationTarget};
+    use handfest_core::ActorKind;
+
+    let ast = RevocationAst::new(
+        ActorDecl::new(
+            ActorKind::Human,
+            "alice".to_string(),
+            root_kp.key_id(),
+            Default::default(),
+        )
+        .unwrap(),
+        RevocationTarget::Mandate(MandateId::sha256(seed)),
+        now + 1,
+        Some(reason.to_string()),
+    )
+    .unwrap();
+    let words = render_canonical_revocation(&ast);
+    let signed = root_kp
+        .sign_revocation(&words, "local-ed25519", now - 100, now + 10_000)
+        .unwrap();
+    let verified = handfest_anchors::verify_revocation(&signed).unwrap();
+    (verified, signed.signature_hex)
+}
+
+#[test]
+fn cmd_audit_with_registry_rejects_malformed_expected_checkpoint_and_real_signed_revocation_substitution(
+) {
+    use handfest_core::cnl::parse_mandate;
+    use handfest_core::gate::VerifiedFacts;
+    use handfest_ledger::{
+        default_checkpoint_sidecar_path, verify_ledger_witness_checkpoints, AnchoredLedger,
+        ReceiptLedger, WitnessPolicy,
+    };
+
+    let dir = tempfile::TempDir::new().unwrap();
+    let db_path = dir.path().join("signed_rev_sub.sqlite");
+    let alt_db_path = dir.path().join("signed_rev_alt.sqlite");
+    let sidecar = default_checkpoint_sidecar_path(&db_path);
+
+    let root_kp = Ed25519Keypair::from_secret_bytes([0x11; 32]);
+    let actor_kp = Ed25519Keypair::from_secret_bytes([0x22; 32]);
+    let now: i64 = 1_764_000_000;
+    let raw = format!(
+        "HANDFEST v1\nFROM human \"alice\" (key: {})\nTO agent \"bot\" (key: {})\nDELEGATION max 0 hops\nALLOW git.pr.merge\nON repo \"org/*\"\n",
+        root_kp.key_id(),
+        actor_kp.key_id()
+    );
+    let canonical = handfest_core::cnl::render_canonical(&parse_mandate(&raw).unwrap());
+    let signed_m = root_kp
+        .sign_mandate(&canonical, "local-ed25519", now - 100, now + 10_000)
+        .unwrap();
+    let verified_chain = handfest_anchors::verify_chain(&[signed_m]).unwrap();
+    let req = ActionRequest {
+        actor_key: actor_kp.key_id(),
+        action: "git.pr.merge".to_string(),
+        resource_kind: "repo".to_string(),
+        resource_id: "org/app".to_string(),
+    };
+
+    let (rev_a, sig_a) = make_signed_test_revocation(&root_kp, b"rev-a", "original rev", now);
+    let (rev_b, sig_b) =
+        make_signed_test_revocation(&root_kp, b"rev-b", "signed replacement rev", now);
+
+    {
+        let mut anchored = AnchoredLedger::with_checkpoint_file(
+            SqliteLedger::open(&db_path).unwrap(),
+            StubMockWitness,
+            WitnessPolicy::SyncStrict,
+            &sidecar,
+        )
+        .unwrap();
+        anchored
+            .evaluate_and_record(&verified_chain, &req, &VerifiedFacts::new(), now)
+            .unwrap();
+        anchored.record_revocation(&rev_a, &sig_a).unwrap();
+    }
+    {
+        let mut alt = SqliteLedger::open(&alt_db_path).unwrap();
+        alt.evaluate_and_record(&verified_chain, &req, &VerifiedFacts::new(), now)
+            .unwrap();
+        alt.record_revocation(&rev_b, &sig_b).unwrap();
+    }
+
+    let alt_ro = SqliteLedger::open_read_only(&alt_db_path).unwrap();
+    let alt_snap = alt_ro.audit_full_snapshot(None, false).unwrap();
+    assert_eq!(alt_snap.verified_receipts, 1);
+    crate::revoke::verify_stored_revocations_signatures(&alt_snap.stored_revocations)
+        .expect("replacement revocation must have a valid Ed25519 signature");
+
+    let mut reg = handfest_ledger::WitnessRegistry::new();
+    reg.register(StubMockWitness).unwrap();
+    let err =
+        verify_ledger_witness_checkpoints(&alt_ro, &sidecar, &reg, true, true, None).unwrap_err();
+    assert!(
+        matches!(err, LedgerError::Integrity(ref msg) if msg.contains("revocation tip hash mismatch")),
+        "expected revocation tip hash mismatch, got: {err}"
+    );
+
+    let audit_err = crate::witness::execute_audit_with_registry(
+        &db_path,
+        None,
+        true,
+        Some("not-a-sha256-digest"),
+        &reg,
+    )
+    .unwrap()
+    .unwrap_err();
+    assert_eq!(audit_err.code, "invalid_expected_checkpoint");
+    assert_eq!(
+        audit_err.to_json_value()["code"],
+        "invalid_expected_checkpoint"
+    );
+}
+
+#[test]
+fn execute_audit_with_registry_reports_forged_revocation_sig_as_structured_error() {
+    use handfest_ledger::{
+        default_checkpoint_sidecar_path, AnchoredLedger, ReceiptLedger, WitnessPolicy,
+    };
+
+    let dir = tempfile::TempDir::new().unwrap();
+    let mut reg = handfest_ledger::WitnessRegistry::new();
+    reg.register(StubMockWitness).unwrap();
+
+    let root_kp = Ed25519Keypair::from_secret_bytes([0x31; 32]);
+    let (verified_rev, _) =
+        make_signed_test_revocation(&root_kp, b"forged-unit", "forged", 1_764_000_000);
+    let forged_db = dir.path().join("forged_rev_sig_unit.sqlite");
+    let forged_sc = default_checkpoint_sidecar_path(&forged_db);
+    {
+        let mut anchored = AnchoredLedger::with_checkpoint_file(
+            SqliteLedger::open(&forged_db).unwrap(),
+            StubMockWitness,
+            WitnessPolicy::SyncStrict,
+            &forged_sc,
+        )
+        .unwrap();
+        anchored
+            .record_revocation(&verified_rev, "deadbeef")
+            .unwrap();
+    }
+
+    let err = crate::witness::execute_audit_with_registry(&forged_db, None, true, None, &reg)
+        .unwrap()
+        .unwrap_err();
+    assert_eq!(err.code, "invalid_revocation_signature");
+    let payload = err.to_json_value();
+    assert_eq!(payload["error"], "witness_verification_failed");
+    assert_eq!(payload["code"], "invalid_revocation_signature");
+}
+
+#[test]
+fn execute_audit_with_registry_reports_stationary_duplicate_checkpoint_as_structured_error() {
+    use handfest_core::cnl::parse_mandate;
+    use handfest_core::gate::VerifiedFacts;
+    use handfest_ledger::{
+        default_checkpoint_sidecar_path, AnchoredLedger, ReceiptLedger, StoredCheckpoint,
+        WitnessPolicy,
+    };
+
+    let dir = tempfile::TempDir::new().unwrap();
+    let mut reg = handfest_ledger::WitnessRegistry::new();
+    reg.register(StubMockWitness).unwrap();
+
+    let root_kp = Ed25519Keypair::from_secret_bytes([0x31; 32]);
+    let actor_kp = Ed25519Keypair::from_secret_bytes([0x32; 32]);
+    let now: i64 = 1_764_000_000;
+    let raw = format!(
+        "HANDFEST v1\nFROM human \"alice\" (key: {})\nTO agent \"bot\" (key: {})\nDELEGATION max 0 hops\nALLOW git.pr.merge\nON repo \"org/*\"\n",
+        root_kp.key_id(),
+        actor_kp.key_id()
+    );
+    let canonical = handfest_core::cnl::render_canonical(&parse_mandate(&raw).unwrap());
+    let signed_m = root_kp
+        .sign_mandate(&canonical, "local-ed25519", now - 100, now + 10_000)
+        .unwrap();
+    let verified_chain = handfest_anchors::verify_chain(&[signed_m]).unwrap();
+    let req = ActionRequest {
+        actor_key: actor_kp.key_id(),
+        action: "git.pr.merge".to_string(),
+        resource_kind: "repo".to_string(),
+        resource_id: "org/app".to_string(),
+    };
+    let dup_db = dir.path().join("dup_cp_unit.sqlite");
+    let dup_sc = default_checkpoint_sidecar_path(&dup_db);
+    {
+        let mut anchored = AnchoredLedger::with_checkpoint_file(
+            SqliteLedger::open(&dup_db).unwrap(),
+            StubMockWitness,
+            WitnessPolicy::SyncStrict,
+            &dup_sc,
+        )
+        .unwrap();
+        anchored
+            .evaluate_and_record(&verified_chain, &req, &VerifiedFacts::new(), now)
+            .unwrap();
+    }
+    let line1 = std::fs::read_to_string(&dup_sc).unwrap();
+    let rec1: StoredCheckpoint = serde_json::from_str(line1.trim()).unwrap();
+    let rec2_hash = StoredCheckpoint::compute_record_hash(
+        2,
+        Some(&rec1.record_hash),
+        &rec1.checkpoint,
+        &rec1.proof,
+    );
+    let rec2 = StoredCheckpoint {
+        seq: 2,
+        prev_record_hash: Some(rec1.record_hash.clone()),
+        record_hash: rec2_hash,
+        checkpoint: rec1.checkpoint.clone(),
+        proof: rec1.proof.clone(),
+    };
+    std::fs::write(
+        &dup_sc,
+        format!("{}{}\n", line1, serde_json::to_string(&rec2).unwrap()),
+    )
+    .unwrap();
+
+    let err = crate::witness::execute_audit_with_registry(&dup_db, None, true, None, &reg)
+        .unwrap()
+        .unwrap_err();
+    assert_eq!(err.code, "integrity_or_rollback_mismatch");
+    assert!(
+        err.message.contains("zero-progress duplicate"),
+        "expected zero-progress duplicate message, got: {}",
+        err.message
+    );
+    let payload = err.to_json_value();
+    assert_eq!(payload["error"], "witness_verification_failed");
+    assert_eq!(payload["code"], "integrity_or_rollback_mismatch");
+}
+
+#[cfg(unix)]
+#[test]
+fn audit_snapshot_with_witness_reports_storage_error_on_sidecar_path_permission_loss() {
+    use std::os::unix::fs::PermissionsExt;
+
+    struct RestoreMode(std::path::PathBuf, u32);
+    impl Drop for RestoreMode {
+        fn drop(&mut self) {
+            let _ = fs::set_permissions(&self.0, fs::Permissions::from_mode(self.1));
+        }
+    }
+
+    let dir = tempfile::TempDir::new().unwrap();
+    let restricted = dir.path().join("audit_access_loss");
+    fs::create_dir(&restricted).unwrap();
+    let db_path = restricted.join("ledger.sqlite");
+    let _ = SqliteLedger::open(&db_path).unwrap();
+    let ro = SqliteLedger::open_read_only(&db_path).unwrap();
+    let reg = handfest_ledger::WitnessRegistry::new();
+
+    let _restore = RestoreMode(restricted.clone(), 0o700);
+    fs::set_permissions(&restricted, fs::Permissions::from_mode(0o000)).unwrap();
+    if fs::canonicalize(&db_path).is_ok() {
+        return; // Root / CAP_DAC_OVERRIDE bypasses 0o000 parent dir permissions.
+    }
+
+    let err =
+        crate::witness::audit_snapshot_with_witness(&ro, &db_path, None, &reg, None).unwrap_err();
+    assert_eq!(err.code, "storage_error", "got: {err:?}");
 }

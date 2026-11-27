@@ -16,13 +16,22 @@ use rusqlite::{
     params, Connection, OpenFlags, OptionalExtension, Transaction, TransactionBehavior,
 };
 
-use crate::audit::{run_audit_tx, run_verified_list_receipts, run_verified_track_record};
+use crate::audit::{
+    collect_verified_chain_hashes_in_conn, run_audit_tx, run_full_audit_tx, run_full_audit_tx_with,
+    run_verified_chain_hashes, run_verified_chain_hashes_with, run_verified_list_receipts,
+    run_verified_track_record,
+};
 use crate::preflight::{open_read_only_guarded, open_writable_guarded, ActiveHandleGuard};
+use crate::preflight_open::{
+    map_open_existing_error, map_read_only_canonicalize_error, validate_file_path,
+};
 use crate::quotas::{apply_quota_updates, compute_quota_updates, load_quota_snapshot};
 use crate::revocations::{record_revocation_tx, verify_and_load_revocations};
 use crate::schema::{initialize_or_verify_schema, verify_existing_schema, verify_schema_integrity};
 use crate::{
-    resolve_pre_gate_denial_reason, LedgerError, ReceiptLedger, StoredRevocation, TrackRecord,
+    resolve_pre_gate_denial_reason, AtomicDenialWithRevocations, AtomicEvalRequest, AuditSnapshot,
+    LedgerChainHashes, LedgerError, ReadSnapshotLedger, ReceiptLedger, StoredRevocation,
+    TrackRecord, TransactionalLedger,
 };
 
 const BUSY_TIMEOUT_MS: u64 = 5_000;
@@ -86,12 +95,8 @@ impl SqliteLedger {
     /// before SQLite opens the database.
     pub fn open_read_only(path: impl AsRef<Path>) -> Result<Self, LedgerError> {
         let path = path.as_ref();
-        let canonical = fs::canonicalize(path).map_err(|err| {
-            LedgerError::Integrity(format!(
-                "failed to resolve read-only ledger path '{}': {err}",
-                path.display()
-            ))
-        })?;
+        let canonical =
+            fs::canonicalize(path).map_err(|err| map_read_only_canonicalize_error(path, &err))?;
 
         let flags = OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX;
         let (conn, handle_guard) = open_read_only_guarded(&canonical, |p| {
@@ -200,41 +205,84 @@ impl SqliteLedger {
         extra_revocations: &RevocationSnapshot,
         now: i64,
     ) -> Result<(Verdict, DecisionReceipt), LedgerError> {
+        self.evaluate_and_record_atomic(
+            AtomicEvalRequest {
+                chain,
+                request,
+                facts,
+                extra_revocations,
+                now,
+            },
+            |_| Ok(()),
+            |(), _, _, _| Ok(()),
+        )
+        .map(|(res, ())| res)
+    }
+
+    /// Executes [`Self::evaluate_and_record_with_revocations`] inside a `BEGIN EXCLUSIVE`
+    /// transaction, invoking `before_insert` prior to any mutation and `before_commit` prior to
+    /// committing. Drops `G` inside the exclusive lock if `COMMIT` fails.
+    pub fn evaluate_and_record_atomic<P, G, FPre, FPost>(
+        &mut self,
+        eval: AtomicEvalRequest<'_>,
+        before_insert: FPre,
+        before_commit: FPost,
+    ) -> Result<((Verdict, DecisionReceipt), G), LedgerError>
+    where
+        FPre: FnOnce(&dyn Fn() -> Result<LedgerChainHashes, LedgerError>) -> Result<P, LedgerError>,
+        FPost: FnOnce(
+            P,
+            &Verdict,
+            &DecisionReceipt,
+            &dyn Fn() -> Result<LedgerChainHashes, LedgerError>,
+        ) -> Result<G, LedgerError>,
+    {
         let tx = self
             .conn
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+            .transaction_with_behavior(TransactionBehavior::Exclusive)?;
 
         verify_schema_integrity(&tx)?;
+        let load_hashes = || collect_verified_chain_hashes_in_conn(&tx);
+        let pre_state = before_insert(&load_hashes)?;
+
         let prev_receipt_hash = load_latest_receipt_hash(&tx)?;
-        let chain_ids: Vec<MandateId> = chain.iter().map(|vm| vm.ast.mandate_id()).collect();
+        let chain_ids: Vec<MandateId> = eval.chain.iter().map(|vm| vm.ast.mandate_id()).collect();
         let usage = load_quota_snapshot(&tx, &chain_ids)?;
         let (_, mut revocations) = verify_and_load_revocations(&tx)?;
-        revocations.extend_from(extra_revocations);
+        revocations.extend_from(eval.extra_revocations);
 
         let (verdict, receipt) = authorize_with_revocations(
-            chain,
-            request,
-            facts,
+            eval.chain,
+            eval.request,
+            eval.facts,
             &usage,
             &revocations,
-            now,
+            eval.now,
             prev_receipt_hash,
         );
 
         let quota_updates = if verdict == Verdict::Permit {
-            Some(compute_quota_updates(chain, &chain_ids, facts, &usage)?)
+            Some(compute_quota_updates(
+                eval.chain, &chain_ids, eval.facts, &usage,
+            )?)
         } else {
             None
         };
 
-        insert_receipt(&tx, &receipt, &request.resource_kind, &request.resource_id)?;
+        insert_receipt(
+            &tx,
+            &receipt,
+            &eval.request.resource_kind,
+            &eval.request.resource_id,
+        )?;
 
         if let Some(updates) = quota_updates {
             apply_quota_updates(&tx, &updates)?;
         }
 
-        tx.commit()?;
-        Ok((verdict, receipt))
+        let guard = before_commit(pre_state, &verdict, &receipt, &load_hashes)?;
+        let guard = commit_tx_or_rollback_guard(tx, guard)?;
+        Ok(((verdict, receipt), guard))
     }
 
     /// Atomically persists a verified revocation into the tamper-evident `revocations` hash chain
@@ -244,13 +292,38 @@ impl SqliteLedger {
         revocation: &VerifiedRevocation,
         signature_hex: &str,
     ) -> Result<RevocationId, LedgerError> {
+        self.record_revocation_atomic(revocation, signature_hex, |_| Ok(()), |(), _, _| Ok(()))
+            .map(|(rev_id, ())| rev_id)
+    }
+
+    /// Executes [`Self::record_revocation`] inside a `BEGIN EXCLUSIVE` transaction, invoking
+    /// `before_insert` prior to any mutation and `before_commit` prior to committing. Drops `G`
+    /// inside the exclusive lock if `COMMIT` fails.
+    pub fn record_revocation_atomic<P, G, FPre, FPost>(
+        &mut self,
+        revocation: &VerifiedRevocation,
+        signature_hex: &str,
+        before_insert: FPre,
+        before_commit: FPost,
+    ) -> Result<(RevocationId, G), LedgerError>
+    where
+        FPre: FnOnce(&dyn Fn() -> Result<LedgerChainHashes, LedgerError>) -> Result<P, LedgerError>,
+        FPost: FnOnce(
+            P,
+            Option<[u8; 32]>,
+            &dyn Fn() -> Result<LedgerChainHashes, LedgerError>,
+        ) -> Result<G, LedgerError>,
+    {
         let tx = self
             .conn
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+            .transaction_with_behavior(TransactionBehavior::Exclusive)?;
         verify_schema_integrity(&tx)?;
-        let revocation_id = record_revocation_tx(&tx, revocation, signature_hex)?;
-        tx.commit()?;
-        Ok(revocation_id)
+        let load_hashes = || collect_verified_chain_hashes_in_conn(&tx);
+        let pre_state = before_insert(&load_hashes)?;
+        let (revocation_id, inserted_hash) = record_revocation_tx(&tx, revocation, signature_hex)?;
+        let guard = before_commit(pre_state, inserted_hash, &load_hashes)?;
+        let guard = commit_tx_or_rollback_guard(tx, guard)?;
+        Ok((revocation_id, guard))
     }
 
     /// Loads and integrity-verifies all persisted revocations as a [`RevocationSnapshot`] inside
@@ -291,11 +364,31 @@ impl SqliteLedger {
         now: i64,
         reason: String,
     ) -> Result<DecisionReceipt, LedgerError> {
+        self.record_denial_atomic(chain_ids, request, now, reason, |_| Ok(()))
+    }
+
+    /// Executes [`Self::record_denial`] inside a `BEGIN EXCLUSIVE` transaction and invokes
+    /// `before_insert` prior to inserting the denial receipt.
+    pub fn record_denial_atomic<FPre>(
+        &mut self,
+        chain_ids: Vec<MandateId>,
+        request: &ActionRequest,
+        now: i64,
+        reason: String,
+        before_insert: FPre,
+    ) -> Result<DecisionReceipt, LedgerError>
+    where
+        FPre:
+            FnOnce(&dyn Fn() -> Result<LedgerChainHashes, LedgerError>) -> Result<(), LedgerError>,
+    {
         let tx = self
             .conn
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+            .transaction_with_behavior(TransactionBehavior::Exclusive)?;
 
         verify_schema_integrity(&tx)?;
+        let load_hashes = || collect_verified_chain_hashes_in_conn(&tx);
+        before_insert(&load_hashes)?;
+
         let prev_receipt_hash = load_latest_receipt_hash(&tx)?;
         let receipt = build_denial_receipt(
             chain_ids,
@@ -317,7 +410,7 @@ impl SqliteLedger {
     /// Atomically verifies schema and persisted revocations, merges `extra_revocations`, resolves
     /// the effective pre-gate denial reason (`verify_chain_runtime` error > active revocation >
     /// `fallback_reason`), and persists the hash-chained denial receipt inside a single
-    /// `BEGIN IMMEDIATE` transaction without modifying quota counters.
+    /// `BEGIN EXCLUSIVE` transaction without modifying quota counters.
     pub fn record_denial_with_revocations(
         &mut self,
         chain: &[VerifiedMandate],
@@ -327,22 +420,54 @@ impl SqliteLedger {
         now: i64,
         fallback_reason: String,
     ) -> Result<(String, DecisionReceipt), LedgerError> {
-        let chain_ids: Vec<MandateId> = chain.iter().map(|vm| vm.ast.mandate_id()).collect();
+        self.record_denial_with_revocations_atomic(
+            AtomicDenialWithRevocations {
+                chain,
+                actor_key,
+                request,
+                extra_revocations,
+                now,
+                fallback_reason,
+            },
+            |_| Ok(()),
+        )
+    }
+
+    /// Executes [`Self::record_denial_with_revocations`] inside a `BEGIN EXCLUSIVE` transaction
+    /// and invokes `before_insert` prior to inserting the denial receipt.
+    pub fn record_denial_with_revocations_atomic<FPre>(
+        &mut self,
+        denial: AtomicDenialWithRevocations<'_>,
+        before_insert: FPre,
+    ) -> Result<(String, DecisionReceipt), LedgerError>
+    where
+        FPre:
+            FnOnce(&dyn Fn() -> Result<LedgerChainHashes, LedgerError>) -> Result<(), LedgerError>,
+    {
+        let chain_ids: Vec<MandateId> = denial.chain.iter().map(|vm| vm.ast.mandate_id()).collect();
         let tx = self
             .conn
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+            .transaction_with_behavior(TransactionBehavior::Exclusive)?;
 
         verify_schema_integrity(&tx)?;
+        let load_hashes = || collect_verified_chain_hashes_in_conn(&tx);
+        before_insert(&load_hashes)?;
+
         let (_, mut revocations) = verify_and_load_revocations(&tx)?;
-        revocations.extend_from(extra_revocations);
-        let reason =
-            resolve_pre_gate_denial_reason(chain, actor_key, &revocations, now, fallback_reason);
+        revocations.extend_from(denial.extra_revocations);
+        let reason = resolve_pre_gate_denial_reason(
+            denial.chain,
+            denial.actor_key,
+            &revocations,
+            denial.now,
+            denial.fallback_reason,
+        );
         let prev_receipt_hash = load_latest_receipt_hash(&tx)?;
         let bound_request = ActionRequest {
-            actor_key: actor_key.clone(),
-            action: request.action.clone(),
-            resource_kind: request.resource_kind.clone(),
-            resource_id: request.resource_id.clone(),
+            actor_key: denial.actor_key.clone(),
+            action: denial.request.action.clone(),
+            resource_kind: denial.request.resource_kind.clone(),
+            resource_id: denial.request.resource_id.clone(),
         };
         let receipt = build_denial_receipt(
             chain_ids,
@@ -350,7 +475,7 @@ impl SqliteLedger {
             bound_request.action,
             bound_request.resource_kind.clone(),
             bound_request.resource_id.clone(),
-            now,
+            denial.now,
             reason.clone(),
             prev_receipt_hash,
         )
@@ -390,6 +515,45 @@ impl SqliteLedger {
     /// in ascending `seq` order inside a single consistent read transaction.
     pub fn list_receipts(&self) -> Result<Vec<DecisionReceipt>, LedgerError> {
         run_verified_list_receipts(&self.conn)
+    }
+
+    /// Integrity-verifies the entire ledger inside a single consistent read snapshot and returns
+    /// the ordered 32-byte receipt hashes (`seq = 1..=N`) and revocation entry hashes
+    /// (`seq = 1..=M`).
+    pub fn verified_chain_hashes(&self) -> Result<LedgerChainHashes, LedgerError> {
+        run_verified_chain_hashes(&self.conn)
+    }
+
+    /// Integrity-verifies the entire ledger inside a single read transaction (`SHARED` lock) and
+    /// invokes `with_hashes` before committing/releasing the read lock.
+    pub fn with_read_snapshot<T, F>(&self, with_hashes: F) -> Result<T, LedgerError>
+    where
+        F: FnOnce(&LedgerChainHashes) -> Result<T, LedgerError>,
+    {
+        run_verified_chain_hashes_with(&self.conn, with_hashes)
+    }
+
+    /// Integrity-verifies the entire ledger and returns verified receipt count, optional actor
+    /// [`TrackRecord`], stored revocations, and optional [`LedgerChainHashes`] inside a single
+    /// consistent read transaction.
+    pub fn audit_full_snapshot(
+        &self,
+        actor_key: Option<&KeyId>,
+        include_chain_hashes: bool,
+    ) -> Result<AuditSnapshot, LedgerError> {
+        run_full_audit_tx(&self.conn, actor_key, include_chain_hashes)
+    }
+
+    pub(crate) fn audit_full_snapshot_in_read_tx<T, F>(
+        &self,
+        actor_key: Option<&KeyId>,
+        include_chain_hashes: bool,
+        inside_tx: F,
+    ) -> Result<(AuditSnapshot, T), LedgerError>
+    where
+        F: FnOnce() -> Result<T, LedgerError>,
+    {
+        run_full_audit_tx_with(&self.conn, actor_key, include_chain_hashes, inside_tx)
     }
 }
 
@@ -468,6 +632,105 @@ impl ReceiptLedger for SqliteLedger {
     ) -> Result<(usize, Option<TrackRecord>), LedgerError> {
         Self::audit_snapshot(self, actor_key)
     }
+
+    fn verified_chain_hashes(&self) -> Result<LedgerChainHashes, LedgerError> {
+        Self::verified_chain_hashes(self)
+    }
+}
+
+impl ReadSnapshotLedger for SqliteLedger {
+    fn with_read_snapshot<T, F>(&self, with_hashes: F) -> Result<T, LedgerError>
+    where
+        F: FnOnce(&LedgerChainHashes) -> Result<T, LedgerError>,
+    {
+        Self::with_read_snapshot(self, with_hashes)
+    }
+}
+
+impl TransactionalLedger for SqliteLedger {
+    fn evaluate_and_record_atomic<P, G, FPre, FPost>(
+        &mut self,
+        eval: AtomicEvalRequest<'_>,
+        before_insert: FPre,
+        before_commit: FPost,
+    ) -> Result<((Verdict, DecisionReceipt), G), LedgerError>
+    where
+        FPre: FnOnce(&dyn Fn() -> Result<LedgerChainHashes, LedgerError>) -> Result<P, LedgerError>,
+        FPost: FnOnce(
+            P,
+            &Verdict,
+            &DecisionReceipt,
+            &dyn Fn() -> Result<LedgerChainHashes, LedgerError>,
+        ) -> Result<G, LedgerError>,
+    {
+        Self::evaluate_and_record_atomic(self, eval, before_insert, before_commit)
+    }
+
+    fn record_revocation_atomic<P, G, FPre, FPost>(
+        &mut self,
+        revocation: &VerifiedRevocation,
+        signature_hex: &str,
+        before_insert: FPre,
+        before_commit: FPost,
+    ) -> Result<(RevocationId, G), LedgerError>
+    where
+        FPre: FnOnce(&dyn Fn() -> Result<LedgerChainHashes, LedgerError>) -> Result<P, LedgerError>,
+        FPost: FnOnce(
+            P,
+            Option<[u8; 32]>,
+            &dyn Fn() -> Result<LedgerChainHashes, LedgerError>,
+        ) -> Result<G, LedgerError>,
+    {
+        Self::record_revocation_atomic(
+            self,
+            revocation,
+            signature_hex,
+            before_insert,
+            before_commit,
+        )
+    }
+
+    fn record_denial_atomic<FPre>(
+        &mut self,
+        chain_ids: Vec<MandateId>,
+        request: &ActionRequest,
+        now: i64,
+        reason: String,
+        before_insert: FPre,
+    ) -> Result<DecisionReceipt, LedgerError>
+    where
+        FPre:
+            FnOnce(&dyn Fn() -> Result<LedgerChainHashes, LedgerError>) -> Result<(), LedgerError>,
+    {
+        Self::record_denial_atomic(self, chain_ids, request, now, reason, before_insert)
+    }
+
+    fn record_denial_with_revocations_atomic<FPre>(
+        &mut self,
+        denial: AtomicDenialWithRevocations<'_>,
+        before_insert: FPre,
+    ) -> Result<(String, DecisionReceipt), LedgerError>
+    where
+        FPre:
+            FnOnce(&dyn Fn() -> Result<LedgerChainHashes, LedgerError>) -> Result<(), LedgerError>,
+    {
+        Self::record_denial_with_revocations_atomic(self, denial, before_insert)
+    }
+}
+
+pub(crate) fn commit_tx_or_rollback_guard<G>(
+    tx: Transaction<'_>,
+    guard: G,
+) -> Result<G, LedgerError> {
+    if let Err(err) = tx.execute_batch("COMMIT") {
+        // Drop `guard` (e.g. sidecar truncate + sync_all) BEFORE dropping `tx` so no waiting
+        // writer or reader can acquire SQLite's lock and observe an aborted sidecar record before
+        // rollback completes.
+        drop(guard);
+        drop(tx);
+        return Err(LedgerError::from(err));
+    }
+    Ok(guard)
 }
 
 fn load_latest_receipt_hash(tx: &Transaction<'_>) -> Result<Option<MandateId>, LedgerError> {
@@ -483,47 +746,6 @@ fn load_latest_receipt_hash(tx: &Transaction<'_>) -> Result<Option<MandateId>, L
         Some(s) => MandateId::parse(&s)
             .map(Some)
             .map_err(|err| LedgerError::Integrity(format!("corrupt latest receipt_hash: {err}"))),
-    }
-}
-
-fn map_open_existing_error(path: &Path, err: rusqlite::Error) -> LedgerError {
-    if let rusqlite::Error::SqliteFailure(
-        rusqlite::ffi::Error {
-            code: rusqlite::ErrorCode::CannotOpen,
-            extended_code,
-        },
-        _,
-    ) = err
-    {
-        if extended_code != rusqlite::ffi::SQLITE_CANTOPEN_ISDIR
-            && matches!(fs::metadata(path), Err(ref io_err) if io_err.kind() == std::io::ErrorKind::NotFound)
-        {
-            return LedgerError::NotFound(err.to_string());
-        }
-        return LedgerError::Storage(err.to_string());
-    }
-    LedgerError::from(err)
-}
-
-fn validate_file_path(path: &Path, caller: &str) -> Result<(), LedgerError> {
-    let raw_os = path.as_os_str();
-    if raw_os.is_empty() || raw_os == ":memory:" || is_sqlite_uri_path(raw_os) {
-        return Err(LedgerError::Storage(format!(
-            "empty, ':memory:', or 'file:' URI path rejected by {caller}; use open_in_memory() for ephemeral ledgers"
-        )));
-    }
-    Ok(())
-}
-
-fn is_sqlite_uri_path(raw: &std::ffi::OsStr) -> bool {
-    #[cfg(unix)]
-    {
-        use std::os::unix::ffi::OsStrExt;
-        raw.as_bytes().starts_with(b"file:")
-    }
-    #[cfg(not(unix))]
-    {
-        raw.to_str().is_some_and(|s| s.starts_with("file:"))
     }
 }
 

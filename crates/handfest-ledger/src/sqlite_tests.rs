@@ -1535,3 +1535,133 @@ fn schema_verification_precedes_receipt_read_on_non_empty_ledger() {
         other => panic!("expected LedgerError::Integrity, got: {other:?}"),
     }
 }
+
+#[test]
+fn commit_tx_or_rollback_guard_drops_guard_while_exclusive_lock_is_still_held() {
+    use std::sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    };
+
+    let dir = TempDir::new().unwrap();
+    let db_path = dir.path().join("deferred_fk_commit_fail.sqlite");
+
+    let mut conn = Connection::open(&db_path).unwrap();
+    conn.execute_batch(
+        "PRAGMA journal_mode = DELETE;
+         PRAGMA foreign_keys = ON;
+         CREATE TABLE parent(id INTEGER PRIMARY KEY);
+         CREATE TABLE child(pid INTEGER REFERENCES parent(id) DEFERRABLE INITIALLY DEFERRED);",
+    )
+    .unwrap();
+
+    let lock_held_during_guard_drop = Arc::new(AtomicBool::new(false));
+    #[derive(Debug)]
+    struct LockCheckingGuard {
+        db_path: std::path::PathBuf,
+        lock_held: Arc<AtomicBool>,
+    }
+    impl Drop for LockCheckingGuard {
+        fn drop(&mut self) {
+            let probe = Connection::open(&self.db_path).unwrap();
+            probe.busy_timeout(Duration::ZERO).unwrap();
+            let err = probe
+                .query_row("SELECT COUNT(*) FROM child", [], |row| row.get::<_, i64>(0))
+                .expect_err("SQLite EXCLUSIVE lock must STILL be held while rollback guard drops");
+            assert!(
+                matches!(
+                    err,
+                    rusqlite::Error::SqliteFailure(
+                        rusqlite::ffi::Error {
+                            code: rusqlite::ErrorCode::DatabaseBusy,
+                            ..
+                        },
+                        _
+                    )
+                ),
+                "expected SQLITE_BUSY during guard drop, got: {err}"
+            );
+            self.lock_held.store(true, Ordering::SeqCst);
+        }
+    }
+
+    let tx = conn
+        .transaction_with_behavior(TransactionBehavior::Exclusive)
+        .unwrap();
+    tx.execute("INSERT INTO child VALUES (999)", []).unwrap();
+    let guard = LockCheckingGuard {
+        db_path: db_path.clone(),
+        lock_held: Arc::clone(&lock_held_during_guard_drop),
+    };
+    let err = commit_tx_or_rollback_guard(tx, guard).unwrap_err();
+    assert!(
+        matches!(err, LedgerError::Storage(_)),
+        "expected Storage error from deferred FK COMMIT failure, got: {err:?}"
+    );
+    assert!(
+        lock_held_during_guard_drop.load(Ordering::SeqCst),
+        "rollback guard Drop must execute while BEGIN EXCLUSIVE lock is still held"
+    );
+
+    // After commit_tx_or_rollback_guard returns, tx has rolled back and released the lock.
+    let probe = Connection::open(&db_path).unwrap();
+    probe.busy_timeout(Duration::ZERO).unwrap();
+    let count: i64 = probe
+        .query_row("SELECT COUNT(*) FROM child", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(count, 0, "failed COMMIT must roll back inserted row");
+}
+
+#[cfg(unix)]
+#[test]
+fn open_read_only_maps_permission_denied_parent_dir_and_file_to_storage() {
+    use std::os::unix::fs::PermissionsExt;
+
+    struct RestoreMode(std::path::PathBuf, u32);
+    impl Drop for RestoreMode {
+        fn drop(&mut self) {
+            let _ = fs::set_permissions(&self.0, fs::Permissions::from_mode(self.1));
+        }
+    }
+
+    let dir = TempDir::new().unwrap();
+    let (chain, req, facts, now) = sample_chain_and_req();
+
+    // 1. Ledger inside a 0o000 parent dir: fs::canonicalize returns PermissionDenied -> Storage.
+    let restricted_dir = dir.path().join("ro_restricted_dir");
+    fs::create_dir(&restricted_dir).unwrap();
+    let dir_db = restricted_dir.join("ledger.sqlite");
+    {
+        let mut init = SqliteLedger::open(&dir_db).unwrap();
+        init.evaluate_and_record(&chain, &req, &facts, now).unwrap();
+    }
+    let _restore_dir = RestoreMode(restricted_dir.clone(), 0o700);
+    fs::set_permissions(&restricted_dir, fs::Permissions::from_mode(0o000)).unwrap();
+    match fs::canonicalize(&dir_db) {
+        Ok(_) => return, // Root / CAP_DAC_OVERRIDE bypasses 0o000 permissions.
+        Err(err) => assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied),
+    }
+    let dir_err = SqliteLedger::open_read_only(&dir_db).unwrap_err();
+    assert!(
+        matches!(dir_err, LedgerError::Storage(_)),
+        "open_read_only inside 0o000 parent dir must map to Storage, got: {dir_err:?}"
+    );
+    drop(_restore_dir);
+
+    // 2. Unreadable 0o000 ledger file: canonicalize succeeds, header open returns PermissionDenied -> Storage.
+    let mode000_db = dir.path().join("ro_mode_0000.sqlite");
+    {
+        let mut init = SqliteLedger::open(&mode000_db).unwrap();
+        init.evaluate_and_record(&chain, &req, &facts, now).unwrap();
+    }
+    let _restore_file = RestoreMode(mode000_db.clone(), 0o600);
+    fs::set_permissions(&mode000_db, fs::Permissions::from_mode(0o000)).unwrap();
+    if fs::File::open(&mode000_db).is_ok() {
+        return;
+    }
+    let file_err = SqliteLedger::open_read_only(&mode000_db).unwrap_err();
+    assert!(
+        matches!(file_err, LedgerError::Storage(_)),
+        "open_read_only on 0o000 file must map to Storage, got: {file_err:?}"
+    );
+}

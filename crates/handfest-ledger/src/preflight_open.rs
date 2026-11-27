@@ -5,7 +5,7 @@ use std::io;
 use std::path::Path;
 
 #[cfg(unix)]
-pub(super) const UNIX_O_NOFOLLOW: Option<i32> = if cfg!(all(
+pub(crate) const UNIX_O_NOFOLLOW: Option<i32> = if cfg!(all(
     any(target_os = "linux", target_os = "android"),
     any(
         target_arch = "arm",
@@ -48,7 +48,7 @@ pub(super) const UNIX_O_NOFOLLOW: Option<i32> = if cfg!(all(
 };
 
 #[cfg(unix)]
-pub(super) const UNIX_O_NONBLOCK: Option<i32> = if cfg!(all(
+pub(crate) const UNIX_O_NONBLOCK: Option<i32> = if cfg!(all(
     any(target_os = "linux", target_os = "android"),
     any(
         target_arch = "x86_64",
@@ -94,7 +94,7 @@ pub(super) const UNIX_O_NONBLOCK: Option<i32> = if cfg!(all(
 };
 
 #[cfg(unix)]
-pub(super) const fn combine_unix_open_flags(no_follow: Option<i32>, non_block: Option<i32>) -> i32 {
+pub(crate) const fn combine_unix_open_flags(no_follow: Option<i32>, non_block: Option<i32>) -> i32 {
     let nf = if let Some(flag) = no_follow { flag } else { 0 };
     let nb = if let Some(flag) = non_block { flag } else { 0 };
     nf | nb
@@ -107,11 +107,11 @@ thread_local! {
 }
 
 #[cfg(all(test, unix))]
-pub(super) fn raw_open_calls() -> usize {
+pub(crate) fn raw_open_calls() -> usize {
     RAW_OPEN_CALLS.with(|c| c.load(std::sync::atomic::Ordering::SeqCst))
 }
 
-pub(super) fn open_no_follow_read_only(path: &Path) -> io::Result<File> {
+pub(crate) fn open_no_follow_read_only(path: &Path) -> io::Result<File> {
     #[cfg(all(test, unix))]
     RAW_OPEN_CALLS.with(|c| c.fetch_add(1, std::sync::atomic::Ordering::SeqCst));
     let mut opts = fs::OpenOptions::new();
@@ -122,4 +122,109 @@ pub(super) fn open_no_follow_read_only(path: &Path) -> io::Result<File> {
         opts.custom_flags(combine_unix_open_flags(UNIX_O_NOFOLLOW, UNIX_O_NONBLOCK));
     }
     opts.open(path)
+}
+
+pub(crate) const HAS_UNIX_O_NOFOLLOW: bool = {
+    #[cfg(unix)]
+    {
+        UNIX_O_NOFOLLOW.is_some()
+    }
+    #[cfg(not(unix))]
+    {
+        false
+    }
+};
+
+pub(crate) fn open_no_follow_append_0600(path: &Path) -> io::Result<File> {
+    let mut opts = fs::OpenOptions::new();
+    opts.create(true).append(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+        opts.custom_flags(combine_unix_open_flags(UNIX_O_NOFOLLOW, UNIX_O_NONBLOCK));
+    }
+    opts.open(path)
+}
+
+/// Opens (or creates) `path` for writing without following a trailing symlink and without
+/// truncating on open, so callers can inspect `File::metadata()` / inode identity before
+/// truncating and writing.
+pub fn open_no_follow_write_no_trunc(path: &Path) -> io::Result<File> {
+    if !HAS_UNIX_O_NOFOLLOW {
+        if let Ok(meta) = fs::symlink_metadata(path) {
+            if meta.file_type().is_symlink() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("refusing to follow symlink '{}'", path.display()),
+                ));
+            }
+        }
+    }
+    let mut opts = fs::OpenOptions::new();
+    opts.write(true).create(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.custom_flags(combine_unix_open_flags(UNIX_O_NOFOLLOW, UNIX_O_NONBLOCK));
+    }
+    opts.open(path)
+}
+
+pub(crate) fn map_read_only_canonicalize_error(path: &Path, err: &io::Error) -> crate::LedgerError {
+    match err.kind() {
+        io::ErrorKind::NotFound => crate::LedgerError::NotFound(format!(
+            "read-only ledger '{}' not found: {err}",
+            path.display()
+        )),
+        io::ErrorKind::PermissionDenied => crate::LedgerError::Storage(format!(
+            "permission denied resolving read-only ledger path '{}': {err}",
+            path.display()
+        )),
+        _ => crate::LedgerError::Integrity(format!(
+            "failed to resolve read-only ledger path '{}': {err}",
+            path.display()
+        )),
+    }
+}
+
+pub(crate) fn map_open_existing_error(path: &Path, err: rusqlite::Error) -> crate::LedgerError {
+    if let rusqlite::Error::SqliteFailure(
+        rusqlite::ffi::Error {
+            code: rusqlite::ErrorCode::CannotOpen,
+            extended_code,
+        },
+        _,
+    ) = err
+    {
+        if extended_code != rusqlite::ffi::SQLITE_CANTOPEN_ISDIR
+            && matches!(fs::metadata(path), Err(ref io_err) if io_err.kind() == io::ErrorKind::NotFound)
+        {
+            return crate::LedgerError::NotFound(err.to_string());
+        }
+        return crate::LedgerError::Storage(err.to_string());
+    }
+    crate::LedgerError::from(err)
+}
+
+pub(crate) fn validate_file_path(path: &Path, caller: &str) -> Result<(), crate::LedgerError> {
+    let raw_os = path.as_os_str();
+    if raw_os.is_empty() || raw_os == ":memory:" || is_sqlite_uri_path(raw_os) {
+        return Err(crate::LedgerError::Storage(format!(
+            "empty, ':memory:', or 'file:' URI path rejected by {caller}; use open_in_memory() for ephemeral ledgers"
+        )));
+    }
+    Ok(())
+}
+
+fn is_sqlite_uri_path(raw: &std::ffi::OsStr) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        raw.as_bytes().starts_with(b"file:")
+    }
+    #[cfg(not(unix))]
+    {
+        raw.to_str().is_some_and(|s| s.starts_with("file:"))
+    }
 }

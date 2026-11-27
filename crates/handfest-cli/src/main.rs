@@ -6,6 +6,7 @@ mod keyid;
 mod policy_check;
 mod revoke;
 mod sign;
+mod witness;
 
 use std::fs;
 use std::io::Write;
@@ -31,6 +32,9 @@ use crate::revoke::{
     verify_stored_revocations_signatures, RevokeCliArgs,
 };
 use crate::sign::{build_piv_signer_config, cmd_sign, SignArgs, SignerConfig};
+use crate::witness::{
+    cmd_audit, evaluate_with_witness, validate_witness_mode, WitnessMode, WitnessedEvalContext,
+};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -209,6 +213,9 @@ enum Commands {
         /// Optional signed revocation JSON files to enforce alongside ledger revocations (repeatable).
         #[arg(long = "revocation")]
         revocations: Vec<PathBuf>,
+        /// Optional external checkpoint witness backend (`none` default, or `ots` with feature `witness-ots`).
+        #[arg(long, value_enum, default_value_t = WitnessMode::None)]
+        witness: WitnessMode,
     },
     /// Verifies ledger hash-chain integrity and optionally prints an actor's TrackRecord.
     Audit {
@@ -218,6 +225,12 @@ enum Commands {
         /// Optional actor KeyId to compute a TrackRecord projection for.
         #[arg(long)]
         actor_key: Option<String>,
+        /// Verify all persisted external witness proofs against the local hash chain (fails closed on rollback/truncation).
+        #[arg(long, default_value_t = false)]
+        verify_witness: bool,
+        /// Optional operator-pinned expected checkpoint head (`sha256:<64-lowercase-hex>`, matching latest record_hash or checkpoint_digest; requires --verify-witness).
+        #[arg(long, requires = "verify_witness")]
+        expected_checkpoint: Option<String>,
     },
 }
 
@@ -294,24 +307,17 @@ fn run(cli: Cli) -> Result<ExitCode, String> {
             now,
             require_existing_ledger,
             revocations,
+            witness,
         } => {
-            let source = match (policy_map, tool_name) {
-                (Some(policy_map), Some(tool_name)) => CheckSource::PolicyMap {
-                    policy_map,
-                    tool_name,
-                    tool_input,
-                },
-                (None, None) => CheckSource::Direct {
-                    action: action.ok_or_else(|| "missing --action".to_string())?,
-                    resource_kind: resource_kind
-                        .ok_or_else(|| "missing --resource-kind".to_string())?,
-                    resource_id: resource_id.ok_or_else(|| "missing --resource-id".to_string())?,
-                    facts,
-                },
-                _ => {
-                    return Err("--policy-map and --tool-name must be supplied together".to_string())
-                }
-            };
+            let source = resolve_check_source(
+                policy_map,
+                tool_name,
+                tool_input,
+                action,
+                resource_kind,
+                resource_id,
+                facts,
+            )?;
             cmd_check(&CheckArgs {
                 ledger,
                 chain,
@@ -320,9 +326,45 @@ fn run(cli: Cli) -> Result<ExitCode, String> {
                 now,
                 require_existing_ledger,
                 revocations,
+                witness,
             })
         }
-        Commands::Audit { ledger, actor_key } => cmd_audit(&ledger, actor_key.as_deref()),
+        Commands::Audit {
+            ledger,
+            actor_key,
+            verify_witness,
+            expected_checkpoint,
+        } => cmd_audit(
+            &ledger,
+            actor_key.as_deref(),
+            verify_witness,
+            expected_checkpoint.as_deref(),
+        ),
+    }
+}
+
+fn resolve_check_source(
+    policy_map: Option<PathBuf>,
+    tool_name: Option<String>,
+    tool_input: String,
+    action: Option<String>,
+    resource_kind: Option<String>,
+    resource_id: Option<String>,
+    facts: String,
+) -> Result<CheckSource, String> {
+    match (policy_map, tool_name) {
+        (Some(policy_map), Some(tool_name)) => Ok(CheckSource::PolicyMap {
+            policy_map,
+            tool_name,
+            tool_input,
+        }),
+        (None, None) => Ok(CheckSource::Direct {
+            action: action.ok_or_else(|| "missing --action".to_string())?,
+            resource_kind: resource_kind.ok_or_else(|| "missing --resource-kind".to_string())?,
+            resource_id: resource_id.ok_or_else(|| "missing --resource-id".to_string())?,
+            facts,
+        }),
+        _ => Err("--policy-map and --tool-name must be supplied together".to_string()),
     }
 }
 
@@ -348,6 +390,7 @@ struct CheckArgs {
     now: String,
     require_existing_ledger: bool,
     revocations: Vec<PathBuf>,
+    witness: WitnessMode,
 }
 
 #[expect(
@@ -478,6 +521,7 @@ fn cmd_verify(
 }
 
 fn cmd_check(args: &CheckArgs) -> Result<ExitCode, String> {
+    validate_witness_mode(args.witness)?;
     let actor_key = KeyId::parse(&args.actor_key)
         .map_err(|err| format!("invalid --actor-key '{}': {err}", args.actor_key))?;
     let now = parse_rfc3339_utc(&args.now)
@@ -517,7 +561,7 @@ fn cmd_check(args: &CheckArgs) -> Result<ExitCode, String> {
         verify_chain(&signed).map_err(|err| format!("signature verification failed: {err}"))?;
     let extra_revocations = load_and_verify_revocations(&args.revocations)?;
 
-    let mut ledger = if args.require_existing_ledger {
+    let ledger = if args.require_existing_ledger {
         match SqliteLedger::open_existing(&args.ledger) {
             Ok(ledger) => ledger,
             Err(err) => {
@@ -529,9 +573,16 @@ fn cmd_check(args: &CheckArgs) -> Result<ExitCode, String> {
         SqliteLedger::open(&args.ledger)
             .map_err(|err| format!("failed to open ledger '{}': {err}", args.ledger.display()))?
     };
-    let (verdict, receipt) = ledger
-        .evaluate_and_record_with_revocations(&verified, &request, &facts, &extra_revocations, now)
-        .map_err(|err| format!("ledger evaluation failed: {err}"))?;
+    let eval_ctx = WitnessedEvalContext {
+        ledger_path: &args.ledger,
+        witness_mode: args.witness,
+        verified: &verified,
+        request: &request,
+        facts: &facts,
+        extra_revocations: &extra_revocations,
+        now,
+    };
+    let (verdict, receipt) = evaluate_with_witness(ledger, &eval_ctx)?;
 
     match verdict {
         Verdict::Permit => {
@@ -564,6 +615,7 @@ fn classify_existing_ledger_open_error(err: &LedgerError) -> &'static str {
     match err {
         LedgerError::NotFound(_) => "missing_ledger",
         LedgerError::Integrity(_) => "invalid_ledger",
+        LedgerError::Witness(_) => "witness_error",
         LedgerError::Storage(_) | LedgerError::Json(_) | LedgerError::QuotaAccounting(_) => {
             "storage_error"
         }
@@ -579,44 +631,6 @@ fn emit_existing_ledger_open_error(path: &Path, err: &LedgerError) {
         "message": message,
     });
     eprintln!("{payload}");
-}
-
-fn cmd_audit(ledger_path: &Path, actor_key_raw: Option<&str>) -> Result<ExitCode, String> {
-    let actor_key = match actor_key_raw {
-        Some(raw) => {
-            Some(KeyId::parse(raw).map_err(|err| format!("invalid --actor-key '{raw}': {err}"))?)
-        }
-        None => None,
-    };
-
-    let ledger = SqliteLedger::open_read_only(ledger_path)
-        .map_err(|err| format!("failed to open ledger '{}': {err}", ledger_path.display()))?;
-    let (verified_receipts, track_record) = ledger
-        .audit_snapshot(actor_key.as_ref())
-        .map_err(|err| format!("audit integrity check failed: {err}"))?;
-    let stored_revocations = ledger
-        .list_stored_revocations()
-        .map_err(|err| format!("audit revocation check failed: {err}"))?;
-    verify_stored_revocations_signatures(&stored_revocations)
-        .map_err(|err| format!("audit revocation signature check failed: {err}"))?;
-
-    let output = match track_record {
-        Some(record) => json!({
-            "status": "ok",
-            "verified_receipts": verified_receipts,
-            "track_record": record,
-        }),
-        None => json!({
-            "status": "ok",
-            "verified_receipts": verified_receipts,
-        }),
-    };
-
-    println!(
-        "{}",
-        serde_json::to_string_pretty(&output).map_err(|err| err.to_string())?
-    );
-    Ok(ExitCode::SUCCESS)
 }
 
 fn load_signed_mandates(paths: &[PathBuf]) -> Result<Vec<SignedMandate>, String> {

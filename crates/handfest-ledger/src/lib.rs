@@ -1,15 +1,21 @@
 //! Hash-chained receipt ledger abstraction, transactional SQLite store, atomic chain-wide quota
 //! tracking, and offline audit replay.
 
+mod anchored;
 mod audit;
+mod checkpoint_store;
 mod codec;
 #[cfg(all(test, unix))]
 mod lock_probe_test_util;
+#[cfg(feature = "witness-ots")]
+mod ots;
 mod preflight;
+mod preflight_open;
 mod quotas;
 mod revocations;
 mod schema;
 mod sqlite;
+mod witness;
 
 use std::fmt;
 
@@ -21,9 +27,24 @@ use handfest_core::gate::{
 use handfest_core::revocation::RevocationId;
 use serde::{Deserialize, Serialize};
 
+pub use anchored::{
+    verify_audit_snapshot_with_witness, verify_ledger_witness_checkpoints, AnchoredLedger,
+};
 pub use handfest_core::Verdict;
+#[cfg(feature = "witness-ots")]
+pub use ots::{
+    CommandOutput, CommandRunner, OtsWitness, SystemCommandRunner, MAX_OTS_PROOF_BYTES,
+    OTS_PROOF_MAGIC, OTS_WITNESS_KIND,
+};
+pub use preflight_open::open_no_follow_write_no_trunc;
 pub use revocations::StoredRevocation;
 pub use sqlite::SqliteLedger;
+pub use witness::{
+    canonical_checkpoint_sidecar_path, default_checkpoint_sidecar_path, validate_witness_kind,
+    validate_witness_proof, CheckpointWitness, LedgerCheckpoint, StoredCheckpoint, WitnessError,
+    WitnessPolicy, WitnessProof, WitnessRegistry, CHECKPOINT_DIGEST_DOMAIN_PREFIX,
+    EMPTY_RECEIPT_TIP_HASH,
+};
 
 use crate::codec::key_id_serde;
 
@@ -35,6 +56,7 @@ pub enum LedgerError {
     Json(serde_json::Error),
     Integrity(String),
     QuotaAccounting(String),
+    Witness(WitnessError),
 }
 
 impl fmt::Display for LedgerError {
@@ -45,6 +67,7 @@ impl fmt::Display for LedgerError {
             Self::Json(err) => write!(f, "json serialization error: {err}"),
             Self::Integrity(msg) => write!(f, "ledger integrity error: {msg}"),
             Self::QuotaAccounting(msg) => write!(f, "quota accounting error: {msg}"),
+            Self::Witness(err) => write!(f, "witness error: {err}"),
         }
     }
 }
@@ -53,6 +76,7 @@ impl std::error::Error for LedgerError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Json(err) => Some(err),
+            Self::Witness(err) => Some(err),
             Self::NotFound(_)
             | Self::Storage(_)
             | Self::Integrity(_)
@@ -83,6 +107,31 @@ impl From<serde_json::Error> for LedgerError {
     fn from(err: serde_json::Error) -> Self {
         Self::Json(err)
     }
+}
+
+impl From<WitnessError> for LedgerError {
+    fn from(err: WitnessError) -> Self {
+        Self::Witness(err)
+    }
+}
+
+/// Ordered 32-byte SHA-256 hash-chain entries returned by [`ReceiptLedger::verified_chain_hashes`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LedgerChainHashes {
+    pub receipt_hashes: Vec<[u8; 32]>,
+    pub revocation_hashes: Vec<[u8; 32]>,
+    /// 1-based receipt sequence number of the latest persisted `Verdict::Permit` receipt, or
+    /// `None` if the ledger has zero `Permit` receipts (empty or `Deny`-only ledger).
+    pub last_permit_seq: Option<u64>,
+}
+
+/// Complete integrity-verified audit snapshot captured inside a single consistent read transaction.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuditSnapshot {
+    pub verified_receipts: usize,
+    pub track_record: Option<TrackRecord>,
+    pub stored_revocations: Vec<StoredRevocation>,
+    pub chain_hashes: Option<LedgerChainHashes>,
 }
 
 /// Actor track-record projection derived from persisted [`DecisionReceipt`] rows.
@@ -213,6 +262,122 @@ pub trait ReceiptLedger {
         &self,
         actor_key: Option<&KeyId>,
     ) -> Result<(usize, Option<TrackRecord>), LedgerError>;
+
+    /// Integrity-verifies the ledger inside a single consistent read snapshot and returns the
+    /// ordered 32-byte SHA-256 receipt hashes (`seq = 1..=N`) and revocation entry hashes
+    /// (`seq = 1..=M`) without exposing private receipt payloads.
+    fn verified_chain_hashes(&self) -> Result<LedgerChainHashes, LedgerError>;
+}
+
+/// Bundled inputs for [`TransactionalLedger::evaluate_and_record_atomic`].
+#[derive(Debug, Clone, Copy)]
+pub struct AtomicEvalRequest<'a> {
+    pub chain: &'a [VerifiedMandate],
+    pub request: &'a ActionRequest,
+    pub facts: &'a VerifiedFacts,
+    pub extra_revocations: &'a RevocationSnapshot,
+    pub now: i64,
+}
+
+/// Bundled inputs for [`TransactionalLedger::record_denial_with_revocations_atomic`].
+#[derive(Debug)]
+pub struct AtomicDenialWithRevocations<'a> {
+    pub chain: &'a [VerifiedMandate],
+    pub actor_key: &'a KeyId,
+    pub request: &'a ActionRequest,
+    pub extra_revocations: &'a RevocationSnapshot,
+    pub now: i64,
+    pub fallback_reason: String,
+}
+
+/// Synchronized read-snapshot seam for ledger backends (including read-only handles) that can hold
+/// a consistent read lock/transaction across an external sidecar read.
+///
+/// Every implementation must keep its read lock/transaction (such as SQLite's `SHARED` lock) open
+/// until `with_hashes` returns so external sidecar reads observe a writer-synchronized pair.
+pub trait ReadSnapshotLedger {
+    /// Integrity-verifies the ledger inside a single consistent read snapshot and invokes
+    /// `with_hashes(&chain_hashes)` while the underlying read lock/snapshot is still held.
+    fn with_read_snapshot<T, F>(&self, with_hashes: F) -> Result<T, LedgerError>
+    where
+        F: FnOnce(&LedgerChainHashes) -> Result<T, LedgerError>;
+}
+
+/// Transactional pre-insert and pre-commit hook seam for [`ReceiptLedger`] backends supporting
+/// atomic rollback and serialized write locks across external sidecar coordination (such as
+/// [`AnchoredLedger`]).
+///
+/// Every implementation must uphold the exact same fail-closed atomicity contract:
+/// - Acquire an exclusive write lock (e.g. SQLite `BEGIN EXCLUSIVE`) before running
+///   `before_insert` or mutating state, and hold it across `before_commit` and commit/rollback.
+/// - Run `before_insert` BEFORE inserting any receipt, quota, or revocation rows so pre-insert
+///   external sidecar checks catch even 1-row rollbacks + identical replays before any mutation.
+/// - Drop any rollback guard `G` returned by `before_commit` INSIDE the exclusive lock scope
+///   BEFORE releasing the transaction lock if `COMMIT` fails.
+/// - On idempotent [`ReceiptLedger::record_revocation`] replay (no new row inserted), pass
+///   `inserted_entry_hash = None` to `before_commit`.
+pub trait TransactionalLedger: ReceiptLedger + ReadSnapshotLedger {
+    /// Executes [`ReceiptLedger::evaluate_and_record_with_revocations`] inside an exclusive write
+    /// transaction, invoking `before_insert` prior to any mutation and `before_commit` prior to
+    /// `COMMIT`. Drops `G` inside the exclusive lock if `COMMIT` fails.
+    fn evaluate_and_record_atomic<P, G, FPre, FPost>(
+        &mut self,
+        eval: AtomicEvalRequest<'_>,
+        before_insert: FPre,
+        before_commit: FPost,
+    ) -> Result<((Verdict, DecisionReceipt), G), LedgerError>
+    where
+        FPre: FnOnce(&dyn Fn() -> Result<LedgerChainHashes, LedgerError>) -> Result<P, LedgerError>,
+        FPost: FnOnce(
+            P,
+            &Verdict,
+            &DecisionReceipt,
+            &dyn Fn() -> Result<LedgerChainHashes, LedgerError>,
+        ) -> Result<G, LedgerError>;
+
+    /// Executes [`ReceiptLedger::record_revocation`] inside an exclusive write transaction,
+    /// invoking `before_insert` prior to any mutation and
+    /// `before_commit(pre_state, inserted_entry_hash, &load_post_hashes)` prior to `COMMIT`.
+    /// Drops `G` inside the exclusive lock if `COMMIT` fails.
+    fn record_revocation_atomic<P, G, FPre, FPost>(
+        &mut self,
+        revocation: &VerifiedRevocation,
+        signature_hex: &str,
+        before_insert: FPre,
+        before_commit: FPost,
+    ) -> Result<(RevocationId, G), LedgerError>
+    where
+        FPre: FnOnce(&dyn Fn() -> Result<LedgerChainHashes, LedgerError>) -> Result<P, LedgerError>,
+        FPost: FnOnce(
+            P,
+            Option<[u8; 32]>,
+            &dyn Fn() -> Result<LedgerChainHashes, LedgerError>,
+        ) -> Result<G, LedgerError>;
+
+    /// Executes [`ReceiptLedger::record_denial`] inside an exclusive write transaction, invoking
+    /// `before_insert` prior to inserting the denial receipt.
+    fn record_denial_atomic<FPre>(
+        &mut self,
+        chain_ids: Vec<MandateId>,
+        request: &ActionRequest,
+        now: i64,
+        reason: String,
+        before_insert: FPre,
+    ) -> Result<DecisionReceipt, LedgerError>
+    where
+        FPre:
+            FnOnce(&dyn Fn() -> Result<LedgerChainHashes, LedgerError>) -> Result<(), LedgerError>;
+
+    /// Executes [`ReceiptLedger::record_denial_with_revocations`] inside an exclusive write
+    /// transaction, invoking `before_insert` prior to inserting the denial receipt.
+    fn record_denial_with_revocations_atomic<FPre>(
+        &mut self,
+        denial: AtomicDenialWithRevocations<'_>,
+        before_insert: FPre,
+    ) -> Result<(String, DecisionReceipt), LedgerError>
+    where
+        FPre:
+            FnOnce(&dyn Fn() -> Result<LedgerChainHashes, LedgerError>) -> Result<(), LedgerError>;
 }
 
 /// Resolves the effective pre-gate denial reason with strict fail-closed precedence:

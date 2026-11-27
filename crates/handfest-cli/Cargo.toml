@@ -11,6 +11,10 @@ description = "Reference CLI for formatting, signing, narrowing, verifying, and 
 name = "handfest"
 path = "src/main.rs"
 
+[features]
+default = []
+witness-ots = ["handfest-ledger/witness-ots"]
+
 [dependencies]
 handfest-core.workspace = true
 handfest-anchors.workspace = true

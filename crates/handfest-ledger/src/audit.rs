@@ -11,9 +11,19 @@ use crate::codec::{
     col_i64, col_opt_i64, col_opt_text, col_text, format_resource, parse_chain_ids_json,
     parse_optional_mandate_id, parse_verdict,
 };
-use crate::revocations::verify_and_load_revocations;
+use crate::revocations::verify_and_load_revocations_inner;
 use crate::schema::verify_schema_integrity;
-use crate::{LedgerError, TrackRecord};
+use crate::{AuditSnapshot, LedgerChainHashes, LedgerError, StoredRevocation, TrackRecord};
+
+#[derive(Default)]
+struct AuditProjection<'a> {
+    track_record: Option<&'a mut TrackRecordBuilder>,
+    receipts: Option<&'a mut Vec<DecisionReceipt>>,
+    receipt_hashes: Option<&'a mut Vec<[u8; 32]>>,
+    last_permit_seq: Option<&'a mut Option<u64>>,
+    stored_revocations: Option<&'a mut Vec<StoredRevocation>>,
+    revocation_hashes: Option<&'a mut Vec<[u8; 32]>>,
+}
 
 pub(crate) fn run_audit_tx<F: FnOnce()>(
     conn: &Connection,
@@ -22,10 +32,66 @@ pub(crate) fn run_audit_tx<F: FnOnce()>(
 ) -> Result<(usize, Option<TrackRecord>), LedgerError> {
     let tx = conn.unchecked_transaction()?;
     let mut builder = actor_key.cloned().map(TrackRecordBuilder::new);
-    let verified_receipts =
-        verify_and_project_in_conn(&tx, builder.as_mut(), None, after_receipts_scan)?;
+    let mut proj = AuditProjection {
+        track_record: builder.as_mut(),
+        ..AuditProjection::default()
+    };
+    let verified_receipts = verify_and_project_in_conn(&tx, &mut proj, after_receipts_scan)?;
     tx.commit()?;
     Ok((verified_receipts, builder.map(TrackRecordBuilder::finish)))
+}
+
+pub(crate) fn run_full_audit_tx(
+    conn: &Connection,
+    actor_key: Option<&KeyId>,
+    include_chain_hashes: bool,
+) -> Result<AuditSnapshot, LedgerError> {
+    run_full_audit_tx_with(conn, actor_key, include_chain_hashes, || Ok(())).map(|(snap, ())| snap)
+}
+
+pub(crate) fn run_full_audit_tx_with<T, F>(
+    conn: &Connection,
+    actor_key: Option<&KeyId>,
+    include_chain_hashes: bool,
+    inside_tx: F,
+) -> Result<(AuditSnapshot, T), LedgerError>
+where
+    F: FnOnce() -> Result<T, LedgerError>,
+{
+    let tx = conn.unchecked_transaction()?;
+    let mut builder = actor_key.cloned().map(TrackRecordBuilder::new);
+    let mut stored_revocations = Vec::new();
+    let mut receipt_hashes = Vec::new();
+    let mut revocation_hashes = Vec::new();
+    let mut last_permit_seq = None;
+    let verified_receipts = {
+        let mut proj = AuditProjection {
+            track_record: builder.as_mut(),
+            receipts: None,
+            receipt_hashes: include_chain_hashes.then_some(&mut receipt_hashes),
+            last_permit_seq: include_chain_hashes.then_some(&mut last_permit_seq),
+            stored_revocations: Some(&mut stored_revocations),
+            revocation_hashes: include_chain_hashes.then_some(&mut revocation_hashes),
+        };
+        verify_and_project_in_conn(&tx, &mut proj, || {})?
+    };
+    // `tx` now holds SQLite's SHARED read lock; run external sidecar read before releasing it.
+    let extra = inside_tx()?;
+    tx.commit()?;
+    let chain_hashes = include_chain_hashes.then_some(LedgerChainHashes {
+        receipt_hashes,
+        revocation_hashes,
+        last_permit_seq,
+    });
+    Ok((
+        AuditSnapshot {
+            verified_receipts,
+            track_record: builder.map(TrackRecordBuilder::finish),
+            stored_revocations,
+            chain_hashes,
+        },
+        extra,
+    ))
 }
 
 pub(crate) fn run_verified_track_record(
@@ -34,7 +100,11 @@ pub(crate) fn run_verified_track_record(
 ) -> Result<TrackRecord, LedgerError> {
     let tx = conn.unchecked_transaction()?;
     let mut builder = TrackRecordBuilder::new(actor_key.clone());
-    verify_and_project_in_conn(&tx, Some(&mut builder), None, || {})?;
+    let mut proj = AuditProjection {
+        track_record: Some(&mut builder),
+        ..AuditProjection::default()
+    };
+    verify_and_project_in_conn(&tx, &mut proj, || {})?;
     tx.commit()?;
     Ok(builder.finish())
 }
@@ -44,9 +114,54 @@ pub(crate) fn run_verified_list_receipts(
 ) -> Result<Vec<DecisionReceipt>, LedgerError> {
     let tx = conn.unchecked_transaction()?;
     let mut receipts = Vec::new();
-    verify_and_project_in_conn(&tx, None, Some(&mut receipts), || {})?;
+    let mut proj = AuditProjection {
+        receipts: Some(&mut receipts),
+        ..AuditProjection::default()
+    };
+    verify_and_project_in_conn(&tx, &mut proj, || {})?;
     tx.commit()?;
     Ok(receipts)
+}
+
+pub(crate) fn collect_verified_chain_hashes_in_conn(
+    conn: &Connection,
+) -> Result<LedgerChainHashes, LedgerError> {
+    let mut receipt_hashes = Vec::new();
+    let mut revocation_hashes = Vec::new();
+    let mut last_permit_seq = None;
+    let mut proj = AuditProjection {
+        receipt_hashes: Some(&mut receipt_hashes),
+        last_permit_seq: Some(&mut last_permit_seq),
+        revocation_hashes: Some(&mut revocation_hashes),
+        ..AuditProjection::default()
+    };
+    verify_and_project_in_conn(conn, &mut proj, || {})?;
+    Ok(LedgerChainHashes {
+        receipt_hashes,
+        revocation_hashes,
+        last_permit_seq,
+    })
+}
+
+pub(crate) fn run_verified_chain_hashes(
+    conn: &Connection,
+) -> Result<LedgerChainHashes, LedgerError> {
+    run_verified_chain_hashes_with(conn, |hashes| Ok(hashes.clone()))
+}
+
+pub(crate) fn run_verified_chain_hashes_with<T, F>(
+    conn: &Connection,
+    with_hashes: F,
+) -> Result<T, LedgerError>
+where
+    F: FnOnce(&LedgerChainHashes) -> Result<T, LedgerError>,
+{
+    let tx = conn.unchecked_transaction()?;
+    let hashes = collect_verified_chain_hashes_in_conn(&tx)?;
+    // `tx` holds SQLite's SHARED read lock across `with_hashes` before releasing on commit/drop.
+    let out = with_hashes(&hashes)?;
+    tx.commit()?;
+    Ok(out)
 }
 
 struct TrackRecordBuilder {
@@ -106,8 +221,7 @@ impl TrackRecordBuilder {
 
 fn verify_and_project_in_conn<F: FnOnce()>(
     conn: &Connection,
-    mut track_record: Option<&mut TrackRecordBuilder>,
-    mut collect_receipts: Option<&mut Vec<DecisionReceipt>>,
+    proj: &mut AuditProjection<'_>,
     after_receipts_scan: F,
 ) -> Result<usize, LedgerError> {
     verify_schema_integrity(conn)?;
@@ -147,14 +261,22 @@ fn verify_and_project_in_conn<F: FnOnce()>(
                 )));
             }
             record_expected_permit_calls(&mut expected_calls, &receipt.chain_ids)?;
+            if let Some(last_permit) = proj.last_permit_seq.as_deref_mut() {
+                *last_permit = Some(u64::try_from(seq).map_err(|_| {
+                    LedgerError::Integrity("permit receipt seq overflow".to_string())
+                })?);
+            }
         }
-        if let Some(builder) = track_record.as_deref_mut() {
+        if let Some(builder) = proj.track_record.as_deref_mut() {
             if receipt.actor_key == builder.actor_key {
                 builder.record(&receipt);
             }
         }
         expected_prev = Some(receipt.receipt_hash);
-        if let Some(out) = collect_receipts.as_deref_mut() {
+        if let Some(hashes) = proj.receipt_hashes.as_deref_mut() {
+            hashes.push(*receipt.receipt_hash.as_bytes());
+        }
+        if let Some(out) = proj.receipts.as_deref_mut() {
             out.push(receipt);
         }
         expected_seq += 1;
@@ -165,7 +287,11 @@ fn verify_and_project_in_conn<F: FnOnce()>(
     verify_sqlite_sequence_hwm(conn, "receipts", expected_seq - 1)?;
     verify_quota_calls_consistency(conn, &expected_calls)?;
     verify_quota_sums_consistency(conn, &expected_calls)?;
-    let _ = verify_and_load_revocations(conn)?;
+    let (stored, _) =
+        verify_and_load_revocations_inner(conn, proj.revocation_hashes.as_deref_mut())?;
+    if let Some(out) = proj.stored_revocations.as_deref_mut() {
+        *out = stored;
+    }
     Ok(count)
 }
 
