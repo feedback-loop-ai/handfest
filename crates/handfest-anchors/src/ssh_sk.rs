@@ -12,9 +12,11 @@ use sha2::{Digest, Sha256, Sha512};
 
 use crate::{
     decode_lower_hex_vec, parse_canonical_ed25519_verifying_key,
-    revocation::{revocation_signing_payload, validate_revocation_header},
+    revocation::{
+        revocation_signing_payload, validate_revocation_header, REVOCATION_SIGNING_DOMAIN_PREFIX,
+    },
     signing_payload, validate_envelope_header, AnchorError, AnchorVerifier, AssuranceLevel,
-    CommandRunner, MandateSigner, SignedMandate, SignedRevocation,
+    CommandRunner, MandateSigner, SignedMandate, SignedRevocation, SIGNING_DOMAIN_PREFIX,
 };
 
 /// `KeyId` scheme for OpenSSH FIDO2 hardware-backed Ed25519 keys.
@@ -29,7 +31,7 @@ pub const SSHSIG_NAMESPACE: &str = "handfest-v1-envelope";
 const SSHSIG_MAGIC: &[u8; 6] = b"SSHSIG";
 const SSHSIG_VERSION: u32 = 1;
 const SSHSIG_HASH_ALG: &str = "sha512";
-const SSH_SK_USER_PRESENCE_FLAG: u8 = 0x01;
+pub(crate) const SSH_SK_USER_PRESENCE_FLAG: u8 = 0x01;
 const SSH_SK_APPLICATION_PREFIX: &str = "ssh:";
 const SSHSIG_PEM_BEGIN: &str = "-----BEGIN SSH SIGNATURE-----";
 const SSHSIG_PEM_END: &str = "-----END SSH SIGNATURE-----";
@@ -51,59 +53,12 @@ impl SshSkPublicKey {
     /// characters (preventing terminal WYSIWYS spoofing) while permitting non-UTF-8 bytes in
     /// the optional trailing comment field (matching OpenSSH).
     pub fn parse_openssh_pub_bytes(content: &[u8]) -> Result<Self, AnchorError> {
-        if content.contains(&0) {
-            return Err(AnchorError::InvalidPublicKey(
-                "OpenSSH public key must not contain NUL bytes".to_string(),
-            ));
-        }
-        let mut selected_line: Option<&[u8]> = None;
-        for raw_line in content.split(|&b| b == b'\n') {
-            let line = raw_line.strip_suffix(b"\r").unwrap_or(raw_line);
-            if line.iter().any(|&b| (b < 0x20 && b != b'\t') || b == 0x7f) {
-                return Err(AnchorError::InvalidPublicKey(
-                    "OpenSSH public key must not contain control characters or bare CR".to_string(),
-                ));
-            }
-            let trimmed = trim_ssh_spaces(line);
-            if trimmed.is_empty() {
-                continue;
-            }
-            if selected_line.is_some() {
-                return Err(AnchorError::InvalidPublicKey(
-                    "OpenSSH public key must contain exactly one key entry".to_string(),
-                ));
-            }
-            selected_line = Some(trimmed);
-        }
-
-        let line = selected_line.ok_or_else(|| {
-            AnchorError::InvalidPublicKey("OpenSSH public key input is empty".to_string())
-        })?;
-
-        let (key_type_bytes, rest) = split_next_ssh_field(line);
-        let key_type = std::str::from_utf8(key_type_bytes).map_err(|_| {
-            AnchorError::InvalidPublicKey("OpenSSH key type is not valid UTF-8".to_string())
-        })?;
+        let (key_type, blob) = parse_openssh_pub_line_fields(content)?;
         if key_type != SSH_SK_ED25519_SSH_TYPE {
             return Err(AnchorError::InvalidPublicKey(format!(
                 "expected OpenSSH key type '{SSH_SK_ED25519_SSH_TYPE}', got '{key_type}'"
             )));
         }
-
-        let rest = trim_leading_ssh_spaces(rest);
-        if rest.is_empty() {
-            return Err(AnchorError::InvalidPublicKey(
-                "missing base64 key blob in OpenSSH .pub file".to_string(),
-            ));
-        }
-        let (b64_bytes, _comment) = split_next_ssh_field(rest);
-        let b64_blob = std::str::from_utf8(b64_bytes).map_err(|_| {
-            AnchorError::InvalidPublicKey("base64 key blob is not valid UTF-8".to_string())
-        })?;
-        let blob = decode_base64_strict(b64_blob).map_err(|err| {
-            AnchorError::InvalidPublicKey(format!("invalid base64 key blob: {err}"))
-        })?;
-
         parse_ssh_sk_public_key_blob(&blob).map_err(AnchorError::InvalidPublicKey)
     }
 
@@ -181,6 +136,18 @@ impl<R: CommandRunner> SshSkSigner<R> {
         })
     }
 
+    pub(crate) fn from_parsed(
+        sign_key_path: String,
+        public_key: SshSkPublicKey,
+        runner: R,
+    ) -> Self {
+        Self {
+            sign_key_path,
+            public_key,
+            runner,
+        }
+    }
+
     /// Returns the parsed OpenSSH FIDO2 public key bound to this signer.
     #[must_use]
     pub const fn public_key(&self) -> &SshSkPublicKey {
@@ -198,6 +165,14 @@ impl<R: CommandRunner> MandateSigner for SshSkSigner<R> {
     }
 
     fn sign_payload(&self, payload: &[u8]) -> Result<Vec<u8>, AnchorError> {
+        if !payload.starts_with(SIGNING_DOMAIN_PREFIX)
+            && !payload.starts_with(REVOCATION_SIGNING_DOMAIN_PREFIX)
+        {
+            return Err(AnchorError::InvalidSignature(
+                "payload does not start with a recognized handfest signing domain prefix"
+                    .to_string(),
+            ));
+        }
         let output = self.runner.run(
             "ssh-keygen",
             &[
@@ -317,7 +292,8 @@ fn verify_sshsig_blob(
     }
 
     let signature = Signature::from_bytes(&parsed.signature_bytes);
-    let signed_data = build_sk_ed25519_signed_data(
+    let signed_data = build_sk_signed_data(
+        SSHSIG_NAMESPACE,
         &parsed.public_key.application,
         parsed.flags,
         parsed.counter,
@@ -331,6 +307,77 @@ fn verify_sshsig_blob(
 }
 
 fn parse_sshsig_blob(bytes: &[u8]) -> Result<ParsedSshSig, String> {
+    let (pk_blob, sig_blob) = parse_sshsig_outer(bytes, SSHSIG_NAMESPACE)?;
+    let public_key = parse_ssh_sk_public_key_blob(pk_blob)?;
+    let (signature_bytes, flags, counter) = parse_ssh_sk_signature_blob(sig_blob)?;
+    Ok(ParsedSshSig {
+        public_key,
+        signature_bytes,
+        flags,
+        counter,
+    })
+}
+
+pub(crate) fn parse_openssh_pub_line_fields(
+    content: &[u8],
+) -> Result<(&str, Vec<u8>), AnchorError> {
+    if content.contains(&0) {
+        return Err(AnchorError::InvalidPublicKey(
+            "OpenSSH public key must not contain NUL bytes".to_string(),
+        ));
+    }
+    let mut selected_line: Option<&[u8]> = None;
+    for raw_line in content.split_inclusive(|&b| b == b'\n') {
+        let line = match raw_line.strip_suffix(b"\n") {
+            Some(before_lf) => before_lf.strip_suffix(b"\r").unwrap_or(before_lf),
+            None => raw_line,
+        };
+        if line.iter().any(|&b| (b < 0x20 && b != b'\t') || b == 0x7f) {
+            return Err(AnchorError::InvalidPublicKey(
+                "OpenSSH public key must not contain control characters or bare CR".to_string(),
+            ));
+        }
+        let trimmed = trim_ssh_spaces(line);
+        if trimmed.is_empty() {
+            continue;
+        }
+        if selected_line.is_some() {
+            return Err(AnchorError::InvalidPublicKey(
+                "OpenSSH public key must contain exactly one key entry".to_string(),
+            ));
+        }
+        selected_line = Some(trimmed);
+    }
+
+    let line = selected_line.ok_or_else(|| {
+        AnchorError::InvalidPublicKey("OpenSSH public key input is empty".to_string())
+    })?;
+
+    let (key_type_bytes, rest) = split_next_ssh_field(line);
+    let key_type = std::str::from_utf8(key_type_bytes).map_err(|_| {
+        AnchorError::InvalidPublicKey("OpenSSH key type is not valid UTF-8".to_string())
+    })?;
+
+    let rest = trim_leading_ssh_spaces(rest);
+    if rest.is_empty() {
+        return Err(AnchorError::InvalidPublicKey(
+            "missing base64 key blob in OpenSSH .pub file".to_string(),
+        ));
+    }
+    let (b64_bytes, _comment) = split_next_ssh_field(rest);
+    let b64_blob = std::str::from_utf8(b64_bytes).map_err(|_| {
+        AnchorError::InvalidPublicKey("base64 key blob is not valid UTF-8".to_string())
+    })?;
+    let blob = crate::base64::decode_standard(b64_blob)
+        .map_err(|err| AnchorError::InvalidPublicKey(format!("invalid base64 key blob: {err}")))?;
+
+    Ok((key_type, blob))
+}
+
+pub(crate) fn parse_sshsig_outer<'a>(
+    bytes: &'a [u8],
+    expected_namespace: &str,
+) -> Result<(&'a [u8], &'a [u8]), String> {
     let mut reader = SshWireReader::new(bytes);
 
     let magic = reader.read_exact_slice(SSHSIG_MAGIC.len(), "SSHSIG magic")?;
@@ -346,12 +393,11 @@ fn parse_sshsig_blob(bytes: &[u8]) -> Result<ParsedSshSig, String> {
     }
 
     let pk_blob = reader.read_bytes("SSHSIG publickey")?;
-    let public_key = parse_ssh_sk_public_key_blob(pk_blob)?;
 
     let namespace = reader.read_utf8("SSHSIG namespace")?;
-    if namespace != SSHSIG_NAMESPACE {
+    if namespace != expected_namespace {
         return Err(format!(
-            "invalid SSHSIG namespace '{namespace}', expected '{SSHSIG_NAMESPACE}'"
+            "invalid SSHSIG namespace '{namespace}', expected '{expected_namespace}'"
         ));
     }
 
@@ -372,17 +418,10 @@ fn parse_sshsig_blob(bytes: &[u8]) -> Result<ParsedSshSig, String> {
 
     let sig_blob = reader.read_bytes("SSHSIG signature")?;
     reader.finish("SSHSIG blob")?;
-
-    let (signature_bytes, flags, counter) = parse_ssh_sk_signature_blob(sig_blob)?;
-    Ok(ParsedSshSig {
-        public_key,
-        signature_bytes,
-        flags,
-        counter,
-    })
+    Ok((pk_blob, sig_blob))
 }
 
-fn parse_ssh_sk_public_key_blob(blob: &[u8]) -> Result<SshSkPublicKey, String> {
+pub(crate) fn parse_ssh_sk_public_key_blob(blob: &[u8]) -> Result<SshSkPublicKey, String> {
     let mut reader = SshWireReader::new(blob);
     let key_type = reader.read_utf8("publickey type")?;
     if key_type != SSH_SK_ED25519_SSH_TYPE {
@@ -435,7 +474,7 @@ fn parse_ssh_sk_signature_blob(blob: &[u8]) -> Result<([u8; 64], u8, u32), Strin
     Ok((signature_bytes, flags, counter))
 }
 
-fn validate_ssh_sk_application(application: &str) -> Result<(), String> {
+pub(crate) fn validate_ssh_sk_application(application: &str) -> Result<(), String> {
     if !application.starts_with(SSH_SK_APPLICATION_PREFIX) {
         return Err(format!(
             "OpenSSH FIDO2 application '{application}' must start with '{SSH_SK_APPLICATION_PREFIX}'"
@@ -447,7 +486,8 @@ fn validate_ssh_sk_application(application: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn build_sk_ed25519_signed_data(
+pub(crate) fn build_sk_signed_data(
+    namespace: &str,
     application: &str,
     flags: u8,
     counter: u32,
@@ -455,10 +495,10 @@ fn build_sk_ed25519_signed_data(
 ) -> [u8; 69] {
     let payload_sha512 = Sha512::digest(payload);
     let mut preimage = Vec::with_capacity(
-        SSHSIG_MAGIC.len() + 4 + SSHSIG_NAMESPACE.len() + 4 + 4 + SSHSIG_HASH_ALG.len() + 4 + 64,
+        SSHSIG_MAGIC.len() + 4 + namespace.len() + 4 + 4 + SSHSIG_HASH_ALG.len() + 4 + 64,
     );
     preimage.extend_from_slice(SSHSIG_MAGIC);
-    push_ssh_bytes(&mut preimage, SSHSIG_NAMESPACE.as_bytes());
+    push_ssh_bytes(&mut preimage, namespace.as_bytes());
     push_ssh_bytes(&mut preimage, b"");
     push_ssh_bytes(&mut preimage, SSHSIG_HASH_ALG.as_bytes());
     push_ssh_bytes(&mut preimage, &payload_sha512);
@@ -510,7 +550,7 @@ fn split_next_ssh_field(bytes: &[u8]) -> (&[u8], &[u8]) {
     }
 }
 
-fn resolve_pub_key_path(key_path: &Path) -> Result<PathBuf, AnchorError> {
+pub(crate) fn resolve_pub_key_path(key_path: &Path) -> Result<PathBuf, AnchorError> {
     if key_path.as_os_str().is_empty() {
         return Err(AnchorError::InvalidPublicKey(
             "SSH key path must not be empty".to_string(),
@@ -538,7 +578,7 @@ fn resolve_pub_key_path(key_path: &Path) -> Result<PathBuf, AnchorError> {
     )))
 }
 
-fn validate_utf8_key_path(path: &Path) -> Result<String, AnchorError> {
+pub(crate) fn validate_utf8_key_path(path: &Path) -> Result<String, AnchorError> {
     let s = path.to_str().ok_or_else(|| {
         AnchorError::InvalidPublicKey(format!(
             "SSH key path '{}' is not valid UTF-8",
@@ -558,7 +598,7 @@ fn validate_utf8_key_path(path: &Path) -> Result<String, AnchorError> {
     Ok(s.to_string())
 }
 
-fn decode_sshsig_pem(pem_bytes: &[u8]) -> Result<Vec<u8>, AnchorError> {
+pub(crate) fn decode_sshsig_pem(pem_bytes: &[u8]) -> Result<Vec<u8>, AnchorError> {
     let text = std::str::from_utf8(pem_bytes).map_err(|_| {
         AnchorError::InvalidSignature("ssh-keygen output is not valid UTF-8".to_string())
     })?;
@@ -576,82 +616,25 @@ fn decode_sshsig_pem(pem_bytes: &[u8]) -> Result<Vec<u8>, AnchorError> {
         ));
     }
     let body: String = body_lines.concat();
-    decode_base64_strict(&body)
+    crate::base64::decode_standard(&body)
         .map_err(|err| AnchorError::InvalidSignature(format!("invalid SSHSIG PEM base64: {err}")))
 }
 
-fn decode_base64_strict(input: &str) -> Result<Vec<u8>, String> {
-    let bytes = input.as_bytes();
-    if bytes.is_empty() {
-        return Err("base64 input is empty".to_string());
-    }
-    if !bytes.len().is_multiple_of(4) {
-        return Err(format!(
-            "base64 length {} is not a multiple of 4",
-            bytes.len()
-        ));
-    }
-
-    let mut out = Vec::with_capacity((bytes.len() / 4) * 3);
-    let last_chunk = (bytes.len() / 4) - 1;
-    for (idx, chunk) in bytes.as_chunks::<4>().0.iter().enumerate() {
-        let a = decode_base64_sextet(chunk[0])?;
-        let b = decode_base64_sextet(chunk[1])?;
-        match (chunk[2], chunk[3]) {
-            (b'=', b'=') => {
-                if idx != last_chunk {
-                    return Err("base64 padding must only appear in the final quantum".to_string());
-                }
-                if (b & 0x0f) != 0 {
-                    return Err("non-canonical non-zero base64 padding bits".to_string());
-                }
-                out.push((a << 2) | (b >> 4));
-            }
-            (c_byte, b'=') => {
-                if idx != last_chunk {
-                    return Err("base64 padding must only appear in the final quantum".to_string());
-                }
-                let c = decode_base64_sextet(c_byte)?;
-                if (c & 0x03) != 0 {
-                    return Err("non-canonical non-zero base64 padding bits".to_string());
-                }
-                out.push((a << 2) | (b >> 4));
-                out.push((b << 4) | (c >> 2));
-            }
-            (c_byte, d_byte) => {
-                let c = decode_base64_sextet(c_byte)?;
-                let d = decode_base64_sextet(d_byte)?;
-                out.push((a << 2) | (b >> 4));
-                out.push((b << 4) | (c >> 2));
-                out.push((c << 6) | d);
-            }
-        }
-    }
-    Ok(out)
-}
-
-fn decode_base64_sextet(byte: u8) -> Result<u8, String> {
-    match byte {
-        b'A'..=b'Z' => Ok(byte - b'A'),
-        b'a'..=b'z' => Ok(byte - b'a' + 26),
-        b'0'..=b'9' => Ok(byte - b'0' + 52),
-        b'+' => Ok(62),
-        b'/' => Ok(63),
-        other => Err(format!("invalid base64 byte 0x{other:02x}")),
-    }
-}
-
-struct SshWireReader<'a> {
+pub(crate) struct SshWireReader<'a> {
     bytes: &'a [u8],
     offset: usize,
 }
 
 impl<'a> SshWireReader<'a> {
-    const fn new(bytes: &'a [u8]) -> Self {
+    pub(crate) const fn new(bytes: &'a [u8]) -> Self {
         Self { bytes, offset: 0 }
     }
 
-    fn read_exact_slice(&mut self, len: usize, context: &str) -> Result<&'a [u8], String> {
+    pub(crate) fn read_exact_slice(
+        &mut self,
+        len: usize,
+        context: &str,
+    ) -> Result<&'a [u8], String> {
         let remaining = &self.bytes[self.offset..];
         let slice = remaining.get(..len).ok_or_else(|| {
             format!(
@@ -663,28 +646,28 @@ impl<'a> SshWireReader<'a> {
         Ok(slice)
     }
 
-    fn read_u8(&mut self, context: &str) -> Result<u8, String> {
+    pub(crate) fn read_u8(&mut self, context: &str) -> Result<u8, String> {
         let slice = self.read_exact_slice(1, context)?;
         Ok(slice[0])
     }
 
-    fn read_u32(&mut self, context: &str) -> Result<u32, String> {
+    pub(crate) fn read_u32(&mut self, context: &str) -> Result<u32, String> {
         let slice = self.read_exact_slice(4, context)?;
         let arr: [u8; 4] = slice.try_into().expect("slice length is 4");
         Ok(u32::from_be_bytes(arr))
     }
 
-    fn read_bytes(&mut self, context: &str) -> Result<&'a [u8], String> {
+    pub(crate) fn read_bytes(&mut self, context: &str) -> Result<&'a [u8], String> {
         let len = usize::try_from(self.read_u32(context)?).expect("u32 length fits in usize");
         self.read_exact_slice(len, context)
     }
 
-    fn read_utf8(&mut self, context: &str) -> Result<&'a str, String> {
+    pub(crate) fn read_utf8(&mut self, context: &str) -> Result<&'a str, String> {
         let raw = self.read_bytes(context)?;
         std::str::from_utf8(raw).map_err(|_| format!("non-UTF-8 string in {context}"))
     }
 
-    fn finish(&self, context: &str) -> Result<(), String> {
+    pub(crate) fn finish(&self, context: &str) -> Result<(), String> {
         let remaining = self.bytes.len().saturating_sub(self.offset);
         if remaining != 0 {
             return Err(format!(

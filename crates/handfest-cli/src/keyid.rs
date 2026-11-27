@@ -9,7 +9,7 @@ use clap::Args;
 use handfest_anchors::{
     parse_ed25519_spki_pem, piv_ed25519_key_id, AnchorError, CommandOutput, CommandRunner,
     Ed25519KeyFile, Ed25519Keypair, Fido2CredentialFile, Fido2Ed25519Signer, MandateSigner,
-    OpenPgpEd25519Signer, SshSkPublicKey, SystemCommandRunner,
+    OpenPgpEd25519Signer, SshSkAnyPublicKey, SystemCommandRunner,
 };
 use handfest_core::ast::KeyId;
 use serde::{Deserialize, Serialize};
@@ -52,7 +52,7 @@ pub(crate) struct PrincipalKeyArgs {
         conflicts_with_all = ["ssh_key", "fido2_cred", "gpg_key", "piv_pubkey"]
     )]
     pub(crate) key: Option<PathBuf>,
-    /// Path to an OpenSSH FIDO2 key handle or `.pub` file (`sk-ssh-ed25519@openssh.com`).
+    /// Path to an OpenSSH FIDO2 key handle or `.pub` file (`sk-ssh-ed25519@openssh.com` or `sk-ecdsa-sha2-nistp256@openssh.com`).
     #[arg(
         long,
         required_unless_present_any = ["key", "fido2_cred", "gpg_key", "piv_pubkey"],
@@ -195,7 +195,7 @@ fn resolve_local_ed25519(path: &Path) -> Result<ResolvedPrincipalKey, String> {
 
 fn resolve_ssh_sk(path: &Path) -> Result<ResolvedPrincipalKey, String> {
     let hint = path_to_utf8_string(path, "--ssh-key")?;
-    let pub_key = SshSkPublicKey::from_key_path(path)
+    let pub_key = SshSkAnyPublicKey::from_key_path(path)
         .map_err(|err| format!("failed to load SSH security key: {err}"))?;
     Ok(ResolvedPrincipalKey {
         key_id: pub_key.key_id(),

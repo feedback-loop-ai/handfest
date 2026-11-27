@@ -197,7 +197,7 @@ fn cli_sign_flags_enforce_mutual_exclusion_and_default_anchor_id() {
         other => panic!("unexpected command: {other:?}"),
     }
     assert_eq!(
-        SignerConfig::SshSkEd25519 {
+        SignerConfig::SshSk {
             key_path: PathBuf::from("id_ed25519_sk.pub")
         }
         .default_anchor_id(),
@@ -336,7 +336,7 @@ fn resolve_signer_loads_ssh_sk_pub_and_companion_pub_without_reading_private_key
         hex::encode(sk.verifying_key().as_bytes())
     );
 
-    let from_pub = resolve_signer(&SignerConfig::SshSkEd25519 {
+    let from_pub = resolve_signer(&SignerConfig::SshSk {
         key_path: pub_path.clone(),
     })
     .expect("resolve from .pub");
@@ -346,7 +346,7 @@ fn resolve_signer_loads_ssh_sk_pub_and_companion_pub_without_reading_private_key
         handfest_anchors::AssuranceLevel::Passkey
     );
 
-    let from_handle = resolve_signer(&SignerConfig::SshSkEd25519 {
+    let from_handle = resolve_signer(&SignerConfig::SshSk {
         key_path: key_handle,
     })
     .expect("resolve from key handle via companion .pub");
@@ -359,7 +359,7 @@ fn resolve_signer_loads_ssh_sk_pub_and_companion_pub_without_reading_private_key
     // Missing companion .pub fails closed without reading private key.
     let orphan = dir.path().join("orphan_key");
     fs::write(&orphan, "-----BEGIN OPENSSH PRIVATE KEY-----\n").unwrap();
-    let err = resolve_signer(&SignerConfig::SshSkEd25519 { key_path: orphan })
+    let err = resolve_signer(&SignerConfig::SshSk { key_path: orphan })
         .err()
         .expect("missing companion .pub must fail");
     assert!(err.contains("failed to load SSH security key"));
@@ -415,4 +415,34 @@ fn run_sign_rejects_missing_or_both_key_sources_defensively() {
         .expect_err("defensive key source guard must fail closed");
         assert!(err.contains("--key") && err.contains("--ssh-key"));
     }
+}
+
+#[test]
+fn resolve_signer_supports_ssh_sk_p256_pub_and_companion_handle() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let pub_line = "sk-ecdsa-sha2-nistp256@openssh.com AAAAInNrLWVjZHNhLXNoYTItbmlzdHAyNTZAb3BlbnNzaC5jb20AAAAIbmlzdHAyNTYAAABBBGD+1LolWp0xyWHrdMY1bWjASbiSO2H6bOZpYi5g8p+2eQP+EAi4vJmkGunpVii8ZPLxsgwtfp9Rd6PClNRGIpkAAAAMc3NoOmhhbmRmZXN0 yubikey-p256@test\n";
+    let key_handle = dir.path().join("id_ecdsa_sk");
+    let pub_path = dir.path().join("id_ecdsa_sk.pub");
+    fs::write(&key_handle, "dummy-handle").unwrap();
+    fs::write(&pub_path, pub_line).unwrap();
+
+    let expected_key_id = "ssh-sk-p256:0460fed4ba255a9d31c961eb74c6356d68c049b8923b61fa6ce669622e60f29fb67903fe1008b8bc99a41ae9e95628bc64f2f1b20c2d7e9f5177a3c294d4462299";
+
+    let from_pub = resolve_signer(&SignerConfig::SshSk { key_path: pub_path })
+        .expect("resolve P-256 from .pub");
+    assert_eq!(from_pub.key_id().to_string(), expected_key_id);
+    assert_eq!(
+        from_pub.assurance(),
+        handfest_anchors::AssuranceLevel::Passkey
+    );
+
+    let from_handle = resolve_signer(&SignerConfig::SshSk {
+        key_path: key_handle,
+    })
+    .expect("resolve P-256 from handle via companion .pub");
+    assert_eq!(from_handle.key_id().to_string(), expected_key_id);
+    assert_eq!(
+        from_handle.assurance(),
+        handfest_anchors::AssuranceLevel::Passkey
+    );
 }

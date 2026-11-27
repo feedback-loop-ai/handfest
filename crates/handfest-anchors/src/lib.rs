@@ -16,10 +16,12 @@ use serde::{Deserialize, Serialize};
 mod base64;
 mod fido2;
 mod openpgp;
+mod p256;
 mod piv;
 mod revocation;
 mod signer;
 mod ssh_sk;
+mod ssh_sk_p256;
 
 pub use fido2::{
     discover_fido2_device, format_fido2_ed25519_key_id, verify_fido2_ed25519,
@@ -32,6 +34,7 @@ pub use openpgp::{
     extract_ed25519_public_key, extract_ed25519_public_key_for_fingerprint, openpgp_ed25519_key_id,
     verify_openpgp_ed25519, OpenPgpEd25519Signer, OpenPgpEd25519Verifier, OPENPGP_ED25519_SCHEME,
 };
+pub use p256::{P256Error, P256PublicKey, P256_UNCOMPRESSED_KEY_LEN};
 pub use piv::{
     parse_ed25519_spki_der, parse_ed25519_spki_pem, piv_ed25519_key_id, verify_piv_ed25519,
     verify_revocation_piv_ed25519, PivEd25519Signer, PivEd25519Verifier, PivPinSource,
@@ -50,6 +53,11 @@ pub use signer::{
 pub use ssh_sk::{
     verify_revocation_ssh_sk_ed25519, verify_ssh_sk_ed25519, SshSkEd25519Verifier, SshSkPublicKey,
     SshSkSigner, SSHSIG_NAMESPACE, SSH_SK_ED25519_SCHEME, SSH_SK_ED25519_SSH_TYPE,
+};
+pub use ssh_sk_p256::{
+    verify_revocation_ssh_sk_p256, verify_ssh_sk_p256, SshSkAnyPublicKey, SshSkAnySigner,
+    SshSkP256PublicKey, SshSkP256Signer, SshSkP256Verifier, SSHSIG_REVOCATION_NAMESPACE,
+    SSH_SK_P256_CURVE_NAME, SSH_SK_P256_SCHEME, SSH_SK_P256_SSH_TYPE,
 };
 
 /// Domain-separation prefix prepended to length-prefixed envelope metadata and canonical
@@ -447,12 +455,13 @@ impl AnchorRegistry {
     }
 
     /// Creates a registry pre-populated with the built-in trust-anchor verifiers
-    /// (`ed25519`, `ssh-sk-ed25519`, `fido2-ed25519`, `openpgp-ed25519`, `piv-ed25519`).
+    /// (`ed25519`, `ssh-sk-ed25519`, `ssh-sk-p256`, `fido2-ed25519`, `openpgp-ed25519`, `piv-ed25519`).
     #[must_use]
     pub fn default_registry() -> Self {
         let mut registry = Self::new();
         registry.register("ed25519", Ed25519Verifier);
         registry.register(SSH_SK_ED25519_SCHEME, SshSkEd25519Verifier);
+        registry.register(SSH_SK_P256_SCHEME, SshSkP256Verifier);
         registry.register(FIDO2_ED25519_SCHEME, Fido2Ed25519Verifier);
         registry.register(OPENPGP_ED25519_SCHEME, OpenPgpEd25519Verifier);
         registry.register(PIV_ED25519_SCHEME, PivEd25519Verifier);
@@ -593,19 +602,18 @@ fn enforce_proof_window_and_ast_postconditions(
     Ok(())
 }
 
-pub(crate) struct ValidatedEnvelopeHeader {
+pub(crate) struct ValidatedEnvelopeMetadata {
     pub(crate) ast: HandfestAst,
     pub(crate) actor_kind: ActorKind,
     pub(crate) assurance: AssuranceLevel,
     pub(crate) signer_key: KeyId,
-    pub(crate) verifying_key: VerifyingKey,
 }
 
-pub(crate) fn validate_envelope_header(
+pub(crate) fn validate_envelope_metadata(
     signed: &SignedMandate,
     expected_scheme: &str,
     expected_assurance: AssuranceLevel,
-) -> Result<ValidatedEnvelopeHeader, AnchorError> {
+) -> Result<ValidatedEnvelopeMetadata, AnchorError> {
     let ast = parse_canonical(&signed.canonical_words).map_err(AnchorError::NonCanonicalMandate)?;
     validate_proof_shape(&signed.anchor_id, signed.valid_from, signed.valid_until)
         .map_err(map_proof_shape_error)?;
@@ -626,7 +634,15 @@ pub(crate) fn validate_envelope_header(
         });
     }
 
-    let (signer_key, pub_bytes) = parse_hex32_key_id(&signed.signer_key, expected_scheme)?;
+    let signer_key = KeyId::parse(&signed.signer_key).map_err(|err| {
+        AnchorError::InvalidPublicKey(format!("invalid KeyId '{}': {err}", signed.signer_key))
+    })?;
+    if signer_key.scheme() != expected_scheme {
+        return Err(AnchorError::InvalidPublicKey(format!(
+            "expected '{expected_scheme}' key scheme, got '{}'",
+            signer_key.scheme()
+        )));
+    }
     if &signer_key != ast.from().key() {
         return Err(AnchorError::SignerMismatch {
             expected: ast.from().key().to_string(),
@@ -634,14 +650,38 @@ pub(crate) fn validate_envelope_header(
         });
     }
 
-    let verifying_key =
-        parse_canonical_ed25519_verifying_key(&pub_bytes).map_err(AnchorError::InvalidPublicKey)?;
-
-    Ok(ValidatedEnvelopeHeader {
+    Ok(ValidatedEnvelopeMetadata {
         ast,
         actor_kind,
         assurance,
         signer_key,
+    })
+}
+
+pub(crate) struct ValidatedEnvelopeHeader {
+    pub(crate) ast: HandfestAst,
+    pub(crate) actor_kind: ActorKind,
+    pub(crate) assurance: AssuranceLevel,
+    pub(crate) signer_key: KeyId,
+    pub(crate) verifying_key: VerifyingKey,
+}
+
+pub(crate) fn validate_envelope_header(
+    signed: &SignedMandate,
+    expected_scheme: &str,
+    expected_assurance: AssuranceLevel,
+) -> Result<ValidatedEnvelopeHeader, AnchorError> {
+    let meta = validate_envelope_metadata(signed, expected_scheme, expected_assurance)?;
+    let pub_bytes = decode_lower_hex_fixed::<32>(meta.signer_key.value())
+        .map_err(AnchorError::InvalidPublicKey)?;
+    let verifying_key =
+        parse_canonical_ed25519_verifying_key(&pub_bytes).map_err(AnchorError::InvalidPublicKey)?;
+
+    Ok(ValidatedEnvelopeHeader {
+        ast: meta.ast,
+        actor_kind: meta.actor_kind,
+        assurance: meta.assurance,
+        signer_key: meta.signer_key,
         verifying_key,
     })
 }

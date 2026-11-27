@@ -72,7 +72,7 @@ enum Commands {
             conflicts_with_all = ["ssh_key", "fido2_cred", "fido2_device", "gpg_key", "piv_pubkey", "piv_module", "piv_id"]
         )]
         key: Option<PathBuf>,
-        /// Path to an OpenSSH FIDO2 key handle or `.pub` file (`sk-ssh-ed25519@openssh.com`).
+        /// Path to an OpenSSH FIDO2 key handle or `.pub` file (`sk-ssh-ed25519@openssh.com` or `sk-ecdsa-sha2-nistp256@openssh.com`).
         #[arg(
             long,
             required_unless_present_any = ["key", "fido2_cred", "gpg_key", "piv_pubkey"],
@@ -366,7 +366,7 @@ pub(crate) fn build_signer_config(
 ) -> Result<SignerConfig, String> {
     match (key, ssh_key, fido2_cred, gpg_key, piv_pubkey) {
         (Some(key_path), None, None, None, None) => Ok(SignerConfig::LocalEd25519 { key_path }),
-        (None, Some(key_path), None, None, None) => Ok(SignerConfig::SshSkEd25519 { key_path }),
+        (None, Some(key_path), None, None, None) => Ok(SignerConfig::SshSk { key_path }),
         (None, None, Some(cred_path), None, None) => Ok(SignerConfig::Fido2Ed25519 {
             cred_path,
             device_path: fido2_device,

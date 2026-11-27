@@ -7,7 +7,7 @@ use std::process::ExitCode;
 use handfest_anchors::{
     parse_ed25519_spki_pem, sign_mandate_with, CommandRunner, Ed25519KeyFile, Ed25519Keypair,
     Fido2CredentialFile, Fido2Ed25519Signer, MandateSigner, OpenPgpEd25519Signer, PivEd25519Signer,
-    PivPinSource, PivSignerConfig, SignedMandate, SshSkSigner, SystemCommandRunner,
+    PivPinSource, PivSignerConfig, SignedMandate, SshSkAnySigner, SystemCommandRunner,
     DEFAULT_PIV_KEY_ID, DEFAULT_PIV_PIN_ENV, DEFAULT_PKCS11_MODULE,
 };
 use handfest_core::cnl::{parse_mandate, try_render_canonical};
@@ -25,7 +25,7 @@ pub(crate) enum SignerConfig {
     LocalEd25519 {
         key_path: PathBuf,
     },
-    SshSkEd25519 {
+    SshSk {
         key_path: PathBuf,
     },
     Fido2Ed25519 {
@@ -45,7 +45,7 @@ impl SignerConfig {
     pub(crate) const fn default_anchor_id(&self) -> &'static str {
         match self {
             Self::LocalEd25519 { .. } => DEFAULT_LOCAL_ED25519_ANCHOR_ID,
-            Self::SshSkEd25519 { .. } => DEFAULT_SSH_SK_ANCHOR_ID,
+            Self::SshSk { .. } => DEFAULT_SSH_SK_ANCHOR_ID,
             Self::Fido2Ed25519 { .. } => DEFAULT_FIDO2_ANCHOR_ID,
             Self::OpenPgpEd25519 { .. } => DEFAULT_OPENPGP_ANCHOR_ID,
             Self::PivEd25519 { .. } => DEFAULT_PIV_ANCHOR_ID,
@@ -103,8 +103,8 @@ fn resolve_signer_with_runner<R: CommandRunner + 'static>(
                 .map_err(|err| format!("failed to load Ed25519 key: {err}"))?;
             Ok(Box::new(keypair))
         }
-        SignerConfig::SshSkEd25519 { key_path } => {
-            let signer = SshSkSigner::from_key_path(key_path, runner)
+        SignerConfig::SshSk { key_path } => {
+            let signer = SshSkAnySigner::from_key_path(key_path, runner)
                 .map_err(|err| format!("failed to load SSH security key: {err}"))?;
             Ok(Box::new(signer))
         }

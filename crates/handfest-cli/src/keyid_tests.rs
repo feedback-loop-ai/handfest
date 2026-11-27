@@ -327,3 +327,22 @@ fn resolve_principal_key_rejects_malformed_inputs_fail_closed() {
     .unwrap_err()
     .contains("failed to load OpenPGP key"));
 }
+
+#[test]
+fn resolve_principal_key_supports_ssh_sk_p256() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let pub_line = "sk-ecdsa-sha2-nistp256@openssh.com AAAAInNrLWVjZHNhLXNoYTItbmlzdHAyNTZAb3BlbnNzaC5jb20AAAAIbmlzdHAyNTYAAABBBGD+1LolWp0xyWHrdMY1bWjASbiSO2H6bOZpYi5g8p+2eQP+EAi4vJmkGunpVii8ZPLxsgwtfp9Rd6PClNRGIpkAAAAMc3NoOmhhbmRmZXN0 yubikey-p256@test\n";
+    let handle = dir.path().join("id_ecdsa_sk");
+    let pub_path = dir.path().join("id_ecdsa_sk.pub");
+    fs::write(&handle, "dummy-handle").unwrap();
+    fs::write(&pub_path, pub_line).unwrap();
+
+    let resolved = resolve_principal_key(&PrincipalKeySource::SshSk(handle.clone()))
+        .expect("resolve ssh-sk-p256");
+    assert_eq!(
+        resolved.key_id.to_string(),
+        "ssh-sk-p256:0460fed4ba255a9d31c961eb74c6356d68c049b8923b61fa6ce669622e60f29fb67903fe1008b8bc99a41ae9e95628bc64f2f1b20c2d7e9f5177a3c294d4462299"
+    );
+    assert_eq!(resolved.signer_kind, SignerKind::SshSk);
+    assert_eq!(resolved.signer_hint, handle.to_str().unwrap());
+}

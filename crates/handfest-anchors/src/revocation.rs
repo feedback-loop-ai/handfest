@@ -14,8 +14,8 @@ use serde::{Deserialize, Serialize};
 use crate::{
     build_envelope_signing_payload, decode_lower_hex_fixed, format_actor_kind, format_assurance,
     map_proof_shape_error, parse_actor_kind, parse_assurance,
-    parse_canonical_ed25519_verifying_key, parse_hex32_key_id, AnchorError, AnchorRegistry,
-    AnchorVerifier, AssuranceLevel, EnvelopeFields, MandateSigner, ProofIdentitySource,
+    parse_canonical_ed25519_verifying_key, AnchorError, AnchorRegistry, AnchorVerifier,
+    AssuranceLevel, EnvelopeFields, MandateSigner, ProofIdentitySource,
 };
 
 /// Domain-separation prefix prepended to length-prefixed envelope metadata and canonical
@@ -199,19 +199,18 @@ fn enforce_revocation_window_and_ast_postconditions(
     Ok(())
 }
 
-pub(crate) struct ValidatedRevocationHeader {
+pub(crate) struct ValidatedRevocationMetadata {
     pub(crate) ast: RevocationAst,
     pub(crate) actor_kind: ActorKind,
     pub(crate) assurance: AssuranceLevel,
     pub(crate) signer_key: KeyId,
-    pub(crate) verifying_key: VerifyingKey,
 }
 
-pub(crate) fn validate_revocation_header(
+pub(crate) fn validate_revocation_metadata(
     signed: &SignedRevocation,
     expected_scheme: &str,
     expected_assurance: AssuranceLevel,
-) -> Result<ValidatedRevocationHeader, AnchorError> {
+) -> Result<ValidatedRevocationMetadata, AnchorError> {
     let ast = parse_canonical_revocation(&signed.canonical_words)
         .map_err(AnchorError::NonCanonicalRevocation)?;
     validate_proof_shape(&signed.anchor_id, signed.valid_from, signed.valid_until)
@@ -233,7 +232,15 @@ pub(crate) fn validate_revocation_header(
         });
     }
 
-    let (signer_key, pub_bytes) = parse_hex32_key_id(&signed.signer_key, expected_scheme)?;
+    let signer_key = KeyId::parse(&signed.signer_key).map_err(|err| {
+        AnchorError::InvalidPublicKey(format!("invalid KeyId '{}': {err}", signed.signer_key))
+    })?;
+    if signer_key.scheme() != expected_scheme {
+        return Err(AnchorError::InvalidPublicKey(format!(
+            "expected '{expected_scheme}' key scheme, got '{}'",
+            signer_key.scheme()
+        )));
+    }
     if &signer_key != ast.by().key() {
         return Err(AnchorError::SignerMismatch {
             expected: ast.by().key().to_string(),
@@ -241,14 +248,38 @@ pub(crate) fn validate_revocation_header(
         });
     }
 
-    let verifying_key =
-        parse_canonical_ed25519_verifying_key(&pub_bytes).map_err(AnchorError::InvalidPublicKey)?;
-
-    Ok(ValidatedRevocationHeader {
+    Ok(ValidatedRevocationMetadata {
         ast,
         actor_kind,
         assurance,
         signer_key,
+    })
+}
+
+pub(crate) struct ValidatedRevocationHeader {
+    pub(crate) ast: RevocationAst,
+    pub(crate) actor_kind: ActorKind,
+    pub(crate) assurance: AssuranceLevel,
+    pub(crate) signer_key: KeyId,
+    pub(crate) verifying_key: VerifyingKey,
+}
+
+pub(crate) fn validate_revocation_header(
+    signed: &SignedRevocation,
+    expected_scheme: &str,
+    expected_assurance: AssuranceLevel,
+) -> Result<ValidatedRevocationHeader, AnchorError> {
+    let meta = validate_revocation_metadata(signed, expected_scheme, expected_assurance)?;
+    let pub_bytes = decode_lower_hex_fixed::<32>(meta.signer_key.value())
+        .map_err(AnchorError::InvalidPublicKey)?;
+    let verifying_key =
+        parse_canonical_ed25519_verifying_key(&pub_bytes).map_err(AnchorError::InvalidPublicKey)?;
+
+    Ok(ValidatedRevocationHeader {
+        ast: meta.ast,
+        actor_kind: meta.actor_kind,
+        assurance: meta.assurance,
+        signer_key: meta.signer_key,
         verifying_key,
     })
 }

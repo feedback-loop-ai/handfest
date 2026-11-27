@@ -308,7 +308,7 @@ pub(crate) struct RevokeCliArgs {
         conflicts_with_all = ["ssh_key", "fido2_cred", "fido2_device", "gpg_key", "piv_pubkey", "piv_module", "piv_id"]
     )]
     pub(crate) key: Option<PathBuf>,
-    /// Path to an OpenSSH FIDO2 key handle or `.pub` file (`sk-ssh-ed25519@openssh.com`).
+    /// Path to an OpenSSH FIDO2 key handle or `.pub` file (`sk-ssh-ed25519@openssh.com` or `sk-ecdsa-sha2-nistp256@openssh.com`).
     #[arg(
         long,
         required_unless_present_any = ["key", "fido2_cred", "gpg_key", "piv_pubkey"],
