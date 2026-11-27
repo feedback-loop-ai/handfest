@@ -1,0 +1,19 @@
+# Model Studio (DashScope) route overlay for qwen4-max at xhigh effort.
+- id: llm-pi-ai
+  config:
+    providers:
+      dashscope:
+        displayName: Model Studio (Token Plan)
+        apiKeyEnv: DASHSCOPE_API_KEY
+        api: openai-completions
+        baseURL: https://token-plan.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1
+        compat:
+          thinkingFormat: deepseek
+          supportsDeveloperRole: false
+        models:
+          - id: qwen4-max
+            reasoningEfforts:
+              low: low
+              medium: medium
+              high: high
+              xhigh: xhigh

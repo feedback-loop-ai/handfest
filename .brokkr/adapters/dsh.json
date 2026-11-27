@@ -23,7 +23,9 @@
     "{brokkr}",
     "driver",
     "dsh",
-    "--"
+    "--",
+    "--patch",
+    ".brokkr/recipes/arxiv-paper-verify/drivers/dashscope-qwen4-max.yml"
   ],
   "models": {
     "flash": "deepseek-flash",
@@ -56,8 +58,8 @@
   ],
   "effort_flag": "--effort",
   "effortless_routes": {
-    "spark": "dsh 0.1.5-rc.1 refuses reasoningEffort at every level tried (low, none — runs task-framing-doctor-warns-when-a-088cb62b, task-framing-doctor-warns-when-a-b2b4fdc4, 2026-09-11); seats on this route pin no effort and record not applicable (decision 0035 addendum 2026-09-11)",
-    "spark-glm": "dsh 0.1.5-rc.1 refuses reasoningEffort on spark-glm/GLM-5.3-Flash-EXL3 (low — UNSUPPORTED_REASONING_EFFORT, measured 2026-09-16); the model entry states no reasoningEfforts so the lane materialises as non-reasoning, seats on this route pin no effort and record not applicable (decision 0035 addendum 2026-09-11)"
+    "spark": "dsh 0.1.5-rc.1 refuses reasoningEffort at every level tried (low, none \u2014 runs task-framing-doctor-warns-when-a-088cb62b, task-framing-doctor-warns-when-a-b2b4fdc4, 2026-09-11); seats on this route pin no effort and record not applicable (decision 0035 addendum 2026-09-11)",
+    "spark-glm": "dsh 0.1.5-rc.1 refuses reasoningEffort on spark-glm/GLM-5.3-Flash-EXL3 (low \u2014 UNSUPPORTED_REASONING_EFFORT, measured 2026-09-16); the model entry states no reasoningEfforts so the lane materialises as non-reasoning, seats on this route pin no effort and record not applicable (decision 0035 addendum 2026-09-11)"
   },
   "tool_permissions": {
     "unsupported": "dsh 0.2.1-rc.2 and rc.3 (measured 2026-10-26) disable a tool only as a whole profile row through the --patch overlay, which is how this adapter's hands are served; no row narrows bash to a command (no Bash(cargo:*) analogue), so an agent's tools.allow list has nothing to map onto"

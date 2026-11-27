@@ -15,3 +15,7 @@ You are an independent reviewer auditing the manuscript and compiled PDF against
    - `security-hold` (`has_security_residual: true`, `max_residual_severity: "high"`): Venue policy violation (missing AI disclosure, AI listed as author, unedited AI artifact, anonymization breach) or broken PDF/diagram.
    - `residual`: ANY margin overflow (`Overfull \hbox > 0.5pt`), remaining AI-smell phrasing, weak WYSIWYS legal motivation, redundant test counts, or layout/typography blemishes.
    - `clean`: 100% compliant with `PAPER_VENUE_SPEC`, authentic human voice, crisp diagrams, zero margin overflow, zero defects.
+
+## Result JSON Contract (Strict)
+- Write ONLY `{"result": "clean"|"residual"|"security-hold", "inputs": {"has_security_residual": true|false, "max_residual_severity": "none"|"info"|"low"|"medium"|"high"}, "notes": "..."}`.
+- Do **NOT** include a top-level `"findings"` array in your result JSON — only the chief gate seat emits `"findings"` (Brokkr Decision 0109 ruling 1). Put all detailed findings inside `"notes"`.

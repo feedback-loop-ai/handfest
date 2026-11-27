@@ -12,7 +12,7 @@
         "blocked"
       ],
       "class": "work",
-      "agent": "paper-revise-fable"
+      "agent": "paper-revise-neon"
     },
     "parse-bib": {
       "results": [
@@ -59,7 +59,7 @@
         "pass",
         "fail"
       ],
-      "class": "gate",
+      "class": "work",
       "limits": {
         "max_attempts": 2,
         "timeout_seconds": 600
@@ -73,24 +73,6 @@
           "bash",
           "./scripts/check-links.sh",
           "{prompt_file}"
-        ]
-      },
-      "hands": {
-        "kind": "workspace",
-        "network": true,
-        "binds": [
-          {
-            "path": "~/.cargo",
-            "mode": "overlay",
-            "mask": [
-              "credentials.toml",
-              "credentials"
-            ]
-          },
-          {
-            "path": "~/.rustup",
-            "mode": "ro"
-          }
         ]
       }
     },
@@ -139,7 +121,7 @@
         "pass",
         "fail"
       ],
-      "class": "gate",
+      "class": "work",
       "limits": {
         "max_attempts": 2,
         "timeout_seconds": 900
@@ -153,32 +135,6 @@
           "bash",
           "./scripts/build-pdf.sh",
           "{prompt_file}"
-        ]
-      },
-      "hands": {
-        "kind": "workspace",
-        "network": true,
-        "binds": [
-          {
-            "path": "~/.cargo",
-            "mode": "overlay",
-            "mask": [
-              "credentials.toml",
-              "credentials"
-            ]
-          },
-          {
-            "path": "~/.rustup",
-            "mode": "ro"
-          },
-          {
-            "path": "~/.local/bin",
-            "mode": "ro"
-          },
-          {
-            "path": "~/.cache/Tectonic",
-            "mode": "rw"
-          }
         ]
       }
     },
@@ -246,64 +202,16 @@
           ],
           "aggregate": "review-panel",
           "panel": {
-            "citations-fable": {
-              "agent": "paper-review-citations-fable",
-              "class": "work"
-            },
-            "citations-qwen": {
-              "agent": "paper-review-citations-qwen",
-              "class": "work"
-            },
-            "citations-neon": {
-              "agent": "paper-review-citations-neon",
-              "class": "work"
-            },
             "citations-astra": {
               "agent": "paper-review-citations-astra",
-              "class": "work"
-            },
-            "proofs-fable": {
-              "agent": "paper-review-proofs-fable",
-              "class": "work"
-            },
-            "proofs-qwen": {
-              "agent": "paper-review-proofs-qwen",
-              "class": "work"
-            },
-            "proofs-neon": {
-              "agent": "paper-review-proofs-neon",
               "class": "work"
             },
             "proofs-astra": {
               "agent": "paper-review-proofs-astra",
               "class": "work"
             },
-            "code-fable": {
-              "agent": "paper-review-code-fable",
-              "class": "work"
-            },
-            "code-qwen": {
-              "agent": "paper-review-code-qwen",
-              "class": "work"
-            },
-            "code-neon": {
-              "agent": "paper-review-code-neon",
-              "class": "work"
-            },
             "code-astra": {
               "agent": "paper-review-code-astra",
-              "class": "work"
-            },
-            "arxiv-fable": {
-              "agent": "paper-review-arxiv-fable",
-              "class": "work"
-            },
-            "arxiv-qwen": {
-              "agent": "paper-review-arxiv-qwen",
-              "class": "work"
-            },
-            "arxiv-neon": {
-              "agent": "paper-review-arxiv-neon",
               "class": "work"
             },
             "arxiv-astra": {
