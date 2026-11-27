@@ -19,6 +19,7 @@ witness-ots = ["handfest-ledger/witness-ots"]
 handfest-core.workspace = true
 handfest-anchors.workspace = true
 handfest-ledger.workspace = true
+handfest-approver.workspace = true
 clap.workspace = true
 serde.workspace = true
 serde_json.workspace = true

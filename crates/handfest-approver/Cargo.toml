@@ -1,0 +1,25 @@
+[package]
+name = "handfest-approver"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Out-of-band WYSIWYS signing daemon and Unix-socket client for HANDFEST v1 mandates"
+
+[[bin]]
+name = "handfest-approver"
+path = "src/main.rs"
+
+[dependencies]
+handfest-core.workspace = true    # internal workspace crate: AST, CNL parser/renderer, RFC 3339, ExactJson, proof validation
+handfest-anchors.workspace = true # internal workspace crate: MandateSigner, sign_mandate_with, AnchorVerifier, CommandRunner
+clap.workspace = true             # CLI argument parsing for `handfest-approver` binary (prototyping debt)
+serde.workspace = true            # typed wire protocol serialization/deserialization (prototyping debt)
+serde_json.workspace = true       # JSON wire protocol and key-file codecs (prototyping debt)
+
+[dev-dependencies]
+tempfile.workspace = true         # test-only ephemeral directories for restricted Unix sockets and key fixtures
+
+[lints]
+workspace = true

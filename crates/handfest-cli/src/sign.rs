@@ -4,76 +4,22 @@ use std::fs;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-use handfest_anchors::{
-    parse_ed25519_spki_pem, sign_mandate_with, CommandRunner, Ed25519KeyFile, Ed25519Keypair,
-    Fido2CredentialFile, Fido2Ed25519Signer, MandateSigner, OpenPgpEd25519Signer, PivEd25519Signer,
-    PivPinSource, PivSignerConfig, SignedMandate, SshSkAnySigner, SystemCommandRunner,
-    DEFAULT_PIV_KEY_ID, DEFAULT_PIV_PIN_ENV, DEFAULT_PKCS11_MODULE,
-};
+#[cfg(test)]
+use handfest_anchors::CommandRunner;
+use handfest_anchors::{sign_mandate_with, MandateSigner, PivSignerConfig, SignedMandate};
+pub(crate) use handfest_approver::signer::SignerConfig;
+#[cfg(test)]
+use handfest_approver::signer::{DEFAULT_FIDO2_ANCHOR_ID, DEFAULT_LOCAL_ED25519_ANCHOR_ID};
 use handfest_core::cnl::{parse_mandate, try_render_canonical};
 
 use crate::parse_timestamp_arg;
-
-pub(crate) const DEFAULT_LOCAL_ED25519_ANCHOR_ID: &str = "local-ed25519";
-pub(crate) const DEFAULT_SSH_SK_ANCHOR_ID: &str = "yubikey-ssh-sk";
-pub(crate) const DEFAULT_FIDO2_ANCHOR_ID: &str = "yubikey-fido2";
-pub(crate) const DEFAULT_OPENPGP_ANCHOR_ID: &str = "yubikey-openpgp";
-pub(crate) const DEFAULT_PIV_ANCHOR_ID: &str = "yubikey-piv";
-
-#[derive(Debug, PartialEq, Eq)]
-pub(crate) enum SignerConfig {
-    LocalEd25519 {
-        key_path: PathBuf,
-    },
-    SshSk {
-        key_path: PathBuf,
-    },
-    Fido2Ed25519 {
-        cred_path: PathBuf,
-        device_path: Option<String>,
-    },
-    OpenPgpEd25519 {
-        fingerprint: String,
-    },
-    PivEd25519 {
-        pubkey_path: PathBuf,
-        config: PivSignerConfig,
-    },
-}
-
-impl SignerConfig {
-    pub(crate) const fn default_anchor_id(&self) -> &'static str {
-        match self {
-            Self::LocalEd25519 { .. } => DEFAULT_LOCAL_ED25519_ANCHOR_ID,
-            Self::SshSk { .. } => DEFAULT_SSH_SK_ANCHOR_ID,
-            Self::Fido2Ed25519 { .. } => DEFAULT_FIDO2_ANCHOR_ID,
-            Self::OpenPgpEd25519 { .. } => DEFAULT_OPENPGP_ANCHOR_ID,
-            Self::PivEd25519 { .. } => DEFAULT_PIV_ANCHOR_ID,
-        }
-    }
-}
 
 pub(crate) fn build_piv_signer_config(
     piv_module: Option<String>,
     piv_id: Option<String>,
 ) -> Result<PivSignerConfig, String> {
-    let pin_source = match std::env::var_os(DEFAULT_PIV_PIN_ENV) {
-        None => PivPinSource::Interactive,
-        Some(raw) => {
-            let text = raw
-                .to_str()
-                .ok_or_else(|| format!("{DEFAULT_PIV_PIN_ENV} must be valid UTF-8 when set"))?;
-            if text.is_empty() {
-                return Err(format!("{DEFAULT_PIV_PIN_ENV} must not be empty when set"));
-            }
-            PivPinSource::EnvVar(DEFAULT_PIV_PIN_ENV.to_string())
-        }
-    };
-    Ok(PivSignerConfig {
-        pkcs11_module: piv_module.unwrap_or_else(|| DEFAULT_PKCS11_MODULE.to_string()),
-        key_id: piv_id.unwrap_or_else(|| DEFAULT_PIV_KEY_ID.to_string()),
-        pin_source,
-    })
+    handfest_approver::signer::build_piv_signer_config(piv_module, piv_id)
+        .map_err(|err| err.to_string())
 }
 
 pub(crate) struct SignArgs {
@@ -86,59 +32,19 @@ pub(crate) struct SignArgs {
 }
 
 pub(crate) fn resolve_signer(config: &SignerConfig) -> Result<Box<dyn MandateSigner>, String> {
-    resolve_signer_with_runner(config, SystemCommandRunner)
+    handfest_approver::signer::resolve_signer(config)
+        .map(handfest_approver::signer::BoxedSigner::into_inner)
+        .map_err(|err| err.to_string())
 }
 
+#[cfg(test)]
 fn resolve_signer_with_runner<R: CommandRunner + 'static>(
     config: &SignerConfig,
     runner: R,
 ) -> Result<Box<dyn MandateSigner>, String> {
-    match config {
-        SignerConfig::LocalEd25519 { key_path } => {
-            let key_raw = fs::read_to_string(key_path)
-                .map_err(|err| format!("failed to read '{}': {err}", key_path.display()))?;
-            let key_file: Ed25519KeyFile = serde_json::from_str(&key_raw)
-                .map_err(|err| format!("invalid key file JSON: {err}"))?;
-            let keypair = Ed25519Keypair::from_key_file(&key_file)
-                .map_err(|err| format!("failed to load Ed25519 key: {err}"))?;
-            Ok(Box::new(keypair))
-        }
-        SignerConfig::SshSk { key_path } => {
-            let signer = SshSkAnySigner::from_key_path(key_path, runner)
-                .map_err(|err| format!("failed to load SSH security key: {err}"))?;
-            Ok(Box::new(signer))
-        }
-        SignerConfig::Fido2Ed25519 {
-            cred_path,
-            device_path,
-        } => {
-            let cred_raw = fs::read_to_string(cred_path)
-                .map_err(|err| format!("failed to read '{}': {err}", cred_path.display()))?;
-            let cred_file: Fido2CredentialFile = serde_json::from_str(&cred_raw)
-                .map_err(|err| format!("invalid FIDO2 credential file JSON: {err}"))?;
-            let signer =
-                Fido2Ed25519Signer::from_credential_file(runner, &cred_file, device_path.clone())
-                    .map_err(|err| format!("failed to load FIDO2 credential: {err}"))?;
-            Ok(Box::new(signer))
-        }
-        SignerConfig::OpenPgpEd25519 { fingerprint } => {
-            let signer = OpenPgpEd25519Signer::from_gpg_export_with(runner, fingerprint)
-                .map_err(|err| format!("failed to load OpenPGP key '{fingerprint}': {err}"))?;
-            Ok(Box::new(signer))
-        }
-        SignerConfig::PivEd25519 {
-            pubkey_path,
-            config,
-        } => {
-            let pem = fs::read_to_string(pubkey_path)
-                .map_err(|err| format!("failed to read '{}': {err}", pubkey_path.display()))?;
-            let public_key = parse_ed25519_spki_pem(&pem)
-                .map_err(|err| format!("failed to load PIV Ed25519 public key: {err}"))?;
-            let signer = PivEd25519Signer::new(runner, config.clone(), public_key)
-                .map_err(|err| format!("failed to initialize PIV signer: {err}"))?;
-            Ok(Box::new(signer))
-        }
-    }
+    handfest_approver::signer::resolve_signer_with_runner(config, runner)
+        .map(handfest_approver::signer::BoxedSigner::into_inner)
+        .map_err(|err| err.to_string())
 }
 
 pub(crate) fn sign_canonical_with_signer(
@@ -188,8 +94,8 @@ pub(crate) fn cmd_sign(args: &SignArgs) -> Result<ExitCode, String> {
 mod tests {
     use super::*;
     use handfest_anchors::{
-        format_fido2_ed25519_key_id, AnchorError, AssuranceLevel, CommandOutput,
-        DEFAULT_FIDO2_RP_ID,
+        format_fido2_ed25519_key_id, AnchorError, AssuranceLevel, CommandOutput, Ed25519Keypair,
+        Fido2CredentialFile, DEFAULT_FIDO2_RP_ID,
     };
     use handfest_core::ast::KeyId;
 

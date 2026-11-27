@@ -4,6 +4,7 @@ mod facts;
 mod init;
 mod keyid;
 mod policy_check;
+mod request;
 mod revoke;
 mod sign;
 mod witness;
@@ -27,6 +28,7 @@ use crate::facts::parse_facts_arg;
 use crate::init::{run_init_cli, InitCliArgs};
 use crate::keyid::{run_keyid_cli, PrincipalKeyArgs};
 use crate::policy_check::resolve_policy_map_request;
+use crate::request::{run_request_cli, RequestCliArgs};
 use crate::revoke::{
     current_utc_unix_seconds, load_and_verify_revocations, run_revoke_cli,
     verify_stored_revocations_signatures, RevokeCliArgs,
@@ -142,6 +144,8 @@ enum Commands {
         #[arg(long)]
         out: Option<PathBuf>,
     },
+    /// Requests an out-of-band WYSIWYS signature from a running `handfest-approver` daemon.
+    Request(RequestCliArgs),
     /// Signs a canonical HANDFEST REVOKE v1 statement and optionally records it in a ledger.
     Revoke(RevokeCliArgs),
     /// Verifies 1+ signed mandates as a delegation chain (signatures + lattice narrowing + revocations).
@@ -286,6 +290,7 @@ fn run(cli: Cli) -> Result<ExitCode, String> {
                 out,
             })
         }
+        Commands::Request(args) => run_request_cli(args),
         Commands::Revoke(args) => run_revoke_cli(args),
         Commands::Verify {
             signed,
