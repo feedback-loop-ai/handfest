@@ -1021,3 +1021,517 @@ fn open_existing_maps_permission_denied_parent_dir_to_storage_not_not_found() {
         "ledger inside 0o000 parent dir must map to LedgerError::Storage, got: {err:?}"
     );
 }
+
+#[test]
+fn list_receipts_returns_ordered_verified_receipts_and_fails_closed_on_tamper() {
+    let dir = TempDir::new().unwrap();
+    let db_path = dir.path().join("list_receipts.sqlite");
+    let (chain, req, facts, now) = sample_chain_and_req();
+
+    let (v1, r1, v2, r2) = {
+        let mut ledger = SqliteLedger::open(&db_path).unwrap();
+        let (v1, r1) = ledger
+            .evaluate_and_record(&chain, &req, &facts, now)
+            .unwrap();
+        let (v2, r2) = ledger
+            .evaluate_and_record(&chain, &req, &facts, now + 10)
+            .unwrap();
+        let listed = ledger.list_receipts().unwrap();
+        assert_eq!(listed, vec![r1.clone(), r2.clone()]);
+        (v1, r1, v2, r2)
+    };
+    assert_eq!(v1, Verdict::Permit);
+    assert_eq!(v2, Verdict::Permit);
+
+    let reopened = SqliteLedger::open_existing(&db_path).unwrap();
+    let listed = reopened.list_receipts().unwrap();
+    assert_eq!(listed.len(), 2);
+    assert_eq!(listed[0].receipt_hash, r1.receipt_hash);
+    assert_eq!(listed[1].receipt_hash, r2.receipt_hash);
+    drop(reopened);
+
+    // Tampering with receipts fails closed inside list_receipts().
+    let raw = Connection::open(&db_path).unwrap();
+    raw.execute(
+        "UPDATE receipts SET action = 'tampered.action' WHERE seq = 1",
+        [],
+    )
+    .unwrap();
+    drop(raw);
+
+    let tampered = SqliteLedger::open_existing(&db_path).unwrap();
+    assert!(matches!(
+        tampered.list_receipts(),
+        Err(LedgerError::Integrity(_))
+    ));
+}
+
+#[test]
+fn record_denial_with_revocations_is_atomic_against_concurrent_revocation_commit() {
+    use handfest_core::gate::VerifiedRevocation;
+    use handfest_core::revocation::{RevocationAst, RevocationTarget};
+
+    let dir = TempDir::new().unwrap();
+    let db_path = dir.path().join("atomic_denial_rev.sqlite");
+    let (chain, req, _facts, now) = sample_chain_and_req();
+    let chain_ids: Vec<MandateId> = chain.iter().map(|vm| vm.ast.mandate_id()).collect();
+
+    // Initialize the database and open the worker's ledger before acquiring the write lock.
+    let mut worker_ledger = SqliteLedger::open(&db_path).unwrap();
+
+    let rev = VerifiedRevocation {
+        ast: RevocationAst::new(
+            chain[0].ast.from().clone(),
+            RevocationTarget::Mandate(chain_ids[0]),
+            now,
+            Some("concurrent kill".to_string()),
+        )
+        .unwrap(),
+        proof: VerifiedAnchorProof {
+            anchor_id: "test-anchor".to_string(),
+            assurance: AssuranceLevel::LocalKey,
+            signer_key: chain[0].ast.from().key().clone(),
+            actor_kind: chain[0].ast.from().kind(),
+            valid_from: now - 60,
+            valid_until: now + 3600,
+        },
+    };
+    let rev_id = rev.ast.revocation_id();
+
+    let mut raw = Connection::open(&db_path).unwrap();
+    let tx = raw
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .unwrap();
+
+    let (ready_tx, ready_rx) = mpsc::channel();
+    let chain_for_worker = chain.clone();
+    let req_for_worker = req.clone();
+    let worker = std::thread::spawn(move || {
+        ready_tx.send(()).unwrap();
+        let actor_key = req_for_worker.actor_key.clone();
+        worker_ledger
+            .record_denial_with_revocations(
+                &chain_for_worker,
+                &actor_key,
+                &req_for_worker,
+                &RevocationSnapshot::new(),
+                now,
+                "fallback mapping error".to_string(),
+            )
+            .unwrap()
+    });
+
+    ready_rx.recv().unwrap();
+    // Give the worker enough time to enter BEGIN IMMEDIATE (or, if it were non-atomic,
+    // to read an empty revocations snapshot before blocking on the write lock).
+    std::thread::sleep(Duration::from_millis(80));
+    record_revocation_tx(&tx, &rev, &"aa".repeat(64)).unwrap();
+    tx.commit().unwrap();
+
+    let (reason, receipt) = worker.join().unwrap();
+    assert!(
+        reason.contains(&rev_id.to_string()),
+        "atomic BEGIN IMMEDIATE denial must observe concurrent revocation commit, got '{reason}'"
+    );
+    assert!(receipt.verify_hash());
+}
+
+#[test]
+fn record_denial_with_revocations_rejects_dropped_index_before_inserting_row() {
+    let dir = TempDir::new().unwrap();
+    let db_path = dir.path().join("schema_tamper_denial.sqlite");
+    let (chain, req, _facts, now) = sample_chain_and_req();
+
+    let mut ledger = SqliteLedger::open(&db_path).unwrap();
+
+    // Tamper with schema by dropping required index idx_receipts_actor_key.
+    let raw = Connection::open(&db_path).unwrap();
+    raw.execute("DROP INDEX idx_receipts_actor_key", [])
+        .unwrap();
+
+    let changes_before = connection_total_changes(&ledger.conn);
+    let err = ledger
+        .record_denial_with_revocations(
+            &chain,
+            &req.actor_key,
+            &req,
+            &RevocationSnapshot::new(),
+            now,
+            "fallback mapping error".to_string(),
+        )
+        .expect_err("dropped index must fail closed with LedgerError::Integrity");
+    assert!(
+        matches!(err, LedgerError::Integrity(ref msg) if msg.contains("idx_receipts_actor_key")),
+        "expected Integrity error citing idx_receipts_actor_key, got {err:?}"
+    );
+    assert_eq!(
+        connection_total_changes(&ledger.conn),
+        changes_before,
+        "record_denial_with_revocations must attempt zero DML before rejecting schema tamper"
+    );
+
+    let count: i64 = raw
+        .query_row("SELECT COUNT(*) FROM receipts", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(
+        count, 0,
+        "no denial receipt row may be inserted on schema tamper"
+    );
+}
+
+const BEFORE_INSERT_ABORT_TRIGGERS_SQL: &str = concat!(
+    "CREATE TRIGGER r_before_ins BEFORE INSERT ON receipts BEGIN SELECT RAISE(ABORT, 'dml_before_schema_check'); END; ",
+    "CREATE TRIGGER q_before_ins BEFORE INSERT ON quota_calls BEGIN SELECT RAISE(ABORT, 'dml_before_schema_check'); END; ",
+    "CREATE TRIGGER rev_before_ins BEFORE INSERT ON revocations BEGIN SELECT RAISE(ABORT, 'dml_before_schema_check'); END"
+);
+
+fn connection_total_changes(conn: &Connection) -> i64 {
+    // SQLite's `total_changes()` counts DML row modifications on the connection and does NOT
+    // reset on transaction rollback, so it catches writes executed before a pre-commit failure.
+    conn.query_row("SELECT total_changes()", [], |row| row.get(0))
+        .expect("SQLite total_changes() query must succeed")
+}
+
+fn assert_write_op_fails_closed_without_dml<T, F>(
+    ledger: &mut SqliteLedger,
+    expected_substr: &str,
+    label: &str,
+    write_op: F,
+) where
+    T: std::fmt::Debug,
+    F: FnOnce(&mut SqliteLedger) -> Result<T, LedgerError>,
+{
+    let changes_before = connection_total_changes(&ledger.conn);
+    let err = write_op(ledger).expect_err(&format!("{label} must fail closed on schema tamper"));
+    assert!(
+        matches!(err, LedgerError::Integrity(ref msg) if msg.contains(expected_substr)),
+        "{label}: expected Integrity error citing '{expected_substr}', got {err:?}"
+    );
+    assert_eq!(
+        connection_total_changes(&ledger.conn),
+        changes_before,
+        "{label}: must attempt zero DML before reporting schema integrity error"
+    );
+}
+
+fn assert_all_write_txs_fail_closed_before_dml(tamper_sql: &str, expected_substr: &str) {
+    let dir = TempDir::new().unwrap();
+    let db_path = dir.path().join("schema_tamper_writes.sqlite");
+    let (chain, req, facts, now) = sample_chain_and_req();
+    let chain_ids: Vec<MandateId> = chain.iter().map(|vm| vm.ast.mandate_id()).collect();
+    let rev = sample_verified_revocation(&chain, now);
+
+    let mut ledger = SqliteLedger::open(&db_path).unwrap();
+    let raw = Connection::open(&db_path).unwrap();
+    raw.execute_batch(tamper_sql).unwrap();
+
+    assert_write_op_fails_closed_without_dml(
+        &mut ledger,
+        expected_substr,
+        "evaluate_and_record_with_revocations",
+        |l| {
+            l.evaluate_and_record_with_revocations(
+                &chain,
+                &req,
+                &facts,
+                &RevocationSnapshot::new(),
+                now,
+            )
+        },
+    );
+    assert_write_op_fails_closed_without_dml(
+        &mut ledger,
+        expected_substr,
+        "record_revocation",
+        |l| l.record_revocation(&rev, &"aa".repeat(64)),
+    );
+    assert_write_op_fails_closed_without_dml(&mut ledger, expected_substr, "record_denial", |l| {
+        l.record_denial(chain_ids, &req, now, "pre-gate deny".to_string())
+    });
+    assert_write_op_fails_closed_without_dml(
+        &mut ledger,
+        expected_substr,
+        "record_denial_with_revocations",
+        |l| {
+            l.record_denial_with_revocations(
+                &chain,
+                &req.actor_key,
+                &req,
+                &RevocationSnapshot::new(),
+                now,
+                "fallback mapping error".to_string(),
+            )
+        },
+    );
+
+    for table in ["receipts", "quota_calls", "revocations"] {
+        let count: i64 = raw
+            .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(
+            count, 0,
+            "no rows may be written to {table} when schema is tampered"
+        );
+    }
+}
+
+#[test]
+fn all_write_transactions_reject_rogue_trigger_and_dropped_index_before_dml() {
+    assert_all_write_txs_fail_closed_before_dml(
+        "CREATE TRIGGER q_ins AFTER INSERT ON quota_calls BEGIN UPDATE quota_calls SET calls = 0; END;",
+        "q_ins",
+    );
+    assert_all_write_txs_fail_closed_before_dml(
+        "DROP INDEX idx_receipts_actor_key;",
+        "idx_receipts_actor_key",
+    );
+    assert_all_write_txs_fail_closed_before_dml(BEFORE_INSERT_ABORT_TRIGGERS_SQL, "r_before_ins");
+}
+
+struct BusyTamperState {
+    raw: Connection,
+    tamper_sql: String,
+    fired: bool,
+}
+
+thread_local! {
+    static BUSY_TAMPER: std::cell::RefCell<Option<BusyTamperState>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+struct BusyTamperGuard;
+
+impl Drop for BusyTamperGuard {
+    fn drop(&mut self) {
+        BUSY_TAMPER.with(|slot| {
+            *slot.borrow_mut() = None;
+        });
+    }
+}
+
+fn tamper_on_begin_immediate_busy(attempt: i32) -> bool {
+    if attempt != 0 {
+        return false;
+    }
+    BUSY_TAMPER.with(|slot| {
+        let mut borrow = slot.borrow_mut();
+        let Some(state) = borrow.as_mut() else {
+            return false;
+        };
+        if state.fired {
+            return false;
+        }
+        state
+            .raw
+            .execute_batch(&format!("{}; COMMIT;", state.tamper_sql))
+            .expect("busy handler must commit schema tamper");
+        state.fired = true;
+        true
+    })
+}
+
+fn sample_verified_revocation(
+    chain: &[VerifiedMandate],
+    now: i64,
+) -> handfest_core::gate::VerifiedRevocation {
+    use handfest_core::gate::VerifiedRevocation;
+    use handfest_core::revocation::{RevocationAst, RevocationTarget};
+
+    let root_id = chain[0].ast.mandate_id();
+    VerifiedRevocation {
+        ast: RevocationAst::new(
+            chain[0].ast.from().clone(),
+            RevocationTarget::Mandate(root_id),
+            now,
+            Some("tamper ordering test".to_string()),
+        )
+        .unwrap(),
+        proof: VerifiedAnchorProof {
+            anchor_id: "test-anchor".to_string(),
+            assurance: AssuranceLevel::LocalKey,
+            signer_key: chain[0].ast.from().key().clone(),
+            actor_kind: chain[0].ast.from().kind(),
+            valid_from: now - 60,
+            valid_until: now + 3600,
+        },
+    }
+}
+
+fn assert_write_path_verifies_schema_inside_begin_immediate<T, F>(
+    tamper_sql: &str,
+    expected_substr: &str,
+    label: &str,
+    write_op: F,
+) where
+    T: std::fmt::Debug,
+    F: FnOnce(&mut SqliteLedger) -> Result<T, LedgerError>,
+{
+    let dir = TempDir::new().unwrap();
+    let db_path = dir.path().join("schema_tamper_inside_tx.sqlite");
+
+    let mut ledger = SqliteLedger::open(&db_path).unwrap();
+    let raw = Connection::open(&db_path).unwrap();
+    // Hold SQLite's RESERVED write lock while the schema is still clean. A pre-transaction
+    // `verify_schema_integrity` only needs a SHARED lock and passes against the clean schema;
+    // only `BEGIN IMMEDIATE` hits SQLITE_BUSY and invokes `tamper_on_begin_immediate_busy`,
+    // which commits the schema tamper and releases the lock before `BEGIN IMMEDIATE` succeeds.
+    raw.execute_batch("BEGIN IMMEDIATE;").unwrap();
+
+    let _guard = BusyTamperGuard;
+    BUSY_TAMPER.with(|slot| {
+        *slot.borrow_mut() = Some(BusyTamperState {
+            raw,
+            tamper_sql: tamper_sql.to_string(),
+            fired: false,
+        });
+    });
+    ledger
+        .conn
+        .busy_handler(Some(tamper_on_begin_immediate_busy))
+        .unwrap();
+
+    let changes_before = connection_total_changes(&ledger.conn);
+    let err = write_op(&mut ledger).expect_err(&format!(
+        "{label} must reject schema tamper committed while waiting on BEGIN IMMEDIATE"
+    ));
+    let _ = ledger.conn.busy_handler(None);
+    assert!(
+        matches!(err, LedgerError::Integrity(ref msg) if msg.contains(expected_substr)),
+        "{label}: expected Integrity error citing '{expected_substr}', got {err:?}"
+    );
+    assert_eq!(
+        connection_total_changes(&ledger.conn),
+        changes_before,
+        "{label}: must attempt zero DML before reporting schema integrity error"
+    );
+
+    let state = BUSY_TAMPER
+        .with(|slot| slot.borrow_mut().take())
+        .expect("busy tamper state must still be present");
+    assert!(
+        state.fired,
+        "{label}: busy handler must have fired during BEGIN IMMEDIATE"
+    );
+
+    for table in ["receipts", "quota_calls", "revocations"] {
+        let count: i64 = state
+            .raw
+            .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(
+            count, 0,
+            "{label}: no rows may be written to {table} when schema is tampered"
+        );
+    }
+}
+
+fn assert_all_write_paths_verify_schema_inside_begin_immediate(
+    tamper_sql: &str,
+    expected_substr: &str,
+) {
+    let (chain, req, facts, now) = sample_chain_and_req();
+    let chain_ids: Vec<MandateId> = chain.iter().map(|vm| vm.ast.mandate_id()).collect();
+    let rev = sample_verified_revocation(&chain, now);
+
+    assert_write_path_verifies_schema_inside_begin_immediate(
+        tamper_sql,
+        expected_substr,
+        "evaluate_and_record_with_revocations",
+        |ledger| {
+            ledger.evaluate_and_record_with_revocations(
+                &chain,
+                &req,
+                &facts,
+                &RevocationSnapshot::new(),
+                now,
+            )
+        },
+    );
+
+    assert_write_path_verifies_schema_inside_begin_immediate(
+        tamper_sql,
+        expected_substr,
+        "record_revocation",
+        |ledger| ledger.record_revocation(&rev, &"aa".repeat(64)),
+    );
+
+    assert_write_path_verifies_schema_inside_begin_immediate(
+        tamper_sql,
+        expected_substr,
+        "record_denial",
+        |ledger| ledger.record_denial(chain_ids, &req, now, "pre-gate deny".to_string()),
+    );
+
+    assert_write_path_verifies_schema_inside_begin_immediate(
+        tamper_sql,
+        expected_substr,
+        "record_denial_with_revocations",
+        |ledger| {
+            ledger.record_denial_with_revocations(
+                &chain,
+                &req.actor_key,
+                &req,
+                &RevocationSnapshot::new(),
+                now,
+                "fallback mapping error".to_string(),
+            )
+        },
+    );
+}
+
+#[test]
+fn all_write_transactions_verify_schema_integrity_inside_begin_immediate() {
+    assert_all_write_paths_verify_schema_inside_begin_immediate(
+        "CREATE TRIGGER q_ins AFTER INSERT ON quota_calls BEGIN UPDATE quota_calls SET calls = 0; END",
+        "q_ins",
+    );
+    assert_all_write_paths_verify_schema_inside_begin_immediate(
+        "DROP INDEX idx_receipts_actor_key",
+        "idx_receipts_actor_key",
+    );
+    assert_all_write_paths_verify_schema_inside_begin_immediate(
+        BEFORE_INSERT_ABORT_TRIGGERS_SQL,
+        "r_before_ins",
+    );
+}
+
+#[test]
+fn schema_verification_precedes_receipt_read_on_non_empty_ledger() {
+    let dir = TempDir::new().unwrap();
+    let db_path = dir.path().join("schema_before_receipt.sqlite");
+    let (chain, req, facts, now) = sample_chain_and_req();
+
+    let mut ledger = SqliteLedger::open(&db_path).unwrap();
+    let (verdict, _) = ledger
+        .evaluate_and_record_with_revocations(&chain, &req, &facts, &RevocationSnapshot::new(), now)
+        .unwrap();
+    assert_eq!(verdict, Verdict::Permit);
+
+    let raw = Connection::open(&db_path).unwrap();
+    raw.execute_batch(
+        "UPDATE receipts SET receipt_hash = 'not-a-valid-sha256';
+         DROP INDEX idx_receipts_actor_key;",
+    )
+    .unwrap();
+
+    let err = ledger
+        .evaluate_and_record_with_revocations(
+            &chain,
+            &req,
+            &facts,
+            &RevocationSnapshot::new(),
+            now + 1,
+        )
+        .unwrap_err();
+    match err {
+        LedgerError::Integrity(msg) => assert!(
+            msg.contains("idx_receipts_actor_key"),
+            "schema verification must report missing index before reading malformed receipt hash, got: {msg}"
+        ),
+        other => panic!("expected LedgerError::Integrity, got: {other:?}"),
+    }
+}

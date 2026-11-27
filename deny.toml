@@ -22,7 +22,7 @@ unknown-git = "deny"
 [bans]
 multiple-versions = "deny"
 deny = [
-  { crate = "handfest-core", wrappers = ["handfest-anchors", "handfest-ledger", "handfest-mcp", "handfest-cli"], reason = "core sits at the bottom of the one-way dependency graph" },
-  { crate = "handfest-anchors", wrappers = ["handfest-mcp", "handfest-cli"], reason = "anchors verify external cryptographic roots above core" },
-  { crate = "handfest-ledger", wrappers = ["handfest-mcp", "handfest-cli"], reason = "ledger persistence sits above core" },
+  { crate = "handfest-core", wrappers = ["handfest-anchors", "handfest-ledger", "handfest-pep", "handfest-mcp", "handfest-exec", "handfest-http", "handfest-cli"], reason = "core sits at the bottom of the one-way dependency graph" },
+  { crate = "handfest-anchors", wrappers = ["handfest-pep", "handfest-mcp", "handfest-exec", "handfest-http", "handfest-cli"], reason = "anchors verify external cryptographic roots above core" },
+  { crate = "handfest-ledger", wrappers = ["handfest-pep", "handfest-mcp", "handfest-exec", "handfest-http", "handfest-cli"], reason = "ledger persistence sits above core" },
 ]

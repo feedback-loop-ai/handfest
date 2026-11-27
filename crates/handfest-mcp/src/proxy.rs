@@ -5,16 +5,14 @@ use std::fmt;
 use std::io::Write;
 use std::time::Duration;
 
-use handfest_core::ast::{KeyId, MandateId};
+use handfest_core::ast::KeyId;
 use handfest_core::gate::{
-    check_chain_revocations, evaluate_predicate_if_known, verify_chain_runtime, ActionRequest,
-    RevocationSnapshot, VerifiedMandate,
+    evaluate_predicate_if_known, ActionRequest, RevocationSnapshot, VerifiedMandate,
 };
-use handfest_core::Verdict;
 pub use handfest_ledger::ReceiptLedger;
 use handfest_ledger::SqliteLedger;
+use handfest_pep::{GateDecision, GateEngine, PepError};
 
-use crate::adapters::validate_verified_chain;
 pub use crate::adapters::{
     verify_mandate_chain, verify_mandate_chain_with, verify_revocations, verify_revocations_with,
     Clock, FixedClock, ProxyError, SystemClock,
@@ -39,13 +37,8 @@ pub const HANDFEST_DENIED_ERROR_CODE: i32 = -32001;
 
 /// Fail-closed MCP stdio JSON-RPC 2.0 proxy enforcing a verified `HANDFEST v1` mandate chain.
 pub struct McpProxy<C: Clock, L: ReceiptLedger = SqliteLedger> {
-    pub(crate) verified_chain: Vec<VerifiedMandate>,
-    pub(crate) chain_ids: Vec<MandateId>,
-    pub(crate) actor_key: KeyId,
+    pub(crate) engine: GateEngine<C, L>,
     pub(crate) policy_map: CompiledPolicyMap,
-    pub(crate) ledger: L,
-    pub(crate) clock: C,
-    pub(crate) extra_revocations: RevocationSnapshot,
     pub(crate) max_line_bytes: usize,
     pub(crate) shutdown_timeout: Duration,
 }
@@ -53,8 +46,8 @@ pub struct McpProxy<C: Clock, L: ReceiptLedger = SqliteLedger> {
 impl<C: Clock, L: ReceiptLedger> fmt::Debug for McpProxy<C, L> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("McpProxy")
-            .field("chain_len", &self.verified_chain.len())
-            .field("actor_key", &self.actor_key)
+            .field("chain_len", &self.engine.verified_chain().len())
+            .field("actor_key", self.engine.actor_key())
             .field("mapped_tools", &self.policy_map.policy_map().tools.len())
             .field("max_line_bytes", &self.max_line_bytes)
             .field("shutdown_timeout", &self.shutdown_timeout)
@@ -71,19 +64,11 @@ impl<C: Clock, L: ReceiptLedger> McpProxy<C, L> {
         ledger: L,
         clock: C,
     ) -> Result<Self, ProxyError> {
-        let chain_ids = validate_verified_chain(&verified_chain)?;
-        actor_key
-            .validate()
-            .map_err(|err| ProxyError::InvalidChain(format!("invalid actor_key: {err}")))?;
+        let engine = GateEngine::new(verified_chain, actor_key, ledger, clock)?;
         let policy_map = policy_map.compile()?;
         Ok(Self {
-            verified_chain,
-            chain_ids,
-            actor_key,
+            engine,
             policy_map,
-            ledger,
-            clock,
-            extra_revocations: RevocationSnapshot::new(),
             max_line_bytes: DEFAULT_MAX_LINE_BYTES,
             shutdown_timeout: DEFAULT_SHUTDOWN_TIMEOUT,
         })
@@ -92,7 +77,7 @@ impl<C: Clock, L: ReceiptLedger> McpProxy<C, L> {
     /// Attaches static verified revocations enforced alongside revocations persisted in `ledger`.
     #[must_use]
     pub fn with_revocations(mut self, revocations: RevocationSnapshot) -> Self {
-        self.extra_revocations = revocations;
+        self.engine = self.engine.with_revocations(revocations);
         self
     }
 
@@ -117,13 +102,13 @@ impl<C: Clock, L: ReceiptLedger> McpProxy<C, L> {
     /// Borrows the underlying [`ReceiptLedger`].
     #[must_use]
     pub const fn ledger(&self) -> &L {
-        &self.ledger
+        self.engine.ledger()
     }
 
     /// Consumes the proxy and returns its underlying [`ReceiptLedger`].
     #[must_use]
     pub fn into_ledger(self) -> L {
-        self.ledger
+        self.engine.into_ledger()
     }
 
     pub(crate) fn handle_tools_call<CW: Write>(
@@ -133,12 +118,12 @@ impl<C: Clock, L: ReceiptLedger> McpProxy<C, L> {
         raw_frame: &str,
         ctx: &mut DispatchCtx<'_, CW>,
     ) -> Result<(), ProxyError> {
-        let now = self.clock.now_unix();
+        let now = self.engine.now_unix();
         let (tool_name, arguments) = match extract_tool_call_params(obj) {
             Ok(parts) => parts,
             Err(reason) => {
                 let denial_req = ActionRequest {
-                    actor_key: self.actor_key.clone(),
+                    actor_key: self.engine.actor_key().clone(),
                     action: "mcp.invalid_params".to_string(),
                     resource_kind: "mcp_tool".to_string(),
                     resource_id: "invalid_params".to_string(),
@@ -156,12 +141,12 @@ impl<C: Clock, L: ReceiptLedger> McpProxy<C, L> {
         let (request, facts) =
             match self
                 .policy_map
-                .map_call_exact(&self.actor_key, tool_name, arguments)
+                .map_call_exact(self.engine.actor_key(), tool_name, arguments)
             {
                 Ok(mapped) => mapped,
                 Err(err) => {
                     let denial_req = build_mapping_denial_request(
-                        &self.actor_key,
+                        self.engine.actor_key(),
                         self.policy_map.policy_map(),
                         tool_name,
                         arguments,
@@ -178,15 +163,9 @@ impl<C: Clock, L: ReceiptLedger> McpProxy<C, L> {
 
         self.ensure_upstream_alive(&req_id, ctx)?;
 
-        let (verdict, receipt) = match self.ledger.evaluate_and_record_with_revocations(
-            &self.verified_chain,
-            &request,
-            &facts,
-            &self.extra_revocations,
-            now,
-        ) {
+        let decision = match self.engine.authorize_at(&request, &facts, now) {
             Ok(outcome) => outcome,
-            Err(err) => {
+            Err(PepError::Ledger(err)) => {
                 write_jsonrpc_error(
                     ctx.client_out,
                     Some(&req_id),
@@ -196,13 +175,14 @@ impl<C: Clock, L: ReceiptLedger> McpProxy<C, L> {
                 )?;
                 return Err(ProxyError::Ledger(err));
             }
+            Err(err) => return Err(err.into()),
         };
 
-        match verdict {
-            Verdict::Permit => {
+        match decision {
+            GateDecision::Permit { .. } => {
                 self.dispatch_to_upstream(req_id, PendingKind::Normal, raw_frame, ctx)
             }
-            Verdict::Deny { reason } => write_denied_response(
+            GateDecision::Deny { reason, receipt } => write_denied_response(
                 ctx.client_out,
                 &req_id,
                 &reason,
@@ -257,10 +237,9 @@ impl<C: Clock, L: ReceiptLedger> McpProxy<C, L> {
             return fail_upstream_protocol(client_out, Some(req_id), detail);
         }
 
-        let chain_revoked = match self.check_revocation_status(evaluated_at) {
-            Ok(Ok(())) => false,
-            Ok(Err(_)) => true,
-            Err(ProxyError::Ledger(err)) => {
+        let chain_active = match self.engine.is_chain_active(evaluated_at) {
+            Ok(active) => active,
+            Err(PepError::Ledger(err)) => {
                 write_jsonrpc_error(
                     client_out,
                     Some(req_id),
@@ -270,12 +249,10 @@ impl<C: Clock, L: ReceiptLedger> McpProxy<C, L> {
                 )?;
                 return Err(ProxyError::Ledger(err));
             }
-            Err(err) => return Err(err),
+            Err(err) => return Err(err.into()),
         };
 
-        if verify_chain_runtime(&self.verified_chain, &self.actor_key, evaluated_at).is_err()
-            || chain_revoked
-        {
+        if !chain_active {
             tools.clear();
         } else {
             tools.retain(|entry| {
@@ -298,32 +275,12 @@ impl<C: Clock, L: ReceiptLedger> McpProxy<C, L> {
         mapping_reason: String,
         client_out: &mut CW,
     ) -> Result<(), ProxyError> {
-        let reason = match verify_chain_runtime(&self.verified_chain, &self.actor_key, now) {
-            Ok(()) => match self.check_revocation_status(now) {
-                Ok(Ok(())) => mapping_reason,
-                Ok(Err(rev_reason)) => rev_reason,
-                Err(ProxyError::Ledger(err)) => {
-                    write_jsonrpc_error(
-                        client_out,
-                        Some(req_id),
-                        JSONRPC_INTERNAL_ERROR,
-                        &format!("handfest ledger revocation verification failed: {err}"),
-                        None,
-                    )?;
-                    return Err(ProxyError::Ledger(err));
-                }
-                Err(err) => return Err(err),
-            },
-            Err(chain_err) => chain_err.to_string(),
-        };
-        let receipt = match self.ledger.record_denial(
-            self.chain_ids.clone(),
-            denial_request,
-            now,
-            reason.clone(),
-        ) {
-            Ok(receipt) => receipt,
-            Err(err) => {
+        let denial = match self
+            .engine
+            .record_pre_gate_denial(denial_request, mapping_reason, now)
+        {
+            Ok(denial) => denial,
+            Err(PepError::Ledger(err)) => {
                 write_jsonrpc_error(
                     client_out,
                     Some(req_id),
@@ -333,21 +290,13 @@ impl<C: Clock, L: ReceiptLedger> McpProxy<C, L> {
                 )?;
                 return Err(ProxyError::Ledger(err));
             }
+            Err(err) => return Err(err.into()),
         };
         write_denied_response(
             client_out,
             req_id,
-            &reason,
-            &receipt.receipt_hash.to_string(),
-        )
-    }
-
-    fn check_revocation_status(&self, evaluated_at: i64) -> Result<Result<(), String>, ProxyError> {
-        let mut combined = self.ledger.load_revocations().map_err(ProxyError::Ledger)?;
-        combined.extend_from(&self.extra_revocations);
-        Ok(
-            check_chain_revocations(&self.verified_chain, &combined, evaluated_at)
-                .map_err(|deny| deny.to_string()),
+            &denial.reason,
+            &denial.receipt.receipt_hash.to_string(),
         )
     }
 
@@ -358,7 +307,7 @@ impl<C: Clock, L: ReceiptLedger> McpProxy<C, L> {
         let Some(static_facts) = self.policy_map.static_facts_for(tool_name) else {
             return false;
         };
-        self.verified_chain.iter().all(|vm| {
+        self.engine.verified_chain().iter().all(|vm| {
             let action_allowed = vm.ast.allow().iter().any(|pat| pat.matches(&policy.action));
             let resource_allowed = match policy.static_resource_id.as_deref() {
                 Some(static_id) => vm

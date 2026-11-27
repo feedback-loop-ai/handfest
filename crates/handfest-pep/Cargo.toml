@@ -1,0 +1,21 @@
+[package]
+name = "handfest-pep"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Transport-agnostic Policy Enforcement Point (PEP) runtime for HANDFEST v1 proxies and wrappers"
+
+[dependencies]
+handfest-core.workspace = true    # internal workspace crate: AST, ExactJson, gate, receipts, revocations
+handfest-anchors.workspace = true # internal workspace crate: AnchorRegistry, AnchorVerifier, SignedMandate, SignedRevocation
+handfest-ledger.workspace = true  # internal workspace crate: ReceiptLedger trait and SQLite ledger
+serde.workspace = true            # typed config serialization/deserialization for CredentialSource (prototyping debt)
+serde_json.workspace = true       # JSON envelope deserialization for SignedMandate/SignedRevocation files (prototyping debt)
+
+[dev-dependencies]
+tempfile.workspace = true         # test-only ephemeral directories for SQLite ledgers and secret files
+
+[lints]
+workspace = true

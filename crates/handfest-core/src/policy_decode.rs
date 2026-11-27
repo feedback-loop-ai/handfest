@@ -4,9 +4,9 @@ use alloc::collections::BTreeMap;
 use alloc::format;
 use alloc::string::{String, ToString};
 
-use crate::ast::parse_rfc3339_utc;
+use crate::ast::{is_valid_quoted_str, parse_rfc3339_utc, Scalar};
 use crate::exact_json::{reject_unknown_keys, ExactJson};
-use crate::json_num::{parse_canonical_json_int, parse_decimal_str};
+use crate::json_num::{is_canonical_json_int_syntax, parse_canonical_json_int, parse_decimal_str};
 use crate::policy::{FactSpec, FactType, MappingError, ToolPolicy, ToolPolicyMap, TypedScalar};
 
 /// Decodes a [`ToolPolicyMap`] directly from a pre-parsed, duplicate-checked [`ExactJson`] tree.
@@ -56,7 +56,7 @@ fn decode_tool_policy(tool_name: &str, value: &ExactJson) -> Result<ToolPolicy, 
     };
     let static_facts = match obj.get("static_facts") {
         None => BTreeMap::new(),
-        Some(val) => decode_static_facts(tool_name, val)?,
+        Some(val) => decode_static_facts(val, &format!("tool '{tool_name}'.static_facts"))?,
     };
 
     Ok(ToolPolicy {
@@ -88,7 +88,8 @@ fn decode_arg_facts(
     Ok(out)
 }
 
-fn decode_fact_type(raw: &str, ctx: &str) -> Result<FactType, MappingError> {
+/// Decodes a [`FactType`] name string from configuration JSON.
+pub fn decode_fact_type(raw: &str, ctx: &str) -> Result<FactType, MappingError> {
     match raw {
         "str" | "Str" => Ok(FactType::Str),
         "int" | "Int" => Ok(FactType::Int),
@@ -101,20 +102,22 @@ fn decode_fact_type(raw: &str, ctx: &str) -> Result<FactType, MappingError> {
     }
 }
 
-fn decode_static_facts(
-    tool_name: &str,
+/// Decodes a `static_facts` JSON object into a map of field paths to [`TypedScalar`] values.
+pub fn decode_static_facts(
     value: &ExactJson,
+    ctx: &str,
 ) -> Result<BTreeMap<String, TypedScalar>, MappingError> {
-    let obj = expect_object(value, &format!("tool '{tool_name}'.static_facts"))?;
+    let obj = expect_object(value, ctx)?;
     let mut out = BTreeMap::new();
     for (field, scalar_val) in obj {
-        let ctx = format!("tool '{tool_name}'.static_facts['{field}']");
-        out.insert(field.clone(), decode_typed_scalar(scalar_val, &ctx)?);
+        let entry_ctx = format!("{ctx}['{field}']");
+        out.insert(field.clone(), decode_typed_scalar(scalar_val, &entry_ctx)?);
     }
     Ok(out)
 }
 
-fn decode_typed_scalar(value: &ExactJson, ctx: &str) -> Result<TypedScalar, MappingError> {
+/// Decodes a single-key tagged [`TypedScalar`] JSON object without floating-point loss.
+pub fn decode_typed_scalar(value: &ExactJson, ctx: &str) -> Result<TypedScalar, MappingError> {
     let obj = expect_object(value, ctx)?;
     let mut entries = obj.iter();
     let (Some((tag, inner)), None) = (entries.next(), entries.next()) else {
@@ -235,4 +238,43 @@ fn expect_optional_str(
             "{ctx}: field '{field}' must be a JSON string or null"
         ))),
     }
+}
+
+/// Parses and validates a raw text representation (e.g. CLI flag, URL path segment, or query
+/// parameter) into a typed [`Scalar`] matching `fact_type`.
+pub fn parse_text_scalar(fact_type: FactType, raw: &str) -> Result<Scalar, String> {
+    let scalar = match fact_type {
+        FactType::Str => {
+            if !is_valid_quoted_str(raw) {
+                return Err("string must not contain control characters".to_string());
+            }
+            Scalar::Str(raw.to_string())
+        }
+        FactType::Bool => match raw {
+            "true" => Scalar::Bool(true),
+            "false" => Scalar::Bool(false),
+            _ => return Err("expected 'true' or 'false'".to_string()),
+        },
+        FactType::Int => {
+            let parsed = parse_canonical_json_int(raw).ok_or_else(|| {
+                if is_canonical_json_int_syntax(raw) {
+                    "integer outside 64-bit range".to_string()
+                } else {
+                    "expected canonical 64-bit signed integer".to_string()
+                }
+            })?;
+            Scalar::Int(parsed)
+        }
+        FactType::Decimal => {
+            let dec = parse_decimal_str(raw).map_err(|err| format!("invalid decimal: {err}"))?;
+            Scalar::Decimal(dec)
+        }
+        FactType::Timestamp => {
+            let ts = parse_rfc3339_utc(raw)
+                .map_err(|err| format!("invalid RFC 3339 UTC timestamp: {err}"))?;
+            Scalar::Timestamp(ts)
+        }
+    };
+    scalar.validate().map_err(|err| err.to_string())?;
+    Ok(scalar)
 }

@@ -22,6 +22,10 @@ use crate::json_num::{
 #[path = "policy_decode.rs"]
 mod policy_decode;
 
+pub use policy_decode::{
+    decode_fact_type, decode_static_facts, decode_typed_scalar, parse_text_scalar,
+};
+
 /// Expected scalar type for an argument-derived fact.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -279,7 +283,8 @@ impl ToolPolicy {
     }
 }
 
-fn deserialize_unique_btreemap<'de, D, V>(de: D) -> Result<BTreeMap<String, V>, D::Error>
+/// Deserializes a JSON object into a [`BTreeMap`] while rejecting duplicate keys.
+pub fn deserialize_unique_btreemap<'de, D, V>(de: D) -> Result<BTreeMap<String, V>, D::Error>
 where
     D: serde::Deserializer<'de>,
     V: Deserialize<'de>,
@@ -658,69 +663,63 @@ fn build_verified_facts(
     Ok(facts)
 }
 
+/// Parses and validates a lossless [`ExactJson`] scalar against `expected`.
+pub fn parse_json_fact_scalar(
+    expected: FactType,
+    value: &ExactJson,
+) -> Result<Scalar, MappingError> {
+    parse_json_fact_scalar_detail(expected, value).map_err(MappingError::InvalidJson)
+}
+
 fn parse_arg_scalar(
     tool_name: &str,
     arg_key: &str,
     expected: FactType,
     value: &ExactJson,
 ) -> Result<Scalar, MappingError> {
+    parse_json_fact_scalar_detail(expected, value)
+        .map_err(|detail| invalid_arg(tool_name, arg_key, &detail))
+}
+
+fn parse_json_fact_scalar_detail(expected: FactType, value: &ExactJson) -> Result<Scalar, String> {
     let scalar = match (expected, value) {
         (FactType::Str, ExactJson::Str(s)) => {
             if !is_valid_quoted_str(s) {
-                return Err(invalid_arg(
-                    tool_name,
-                    arg_key,
-                    "string must not contain control characters",
-                ));
+                return Err("string must not contain control characters".to_string());
             }
             Scalar::Str(s.clone())
         }
         (FactType::Bool, ExactJson::Bool(b)) => Scalar::Bool(*b),
         (FactType::Int, ExactJson::Number(raw)) => {
             let parsed = parse_canonical_json_int(raw.as_str()).ok_or_else(|| {
-                let detail = if is_canonical_json_int_syntax(raw.as_str()) {
-                    "integer outside 64-bit range"
+                if is_canonical_json_int_syntax(raw.as_str()) {
+                    "integer outside 64-bit range".to_string()
                 } else {
-                    "expected 64-bit signed integer"
-                };
-                invalid_arg(tool_name, arg_key, detail)
+                    "expected 64-bit signed integer".to_string()
+                }
             })?;
             Scalar::Int(parsed)
         }
         (FactType::Decimal, ExactJson::Number(raw)) => {
-            let dec = parse_json_decimal(raw.as_str()).map_err(|err| {
-                invalid_arg(tool_name, arg_key, &format!("invalid decimal: {err}"))
-            })?;
+            let dec = parse_json_decimal(raw.as_str())
+                .map_err(|err| format!("invalid decimal: {err}"))?;
             Scalar::Decimal(dec)
         }
         (FactType::Decimal, ExactJson::Str(raw)) => {
-            let dec = parse_decimal_str(raw).map_err(|err| {
-                invalid_arg(tool_name, arg_key, &format!("invalid decimal: {err}"))
-            })?;
+            let dec = parse_decimal_str(raw).map_err(|err| format!("invalid decimal: {err}"))?;
             Scalar::Decimal(dec)
         }
         (FactType::Timestamp, ExactJson::Str(raw)) => {
-            let ts = parse_rfc3339_utc(raw).map_err(|err| {
-                invalid_arg(
-                    tool_name,
-                    arg_key,
-                    &format!("invalid RFC 3339 UTC timestamp: {err}"),
-                )
-            })?;
+            let ts = parse_rfc3339_utc(raw)
+                .map_err(|err| format!("invalid RFC 3339 UTC timestamp: {err}"))?;
             Scalar::Timestamp(ts)
         }
         _ => {
-            return Err(invalid_arg(
-                tool_name,
-                arg_key,
-                &format!("expected {expected:?}"),
-            ));
+            return Err(format!("expected {expected:?}"));
         }
     };
 
-    scalar
-        .validate()
-        .map_err(|err| invalid_arg(tool_name, arg_key, &err.to_string()))?;
+    scalar.validate().map_err(|err| err.to_string())?;
     Ok(scalar)
 }
 

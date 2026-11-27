@@ -46,16 +46,19 @@ impl Read for PipeReader {
     }
 }
 
-pub(crate) fn mem_pipe() -> (PipeWriter, BufReader<PipeReader>) {
-    let (tx, rx) = mpsc::channel();
-    (
-        PipeWriter { tx },
-        BufReader::new(PipeReader {
+impl PipeReader {
+    pub(crate) fn from_receiver(rx: mpsc::Receiver<Vec<u8>>) -> BufReader<Self> {
+        BufReader::new(Self {
             rx,
             buf: Vec::new(),
             pos: 0,
-        }),
-    )
+        })
+    }
+}
+
+pub(crate) fn mem_pipe() -> (PipeWriter, BufReader<PipeReader>) {
+    let (tx, rx) = mpsc::channel();
+    (PipeWriter { tx }, PipeReader::from_receiver(rx))
 }
 
 pub(crate) struct TimeoutLineReader {

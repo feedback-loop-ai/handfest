@@ -294,3 +294,136 @@ fn updating_or_deleting_revocation_rows_fails_audit() {
         Err(LedgerError::Integrity(_))
     ));
 }
+
+#[test]
+fn record_denial_with_revocations_enforces_precedence_and_tamper() {
+    use handfest_ledger::ReceiptLedger;
+
+    let (alice, _agent, chain, req) = build_chain_with_quota();
+    let expected_chain_ids: Vec<MandateId> = chain.iter().map(|vm| vm.ast.mandate_id()).collect();
+    let now = ts("2026-11-26T13:00:00Z");
+    let expired = ts("2026-11-26T21:00:00Z");
+
+    let rev = build_verified_revocation(
+        alice,
+        RevocationTarget::Mandate(expected_chain_ids[0]),
+        now,
+        Some("emergency"),
+    );
+    let mut extra = RevocationSnapshot::new();
+    let rev_id = extra.insert(rev.clone()).unwrap();
+
+    let dir = tempfile::TempDir::new().unwrap();
+    let db_path = dir.path().join("denial_rev.sqlite");
+    let mut ledger = SqliteLedger::open(&db_path).unwrap();
+
+    let (reason_ok, rec_ok) = ReceiptLedger::record_denial_with_revocations(
+        &mut ledger,
+        &chain,
+        &req.actor_key,
+        &req,
+        &RevocationSnapshot::new(),
+        now,
+        "mapping failed".to_string(),
+    )
+    .unwrap();
+    assert_eq!(reason_ok, "mapping failed");
+    assert_eq!(rec_ok.chain_ids, expected_chain_ids);
+    assert!(rec_ok.verify_hash());
+
+    let (reason_extra, rec_extra) = ledger
+        .record_denial_with_revocations(
+            &chain,
+            &req.actor_key,
+            &req,
+            &extra,
+            now,
+            "mapping failed".to_string(),
+        )
+        .unwrap();
+    assert!(reason_extra.contains(&rev_id.to_string()));
+    assert!(rec_extra.verify_hash());
+
+    ledger.record_revocation(&rev, &"aa".repeat(64)).unwrap();
+    let (reason_persisted, _) = ledger
+        .record_denial_with_revocations(
+            &chain,
+            &req.actor_key,
+            &req,
+            &RevocationSnapshot::new(),
+            now,
+            "mapping failed".to_string(),
+        )
+        .unwrap();
+    assert!(reason_persisted.contains(&rev_id.to_string()));
+
+    let (reason_expired, _) = ledger
+        .record_denial_with_revocations(
+            &chain,
+            &req.actor_key,
+            &req,
+            &RevocationSnapshot::new(),
+            expired,
+            "mapping failed".to_string(),
+        )
+        .unwrap();
+    assert!(
+        !reason_expired.contains(&rev_id.to_string()) && reason_expired != "mapping failed",
+        "expected runtime chain error precedence, got '{reason_expired}'"
+    );
+    assert_eq!(ledger.verify_integrity().unwrap(), 4);
+    drop(ledger);
+
+    let raw = Connection::open(&db_path).unwrap();
+    raw.execute(
+        "UPDATE revocations SET anchor_id = 'tampered' WHERE seq = 1",
+        [],
+    )
+    .unwrap();
+    drop(raw);
+
+    let mut tampered = SqliteLedger::open_existing(&db_path).unwrap();
+    let err = tampered
+        .record_denial_with_revocations(
+            &chain,
+            &req.actor_key,
+            &req,
+            &RevocationSnapshot::new(),
+            expired,
+            "mapping failed".to_string(),
+        )
+        .unwrap_err();
+    assert!(matches!(err, LedgerError::Integrity(_)));
+}
+
+#[test]
+fn record_denial_with_revocations_derives_chain_ids_and_validates_explicit_actor_key() {
+    let (_alice, _agent, chain, req) = build_chain_with_quota();
+    let expected_chain_ids: Vec<MandateId> = chain.iter().map(|vm| vm.ast.mandate_id()).collect();
+    let now = ts("2026-11-26T13:00:00Z");
+
+    let mut ledger = SqliteLedger::open_in_memory().unwrap();
+    let wrong_actor =
+        KeyId::parse("ed25519:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff")
+            .unwrap();
+    let (reason_actor, rec_actor) = ledger
+        .record_denial_with_revocations(
+            &chain,
+            &wrong_actor,
+            &req,
+            &RevocationSnapshot::new(),
+            now,
+            "mapping failed".to_string(),
+        )
+        .unwrap();
+    assert_ne!(reason_actor, "mapping failed");
+    assert!(
+        reason_actor.contains(&wrong_actor.to_string()),
+        "expected actor-key mismatch citing wrong_actor, got '{reason_actor}'"
+    );
+    assert_eq!(rec_actor.actor_key, wrong_actor);
+    assert_eq!(rec_actor.chain_ids, expected_chain_ids);
+    assert!(rec_actor.verify_hash());
+    assert_eq!(ledger.track_record(&wrong_actor).unwrap().denies, 1);
+    assert_eq!(ledger.track_record(&req.actor_key).unwrap().denies, 0);
+}

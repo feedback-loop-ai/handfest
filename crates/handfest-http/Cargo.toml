@@ -1,0 +1,27 @@
+[package]
+name = "handfest-http"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Zero-dependency HTTP/REST Policy Enforcement Point enforcing HANDFEST v1 mandate chains and ledger receipts"
+
+[[bin]]
+name = "handfest-http"
+path = "src/main.rs"
+
+[dependencies]
+handfest-core.workspace = true    # internal workspace crate: AST, exact JSON, lossless decimals, gate, policy types
+handfest-anchors.workspace = true # internal workspace crate: AnchorRegistry, SignedMandate, CommandRunner
+handfest-ledger.workspace = true  # internal workspace crate: ReceiptLedger trait and SQLite ledger
+handfest-pep.workspace = true     # internal workspace crate: shared GateEngine, Clock, CredentialSource
+clap.workspace = true             # CLI argument parsing for `handfest-http` binary (prototyping debt)
+serde.workspace = true            # typed config serialization/deserialization (prototyping debt)
+
+[dev-dependencies]
+serde_json.workspace = true       # test-only JSON fixture serialization/deserialization
+tempfile.workspace = true         # test-only ephemeral directories for SQLite ledger and file credential tests
+
+[lints]
+workspace = true

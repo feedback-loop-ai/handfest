@@ -15,8 +15,8 @@ use std::fmt;
 
 use handfest_core::ast::{KeyId, MandateId};
 use handfest_core::gate::{
-    ActionRequest, DecisionReceipt, RevocationSnapshot, VerifiedFacts, VerifiedMandate,
-    VerifiedRevocation,
+    check_chain_revocations, verify_chain_runtime, ActionRequest, DecisionReceipt,
+    RevocationSnapshot, VerifiedFacts, VerifiedMandate, VerifiedRevocation,
 };
 use handfest_core::revocation::RevocationId;
 use serde::{Deserialize, Serialize};
@@ -171,6 +171,25 @@ pub trait ReceiptLedger {
         reason: String,
     ) -> Result<DecisionReceipt, LedgerError>;
 
+    /// Atomically verifies persisted revocations, merges `extra_revocations`, resolves the
+    /// effective pre-gate denial reason (`verify_chain_runtime(chain, actor_key, now)` error >
+    /// active revocation > `fallback_reason`), derives `chain_ids` directly from `chain`, and
+    /// persists a hash-chained denial receipt inside a single atomic transaction without modifying
+    /// quota counters.
+    ///
+    /// Postcondition: the persisted and returned [`DecisionReceipt`] always binds
+    /// `receipt.actor_key` to `actor_key` (never to a mismatched `request.actor_key`), while
+    /// preserving `request.action`, `request.resource_kind`, and `request.resource_id`.
+    fn record_denial_with_revocations(
+        &mut self,
+        chain: &[VerifiedMandate],
+        actor_key: &KeyId,
+        request: &ActionRequest,
+        extra_revocations: &RevocationSnapshot,
+        now: i64,
+        fallback_reason: String,
+    ) -> Result<(String, DecisionReceipt), LedgerError>;
+
     /// Verifies schema integrity, contiguous receipt ordering, full cryptographic hash-chain
     /// continuity from genesis to tip, every receipt hash, non-empty `chain_ids` on `Permit`
     /// receipts, exact `quota_calls` reconciliation against persisted `Permit` receipts, and
@@ -194,6 +213,25 @@ pub trait ReceiptLedger {
         &self,
         actor_key: Option<&KeyId>,
     ) -> Result<(usize, Option<TrackRecord>), LedgerError>;
+}
+
+/// Resolves the effective pre-gate denial reason with strict fail-closed precedence:
+/// runtime chain verification error > active revocation > `fallback_reason`.
+#[must_use]
+pub fn resolve_pre_gate_denial_reason(
+    chain: &[VerifiedMandate],
+    actor_key: &KeyId,
+    revocations: &RevocationSnapshot,
+    now: i64,
+    fallback_reason: String,
+) -> String {
+    match verify_chain_runtime(chain, actor_key, now) {
+        Ok(()) => match check_chain_revocations(chain, revocations, now) {
+            Ok(()) => fallback_reason,
+            Err(rev_deny) => rev_deny.to_string(),
+        },
+        Err(chain_err) => chain_err.to_string(),
+    }
 }
 
 #[cfg(test)]

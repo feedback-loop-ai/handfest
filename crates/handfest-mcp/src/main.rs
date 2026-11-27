@@ -1,7 +1,6 @@
 //! `handfest-mcp` binary: fail-closed MCP stdio JSON-RPC 2.0 mandate proxy.
 
 use std::fmt;
-use std::fs;
 use std::io::{self, BufReader, BufWriter};
 use std::path::PathBuf;
 use std::process::{Child, Command, ExitCode, Stdio};
@@ -10,13 +9,15 @@ use std::time::Duration;
 
 use clap::error::ErrorKind;
 use clap::Parser;
-use handfest_anchors::{AnchorRegistry, SignedMandate, SignedRevocation};
-use handfest_core::ast::{parse_rfc3339_utc, KeyId};
+use handfest_anchors::AnchorRegistry;
+use handfest_core::ast::KeyId;
 use handfest_core::exact_json::write_json_string;
 use handfest_ledger::SqliteLedger;
 use handfest_mcp::{
-    verify_mandate_chain_with, verify_revocations_with, Clock, FixedClock, MappingError, McpProxy,
-    ProxyError, SystemClock,
+    verify_mandate_chain_with, verify_revocations_with, MappingError, McpProxy, ProxyError,
+};
+use handfest_pep::{
+    load_signed_mandates_files, load_signed_revocations_files, PepError, RuntimeClock,
 };
 
 const CHILD_EXIT_GRACE_POLLS: usize = 20;
@@ -115,20 +116,6 @@ impl fmt::Display for StartupError {
 }
 
 impl std::error::Error for StartupError {}
-
-enum RuntimeClock {
-    System(SystemClock),
-    Fixed(FixedClock),
-}
-
-impl Clock for RuntimeClock {
-    fn now_unix(&self) -> i64 {
-        match self {
-            Self::System(c) => c.now_unix(),
-            Self::Fixed(c) => c.now_unix(),
-        }
-    }
-}
 
 struct ChildGuard {
     child: Child,
@@ -242,12 +229,13 @@ fn parse_upstream_command(upstream: &[String]) -> Result<(&str, &[String]), Star
 }
 
 fn build_proxy(cli: &Cli) -> Result<McpProxy<RuntimeClock, SqliteLedger>, StartupError> {
-    let signed_chain = load_signed_mandates(&cli.chain)?;
+    let signed_chain = load_signed_mandates_files(&cli.chain).map_err(map_envelope_load_error)?;
     let verifier = AnchorRegistry::default_registry();
     let verified_chain = verify_mandate_chain_with(&verifier, &signed_chain).map_err(|err| {
         StartupError::ChainInvalid(format!("startup mandate chain verification failed: {err}"))
     })?;
-    let signed_revocations = load_signed_revocations(&cli.revocations)?;
+    let signed_revocations =
+        load_signed_revocations_files(&cli.revocations).map_err(map_envelope_load_error)?;
     let verified_revocations =
         verify_revocations_with(&verifier, &signed_revocations).map_err(|err| {
             StartupError::ChainInvalid(format!("startup revocation verification failed: {err}"))
@@ -265,14 +253,12 @@ fn build_proxy(cli: &Cli) -> Result<McpProxy<RuntimeClock, SqliteLedger>, Startu
             other => StartupError::PolicyInvalid(format!("failed to load --policy-map: {other}")),
         })?;
 
-    let clock = match &cli.now {
-        Some(raw) => {
-            let ts = parse_rfc3339_utc(raw)
-                .map_err(|err| StartupError::CliArgs(format!("invalid --now '{raw}': {err}")))?;
-            RuntimeClock::Fixed(FixedClock::new(ts))
-        }
-        None => RuntimeClock::System(SystemClock),
-    };
+    let clock = RuntimeClock::from_optional_rfc3339(cli.now.as_deref()).map_err(|err| {
+        StartupError::CliArgs(format!(
+            "invalid --now '{}': {err}",
+            cli.now.as_deref().unwrap_or("")
+        ))
+    })?;
 
     let ledger = SqliteLedger::open(&cli.ledger).map_err(|err| {
         StartupError::LedgerOpen(format!(
@@ -294,38 +280,11 @@ fn build_proxy(cli: &Cli) -> Result<McpProxy<RuntimeClock, SqliteLedger>, Startu
         })
 }
 
-fn load_signed_revocations(paths: &[PathBuf]) -> Result<Vec<SignedRevocation>, StartupError> {
-    let mut revocations = Vec::with_capacity(paths.len());
-    for path in paths {
-        let raw = fs::read_to_string(path).map_err(|err| {
-            StartupError::ChainIo(format!("failed to read '{}': {err}", path.display()))
-        })?;
-        let signed: SignedRevocation = serde_json::from_str(&raw).map_err(|err| {
-            StartupError::ChainInvalid(format!(
-                "invalid SignedRevocation JSON in '{}': {err}",
-                path.display()
-            ))
-        })?;
-        revocations.push(signed);
+fn map_envelope_load_error(err: PepError) -> StartupError {
+    match err {
+        PepError::Io(io_err) => StartupError::ChainIo(io_err.to_string()),
+        other => StartupError::ChainInvalid(other.to_string()),
     }
-    Ok(revocations)
-}
-
-fn load_signed_mandates(paths: &[PathBuf]) -> Result<Vec<SignedMandate>, StartupError> {
-    let mut mandates = Vec::with_capacity(paths.len());
-    for path in paths {
-        let raw = fs::read_to_string(path).map_err(|err| {
-            StartupError::ChainIo(format!("failed to read '{}': {err}", path.display()))
-        })?;
-        let signed: SignedMandate = serde_json::from_str(&raw).map_err(|err| {
-            StartupError::ChainInvalid(format!(
-                "invalid SignedMandate JSON in '{}': {err}",
-                path.display()
-            ))
-        })?;
-        mandates.push(signed);
-    }
-    Ok(mandates)
 }
 
 #[cfg(test)]

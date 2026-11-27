@@ -339,6 +339,34 @@ dependencies = [
 ]
 
 [[package]]
+name = "handfest-exec"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "handfest-anchors",
+ "handfest-core",
+ "handfest-ledger",
+ "handfest-pep",
+ "serde",
+ "serde_json",
+ "tempfile",
+]
+
+[[package]]
+name = "handfest-http"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "handfest-anchors",
+ "handfest-core",
+ "handfest-ledger",
+ "handfest-pep",
+ "serde",
+ "serde_json",
+ "tempfile",
+]
+
+[[package]]
 name = "handfest-ledger"
 version = "0.1.0"
 dependencies = [
@@ -354,6 +382,19 @@ name = "handfest-mcp"
 version = "0.1.0"
 dependencies = [
  "clap",
+ "handfest-anchors",
+ "handfest-core",
+ "handfest-ledger",
+ "handfest-pep",
+ "serde",
+ "serde_json",
+ "tempfile",
+]
+
+[[package]]
+name = "handfest-pep"
+version = "0.1.0"
+dependencies = [
  "handfest-anchors",
  "handfest-core",
  "handfest-ledger",

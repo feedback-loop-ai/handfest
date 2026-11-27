@@ -16,12 +16,14 @@ use rusqlite::{
     params, Connection, OpenFlags, OptionalExtension, Transaction, TransactionBehavior,
 };
 
-use crate::audit::{run_audit_tx, run_verified_track_record};
+use crate::audit::{run_audit_tx, run_verified_list_receipts, run_verified_track_record};
 use crate::preflight::{open_read_only_guarded, open_writable_guarded, ActiveHandleGuard};
 use crate::quotas::{apply_quota_updates, compute_quota_updates, load_quota_snapshot};
 use crate::revocations::{record_revocation_tx, verify_and_load_revocations};
 use crate::schema::{initialize_or_verify_schema, verify_existing_schema, verify_schema_integrity};
-use crate::{LedgerError, ReceiptLedger, StoredRevocation, TrackRecord};
+use crate::{
+    resolve_pre_gate_denial_reason, LedgerError, ReceiptLedger, StoredRevocation, TrackRecord,
+};
 
 const BUSY_TIMEOUT_MS: u64 = 5_000;
 pub(crate) const EXISTING_LEDGER_OPEN_FLAGS: OpenFlags =
@@ -202,6 +204,7 @@ impl SqliteLedger {
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
 
+        verify_schema_integrity(&tx)?;
         let prev_receipt_hash = load_latest_receipt_hash(&tx)?;
         let chain_ids: Vec<MandateId> = chain.iter().map(|vm| vm.ast.mandate_id()).collect();
         let usage = load_quota_snapshot(&tx, &chain_ids)?;
@@ -244,6 +247,7 @@ impl SqliteLedger {
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        verify_schema_integrity(&tx)?;
         let revocation_id = record_revocation_tx(&tx, revocation, signature_hex)?;
         tx.commit()?;
         Ok(revocation_id)
@@ -291,6 +295,7 @@ impl SqliteLedger {
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
 
+        verify_schema_integrity(&tx)?;
         let prev_receipt_hash = load_latest_receipt_hash(&tx)?;
         let receipt = build_denial_receipt(
             chain_ids,
@@ -307,6 +312,58 @@ impl SqliteLedger {
         insert_receipt(&tx, &receipt, &request.resource_kind, &request.resource_id)?;
         tx.commit()?;
         Ok(receipt)
+    }
+
+    /// Atomically verifies schema and persisted revocations, merges `extra_revocations`, resolves
+    /// the effective pre-gate denial reason (`verify_chain_runtime` error > active revocation >
+    /// `fallback_reason`), and persists the hash-chained denial receipt inside a single
+    /// `BEGIN IMMEDIATE` transaction without modifying quota counters.
+    pub fn record_denial_with_revocations(
+        &mut self,
+        chain: &[VerifiedMandate],
+        actor_key: &KeyId,
+        request: &ActionRequest,
+        extra_revocations: &RevocationSnapshot,
+        now: i64,
+        fallback_reason: String,
+    ) -> Result<(String, DecisionReceipt), LedgerError> {
+        let chain_ids: Vec<MandateId> = chain.iter().map(|vm| vm.ast.mandate_id()).collect();
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+
+        verify_schema_integrity(&tx)?;
+        let (_, mut revocations) = verify_and_load_revocations(&tx)?;
+        revocations.extend_from(extra_revocations);
+        let reason =
+            resolve_pre_gate_denial_reason(chain, actor_key, &revocations, now, fallback_reason);
+        let prev_receipt_hash = load_latest_receipt_hash(&tx)?;
+        let bound_request = ActionRequest {
+            actor_key: actor_key.clone(),
+            action: request.action.clone(),
+            resource_kind: request.resource_kind.clone(),
+            resource_id: request.resource_id.clone(),
+        };
+        let receipt = build_denial_receipt(
+            chain_ids,
+            bound_request.actor_key,
+            bound_request.action,
+            bound_request.resource_kind.clone(),
+            bound_request.resource_id.clone(),
+            now,
+            reason.clone(),
+            prev_receipt_hash,
+        )
+        .map_err(|err| LedgerError::Integrity(format!("invalid denial receipt: {err}")))?;
+
+        insert_receipt(
+            &tx,
+            &receipt,
+            &bound_request.resource_kind,
+            &bound_request.resource_id,
+        )?;
+        tx.commit()?;
+        Ok((reason, receipt))
     }
 
     /// Computes an integrity-verified [`TrackRecord`] projection for `actor_key` from persisted
@@ -327,6 +384,12 @@ impl SqliteLedger {
         actor_key: Option<&KeyId>,
     ) -> Result<(usize, Option<TrackRecord>), LedgerError> {
         run_audit_tx(&self.conn, actor_key, || {})
+    }
+
+    /// Integrity-verifies the entire ledger and returns all persisted [`DecisionReceipt`] records
+    /// in ascending `seq` order inside a single consistent read transaction.
+    pub fn list_receipts(&self) -> Result<Vec<DecisionReceipt>, LedgerError> {
+        run_verified_list_receipts(&self.conn)
     }
 }
 
@@ -373,6 +436,26 @@ impl ReceiptLedger for SqliteLedger {
         reason: String,
     ) -> Result<DecisionReceipt, LedgerError> {
         Self::record_denial(self, chain_ids, request, now, reason)
+    }
+
+    fn record_denial_with_revocations(
+        &mut self,
+        chain: &[VerifiedMandate],
+        actor_key: &KeyId,
+        request: &ActionRequest,
+        extra_revocations: &RevocationSnapshot,
+        now: i64,
+        fallback_reason: String,
+    ) -> Result<(String, DecisionReceipt), LedgerError> {
+        Self::record_denial_with_revocations(
+            self,
+            chain,
+            actor_key,
+            request,
+            extra_revocations,
+            now,
+            fallback_reason,
+        )
     }
 
     fn track_record(&self, actor_key: &KeyId) -> Result<TrackRecord, LedgerError> {

@@ -456,7 +456,7 @@ impl<C: Clock, L: ReceiptLedger> McpProxy<C, L> {
                 self.dispatch_to_upstream(req_id, PendingKind::Normal, raw_frame, ctx)
             }
             "tools/list" => {
-                let evaluated_at = self.clock.now_unix();
+                let evaluated_at = self.engine.now_unix();
                 self.dispatch_to_upstream(
                     req_id,
                     PendingKind::ToolsList { evaluated_at },

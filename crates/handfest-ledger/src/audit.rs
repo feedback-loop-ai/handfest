@@ -22,7 +22,8 @@ pub(crate) fn run_audit_tx<F: FnOnce()>(
 ) -> Result<(usize, Option<TrackRecord>), LedgerError> {
     let tx = conn.unchecked_transaction()?;
     let mut builder = actor_key.cloned().map(TrackRecordBuilder::new);
-    let verified_receipts = verify_and_project_in_conn(&tx, builder.as_mut(), after_receipts_scan)?;
+    let verified_receipts =
+        verify_and_project_in_conn(&tx, builder.as_mut(), None, after_receipts_scan)?;
     tx.commit()?;
     Ok((verified_receipts, builder.map(TrackRecordBuilder::finish)))
 }
@@ -33,9 +34,19 @@ pub(crate) fn run_verified_track_record(
 ) -> Result<TrackRecord, LedgerError> {
     let tx = conn.unchecked_transaction()?;
     let mut builder = TrackRecordBuilder::new(actor_key.clone());
-    verify_and_project_in_conn(&tx, Some(&mut builder), || {})?;
+    verify_and_project_in_conn(&tx, Some(&mut builder), None, || {})?;
     tx.commit()?;
     Ok(builder.finish())
+}
+
+pub(crate) fn run_verified_list_receipts(
+    conn: &Connection,
+) -> Result<Vec<DecisionReceipt>, LedgerError> {
+    let tx = conn.unchecked_transaction()?;
+    let mut receipts = Vec::new();
+    verify_and_project_in_conn(&tx, None, Some(&mut receipts), || {})?;
+    tx.commit()?;
+    Ok(receipts)
 }
 
 struct TrackRecordBuilder {
@@ -96,6 +107,7 @@ impl TrackRecordBuilder {
 fn verify_and_project_in_conn<F: FnOnce()>(
     conn: &Connection,
     mut track_record: Option<&mut TrackRecordBuilder>,
+    mut collect_receipts: Option<&mut Vec<DecisionReceipt>>,
     after_receipts_scan: F,
 ) -> Result<usize, LedgerError> {
     verify_schema_integrity(conn)?;
@@ -142,6 +154,9 @@ fn verify_and_project_in_conn<F: FnOnce()>(
             }
         }
         expected_prev = Some(receipt.receipt_hash);
+        if let Some(out) = collect_receipts.as_deref_mut() {
+            out.push(receipt);
+        }
         expected_seq += 1;
         count += 1;
     }

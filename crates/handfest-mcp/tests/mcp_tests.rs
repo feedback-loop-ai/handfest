@@ -2,7 +2,7 @@
 
 use std::collections::BTreeMap;
 use std::fs;
-use std::io::{self, BufRead, BufReader, Cursor, Read, Write};
+use std::io::{self, BufRead, BufReader, Cursor, Write};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
@@ -29,62 +29,12 @@ use tempfile::tempdir;
 // In-memory byte pipe and fake upstream MCP server
 // ---------------------------------------------------------------------------
 
-struct PipeWriter {
-    tx: mpsc::Sender<Vec<u8>>,
-}
-
-impl Write for PipeWriter {
-    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        if buf.is_empty() {
-            return Ok(0);
-        }
-        self.tx
-            .send(buf.to_vec())
-            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "pipe reader dropped"))?;
-        Ok(buf.len())
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        Ok(())
-    }
-}
-
-struct PipeReader {
-    rx: mpsc::Receiver<Vec<u8>>,
-    buf: Vec<u8>,
-    pos: usize,
-}
-
-impl Read for PipeReader {
-    fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
-        if self.pos < self.buf.len() {
-            let n = (self.buf.len() - self.pos).min(out.len());
-            out[..n].copy_from_slice(&self.buf[self.pos..self.pos + n]);
-            self.pos += n;
-            return Ok(n);
-        }
-        match self.rx.recv() {
-            Ok(chunk) => {
-                self.buf = chunk;
-                self.pos = 0;
-                self.read(out)
-            }
-            Err(_) => Ok(0),
-        }
-    }
-}
-
-fn mem_pipe() -> (PipeWriter, BufReader<PipeReader>) {
-    let (tx, rx) = mpsc::channel();
-    (
-        PipeWriter { tx },
-        BufReader::new(PipeReader {
-            rx,
-            buf: Vec::new(),
-            pos: 0,
-        }),
-    )
-}
+#[expect(
+    dead_code,
+    reason = "shared test utilities used selectively across integration test binaries"
+)]
+mod common;
+use common::{mem_pipe, PipeReader, PipeWriter};
 
 #[derive(Default)]
 struct FakeUpstreamState {
@@ -1453,11 +1403,7 @@ fn bounded_mem_pipe(
     let (tx, rx) = mpsc::sync_channel(slots);
     (
         BoundedPipeWriter { tx, chunk_limit },
-        BufReader::new(PipeReader {
-            rx,
-            buf: Vec::new(),
-            pos: 0,
-        }),
+        PipeReader::from_receiver(rx),
     )
 }
 
@@ -1860,6 +1806,33 @@ impl ReceiptLedger for InMemoryLedger {
         .map_err(|err| LedgerError::Integrity(err.to_string()))?;
         self.receipts.push(receipt.clone());
         Ok(receipt)
+    }
+
+    fn record_denial_with_revocations(
+        &mut self,
+        chain: &[VerifiedMandate],
+        actor_key: &KeyId,
+        request: &ActionRequest,
+        extra_revocations: &handfest_core::gate::RevocationSnapshot,
+        now: i64,
+        fallback_reason: String,
+    ) -> Result<(String, DecisionReceipt), LedgerError> {
+        let chain_ids = chain.iter().map(|vm| vm.ast.mandate_id()).collect();
+        let reason = handfest_ledger::resolve_pre_gate_denial_reason(
+            chain,
+            actor_key,
+            extra_revocations,
+            now,
+            fallback_reason,
+        );
+        let bound_request = ActionRequest {
+            actor_key: actor_key.clone(),
+            action: request.action.clone(),
+            resource_kind: request.resource_kind.clone(),
+            resource_id: request.resource_id.clone(),
+        };
+        let receipt = self.record_denial(chain_ids, &bound_request, now, reason.clone())?;
+        Ok((reason, receipt))
     }
 
     fn track_record(&self, actor_key: &KeyId) -> Result<TrackRecord, LedgerError> {

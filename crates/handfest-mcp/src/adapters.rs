@@ -1,74 +1,20 @@
 //! Pluggable runtime abstractions (clock, anchor chain verification) and proxy errors.
+//!
+//! Clock and chain-verification primitives are implemented in [`handfest_pep`] and re-exported
+//! here for full backwards compatibility.
 
 use std::fmt;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use handfest_anchors::{
-    verify_revocations_with as verify_anchor_revocations_with, verify_verifier_postconditions,
-    AnchorError, AnchorRegistry, AnchorVerifier, SignedMandate, SignedRevocation,
-};
+use handfest_anchors::{AnchorError, AnchorVerifier, SignedMandate, SignedRevocation};
+#[cfg(test)]
 use handfest_core::ast::MandateId;
-use handfest_core::gate::{
-    verify_chain_structure, ChainStructureError, RevocationSnapshot, VerifiedMandate,
-};
+use handfest_core::gate::{ChainStructureError, RevocationSnapshot, VerifiedMandate};
 use handfest_ledger::LedgerError;
+use handfest_pep::PepError;
+
+pub use handfest_pep::{Clock, FixedClock, SystemClock};
 
 use crate::mapping::MappingError;
-
-/// Wall-clock abstraction supplying UTC Unix seconds for authorization evaluation.
-pub trait Clock {
-    /// Returns the current UTC timestamp in Unix seconds.
-    fn now_unix(&self) -> i64;
-}
-
-/// Converts a [`SystemTime`] into floored UTC Unix seconds, preserving pre-1970 negative
-/// timestamps (with sub-second floor toward `-infinity`) and saturating to `i64::MIN`/`i64::MAX`.
-#[must_use]
-pub(crate) fn unix_seconds_from_system_time(t: SystemTime) -> i64 {
-    unix_seconds_from_epoch_offset(t.duration_since(UNIX_EPOCH).map_err(|err| err.duration()))
-}
-
-fn unix_seconds_from_epoch_offset(offset: Result<Duration, Duration>) -> i64 {
-    match offset {
-        Ok(dur) => i64::try_from(dur.as_secs()).unwrap_or(i64::MAX),
-        Err(dur) => {
-            let abs_secs = dur
-                .as_secs()
-                .saturating_add(u64::from(dur.subsec_nanos() > 0));
-            i64::try_from(abs_secs).map_or(i64::MIN, |secs| -secs)
-        }
-    }
-}
-
-/// Production wall-clock backed by [`SystemTime::now`].
-#[derive(Debug, Default, Clone, Copy)]
-pub struct SystemClock;
-
-impl Clock for SystemClock {
-    fn now_unix(&self) -> i64 {
-        unix_seconds_from_system_time(SystemTime::now())
-    }
-}
-
-/// Deterministic fixed-timestamp clock for tests and replay.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct FixedClock {
-    now_unix: i64,
-}
-
-impl FixedClock {
-    /// Creates a clock that always returns `now_unix` (UTC Unix seconds).
-    #[must_use]
-    pub const fn new(now_unix: i64) -> Self {
-        Self { now_unix }
-    }
-}
-
-impl Clock for FixedClock {
-    fn now_unix(&self) -> i64 {
-        self.now_unix
-    }
-}
 
 /// Errors returned while validating chains, constructing [`crate::McpProxy`], or running the loop.
 #[derive(Debug)]
@@ -129,6 +75,19 @@ impl std::error::Error for ProxyError {
     }
 }
 
+impl From<PepError> for ProxyError {
+    fn from(err: PepError) -> Self {
+        match err {
+            PepError::Anchor(e) => Self::Anchor(e),
+            PepError::ChainStructure(e) => Self::ChainStructure(e),
+            PepError::InvalidChain(msg) => Self::InvalidChain(msg),
+            PepError::Ledger(e) => Self::Ledger(e),
+            PepError::Secret(e) => Self::InvalidChain(e.to_string()),
+            PepError::Io(e) => Self::Io(e),
+        }
+    }
+}
+
 impl From<AnchorError> for ProxyError {
     fn from(err: AnchorError) -> Self {
         Self::Anchor(err)
@@ -165,32 +124,12 @@ pub fn verify_mandate_chain_with<V: AnchorVerifier + ?Sized>(
     verifier: &V,
     signed: &[SignedMandate],
 ) -> Result<Vec<VerifiedMandate>, ProxyError> {
-    if signed.is_empty() {
-        return Err(ProxyError::Anchor(AnchorError::EmptyChain));
-    }
-    let mut verified = Vec::with_capacity(signed.len());
-    for (hop, item) in signed.iter().enumerate() {
-        let vm = verifier
-            .verify(item)
-            .and_then(|vm| {
-                verify_verifier_postconditions(item, &vm)?;
-                Ok(vm)
-            })
-            .map_err(|source| {
-                ProxyError::Anchor(AnchorError::ChainHop {
-                    hop,
-                    source: Box::new(source),
-                })
-            })?;
-        verified.push(vm);
-    }
-    let _ = validate_verified_chain(&verified)?;
-    Ok(verified)
+    handfest_pep::verify_mandate_chain_with(verifier, signed).map_err(ProxyError::from)
 }
 
-/// Convenience wrapper verifying a mandate chain via [`AnchorRegistry::default_registry`].
+/// Convenience wrapper verifying a mandate chain via `AnchorRegistry::default_registry`.
 pub fn verify_mandate_chain(signed: &[SignedMandate]) -> Result<Vec<VerifiedMandate>, ProxyError> {
-    verify_mandate_chain_with(&AnchorRegistry::default_registry(), signed)
+    handfest_pep::verify_mandate_chain(signed).map_err(ProxyError::from)
 }
 
 /// Verifies a slice of [`SignedRevocation`] envelopes using a pluggable [`AnchorVerifier`] into a
@@ -199,89 +138,29 @@ pub fn verify_revocations_with<V: AnchorVerifier + ?Sized>(
     verifier: &V,
     signed: &[SignedRevocation],
 ) -> Result<RevocationSnapshot, ProxyError> {
-    verify_anchor_revocations_with(verifier, signed).map_err(ProxyError::Anchor)
+    handfest_pep::verify_revocations_with(verifier, signed).map_err(ProxyError::from)
 }
 
 /// Convenience wrapper verifying [`SignedRevocation`] envelopes via
-/// [`AnchorRegistry::default_registry`].
+/// `AnchorRegistry::default_registry`.
 pub fn verify_revocations(signed: &[SignedRevocation]) -> Result<RevocationSnapshot, ProxyError> {
-    verify_revocations_with(&AnchorRegistry::default_registry(), signed)
+    handfest_pep::verify_revocations(signed).map_err(ProxyError::from)
 }
 
+#[cfg(test)]
 pub(crate) fn validate_verified_chain(
     verified: &[VerifiedMandate],
 ) -> Result<Vec<MandateId>, ProxyError> {
-    verify_chain_structure(verified).map_err(ProxyError::ChainStructure)
+    handfest_pep::validate_verified_chain(verified).map_err(ProxyError::from)
 }
 
 #[cfg(test)]
 mod tests {
     use std::error::Error as _;
 
-    use handfest_core::ast::{is_valid_timestamp, MIN_RFC3339_TIMESTAMP};
+    use handfest_anchors::AnchorRegistry;
 
     use super::*;
-
-    #[test]
-    fn unix_seconds_preserves_post_and_pre_1970_subsecond_and_saturation_bounds() {
-        // Post-1970 (and exact epoch)
-        assert_eq!(unix_seconds_from_system_time(UNIX_EPOCH), 0);
-        assert_eq!(
-            unix_seconds_from_system_time(UNIX_EPOCH + Duration::new(1_700_000_000, 999_999_999)),
-            1_700_000_000
-        );
-
-        // Pre-1970 whole seconds: must never clamp to 0
-        assert_eq!(
-            unix_seconds_from_system_time(UNIX_EPOCH - Duration::from_secs(3600)),
-            -3600
-        );
-
-        // Sub-second pre-1970 floors toward -infinity
-        assert_eq!(
-            unix_seconds_from_system_time(UNIX_EPOCH - Duration::from_nanos(1)),
-            -1
-        );
-        assert_eq!(
-            unix_seconds_from_system_time(UNIX_EPOCH - Duration::new(3600, 1)),
-            -3601
-        );
-        assert_eq!(
-            unix_seconds_from_system_time(UNIX_EPOCH - Duration::new(3600, 999_999_999)),
-            -3601
-        );
-
-        // Pre-0000 underflow stays below MIN_RFC3339_TIMESTAMP (never clamped to 0)
-        let before_year_zero_secs = MIN_RFC3339_TIMESTAMP.unsigned_abs() + 1;
-        if let Some(pre_0000) = UNIX_EPOCH.checked_sub(Duration::from_secs(before_year_zero_secs)) {
-            let ts = unix_seconds_from_system_time(pre_0000);
-            assert_eq!(ts, MIN_RFC3339_TIMESTAMP - 1);
-            assert!(!is_valid_timestamp(ts));
-        }
-
-        // Direct offset saturation checks for i64::MAX and i64::MIN boundaries
-        assert_eq!(
-            unix_seconds_from_epoch_offset(Ok(Duration::from_secs(u64::MAX))),
-            i64::MAX
-        );
-        assert_eq!(
-            unix_seconds_from_epoch_offset(Ok(Duration::from_secs(i64::MAX as u64))),
-            i64::MAX
-        );
-        assert_eq!(
-            unix_seconds_from_epoch_offset(Err(Duration::from_secs(u64::MAX))),
-            i64::MIN
-        );
-        assert_eq!(
-            unix_seconds_from_epoch_offset(Err(Duration::new(i64::MAX as u64, 1))),
-            i64::MIN
-        );
-        assert_eq!(
-            unix_seconds_from_epoch_offset(Err(Duration::new(i64::MAX as u64, 0))),
-            i64::MIN + 1
-        );
-        assert_eq!(unix_seconds_from_epoch_offset(Err(Duration::ZERO)), 0);
-    }
 
     #[test]
     fn proxy_error_preserves_typed_chain_structure_error() {
@@ -307,45 +186,5 @@ mod tests {
             verify_mandate_chain_with(&AnchorRegistry::default_registry(), &[]),
             Err(ProxyError::Anchor(AnchorError::EmptyChain))
         ));
-    }
-
-    #[test]
-    fn verify_mandate_chain_and_revocations_accept_ssh_sk_p256_via_default_registry() {
-        let p256_key_id = "ssh-sk-p256:0460fed4ba255a9d31c961eb74c6356d68c049b8923b61fa6ce669622e60f29fb67903fe1008b8bc99a41ae9e95628bc64f2f1b20c2d7e9f5177a3c294d4462299";
-        let agent_key_id = format!("ed25519:{}", "b".repeat(64));
-        let mandate_words = format!(
-            concat!(
-                "HANDFEST v1\n",
-                "FROM human \"Valentin\" (key: {p256_key_id})\n",
-                "TO agent \"Claude\" (key: {agent_key_id})\n",
-                "DELEGATION max 0 hops\n",
-                "ALLOW git.pr.merge\n",
-                "ON repo \"feedback-loop-ai/handfest\"\n",
-                "WHERE context.time >= 2026-11-24T17:00:00Z\n",
-                "  AND context.time < 2026-11-25T01:00:00Z\n",
-                "  AND resource.author == \"valentin\"\n",
-                "LIMIT 2 calls\n",
-            ),
-            p256_key_id = p256_key_id,
-            agent_key_id = agent_key_id,
-        );
-        // Hex encoding of the RFC 6979 A.2.5 P-256 SSHSIG for `mandate_words`
-        let mandate_sig_hex = "535348534947000000010000008700000022736b2d65636473612d736861322d6e69737470323536406f70656e7373682e636f6d000000086e69737470323536000000410460fed4ba255a9d31c961eb74c6356d68c049b8923b61fa6ce669622e60f29fb67903fe1008b8bc99a41ae9e95628bc64f2f1b20c2d7e9f5177a3c294d44622990000000c7373683a68616e64666573740000001468616e64666573742d76312d656e76656c6f706500000000000000067368613531320000007800000022736b2d65636473612d736861322d6e69737470323536406f70656e7373682e636f6d00000049000000200217e617f0b6443928278f96999e69a23a4f2c152bdf6d6cdf66e5b80282d4ed0000002100c8a0065a5d084191814abd7b2b565ad9b8da60b520b26e8ecfae26e243a87cbc0100000011";
-        let signed = SignedMandate {
-            canonical_words: mandate_words,
-            anchor_id: "yubikey-ssh-sk".to_string(),
-            assurance: "passkey".to_string(),
-            actor_kind: "human".to_string(),
-            signer_key: p256_key_id.to_string(),
-            valid_from: 1_795_539_600,
-            valid_until: 1_795_568_400,
-            signature_hex: mandate_sig_hex.to_string(),
-        };
-        let verified = verify_mandate_chain(&[signed]).expect("MCP verifies ssh-sk-p256 chain");
-        assert_eq!(verified.len(), 1);
-        assert_eq!(
-            verified[0].proof.assurance,
-            handfest_core::AssuranceLevel::Passkey
-        );
     }
 }

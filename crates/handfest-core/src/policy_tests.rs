@@ -489,3 +489,106 @@ fn compile_rejects_deserialized_invalid_policy_map() {
         Err(MappingError::InvalidPolicy(ref msg)) if msg.contains("duplicate arg_facts target field")
     ));
 }
+
+#[test]
+fn public_policy_decode_and_json_fact_scalar_helpers_work_losslessly() {
+    assert_eq!(
+        decode_fact_type("decimal", "ctx").unwrap(),
+        FactType::Decimal
+    );
+    assert_eq!(
+        decode_fact_type("Timestamp", "ctx").unwrap(),
+        FactType::Timestamp
+    );
+    assert!(matches!(
+        decode_fact_type("float", "ctx"),
+        Err(MappingError::InvalidJson(ref msg)) if msg.contains("unknown fact type")
+    ));
+
+    let typed_json = parse_exact_json(r#"{"decimal":"123.4500"}"#).unwrap();
+    let typed = decode_typed_scalar(&typed_json, "ctx").unwrap();
+    assert_eq!(
+        typed,
+        TypedScalar::Decimal(Decimal::parse("123.4500").unwrap())
+    );
+
+    let static_json =
+        parse_exact_json(r#"{"env":{"str":"prod"},"limit":{"int":42},"flag":{"bool":true}}"#)
+            .unwrap();
+    let statics = decode_static_facts(&static_json, "route.static_facts").unwrap();
+    assert_eq!(statics.len(), 3);
+    assert_eq!(statics.get("env"), Some(&TypedScalar::Str("prod".into())));
+    assert_eq!(statics.get("limit"), Some(&TypedScalar::Int(42)));
+    assert_eq!(statics.get("flag"), Some(&TypedScalar::Bool(true)));
+
+    let num_dec = parse_exact_json("99.95").unwrap();
+    assert_eq!(
+        parse_json_fact_scalar(FactType::Decimal, &num_dec).unwrap(),
+        Scalar::Decimal(Decimal::parse("99.95").unwrap())
+    );
+    let str_ts = parse_exact_json(r#""2026-01-02T03:04:05Z""#).unwrap();
+    assert_eq!(
+        parse_json_fact_scalar(FactType::Timestamp, &str_ts).unwrap(),
+        Scalar::Timestamp(parse_rfc3339_utc("2026-01-02T03:04:05Z").unwrap())
+    );
+    let bad_ctrl = parse_exact_json(r#""hi\nbye""#).unwrap();
+    assert!(matches!(
+        parse_json_fact_scalar(FactType::Str, &bad_ctrl),
+        Err(MappingError::InvalidJson(ref msg)) if msg.contains("control characters")
+    ));
+    let wrong_type = parse_exact_json("true").unwrap();
+    assert!(matches!(
+        parse_json_fact_scalar(FactType::Int, &wrong_type),
+        Err(MappingError::InvalidJson(ref msg)) if msg.contains("expected Int")
+    ));
+}
+
+#[test]
+fn parse_text_scalar_handles_all_fact_types_and_rejects_invalid_inputs() {
+    assert_eq!(
+        parse_text_scalar(FactType::Str, "org/repo").unwrap(),
+        Scalar::Str("org/repo".to_string())
+    );
+    assert!(parse_text_scalar(FactType::Str, "bad\nstr")
+        .unwrap_err()
+        .contains("control characters"));
+
+    assert_eq!(
+        parse_text_scalar(FactType::Bool, "true").unwrap(),
+        Scalar::Bool(true)
+    );
+    assert_eq!(
+        parse_text_scalar(FactType::Bool, "false").unwrap(),
+        Scalar::Bool(false)
+    );
+    assert!(parse_text_scalar(FactType::Bool, "TRUE")
+        .unwrap_err()
+        .contains("'true' or 'false'"));
+
+    assert_eq!(
+        parse_text_scalar(FactType::Int, "-42").unwrap(),
+        Scalar::Int(-42)
+    );
+    assert!(parse_text_scalar(FactType::Int, "99999999999999999999999")
+        .unwrap_err()
+        .contains("64-bit range"));
+    assert!(parse_text_scalar(FactType::Int, "01")
+        .unwrap_err()
+        .contains("canonical 64-bit"));
+
+    assert_eq!(
+        parse_text_scalar(FactType::Decimal, "-12.50").unwrap(),
+        Scalar::Decimal(Decimal::parse("-12.50").unwrap())
+    );
+    assert!(parse_text_scalar(FactType::Decimal, "1e5")
+        .unwrap_err()
+        .contains("invalid decimal"));
+
+    assert_eq!(
+        parse_text_scalar(FactType::Timestamp, "2026-01-02T03:04:05Z").unwrap(),
+        Scalar::Timestamp(parse_rfc3339_utc("2026-01-02T03:04:05Z").unwrap())
+    );
+    assert!(parse_text_scalar(FactType::Timestamp, "not-a-ts")
+        .unwrap_err()
+        .contains("RFC 3339"));
+}
