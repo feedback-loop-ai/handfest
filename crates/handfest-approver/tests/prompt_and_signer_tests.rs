@@ -39,35 +39,7 @@ fn sample_view(signer: &Ed25519Keypair) -> WysiwysPromptView {
     )
     .expect("valid prompt view")
 }
-fn observed_tty_confirmation_code(view: &WysiwysPromptView) -> String {
-    let mut out = Vec::new();
-    let mut prompt = TtyPrompt::new(Cursor::new(b"".as_slice()), &mut out);
-    assert_eq!(
-        prompt.prompt(view),
-        Ok(ApprovalOutcome::Denied {
-            reason: "operator closed prompt (EOF)".to_string(),
-        })
-    );
-    let rendered = String::from_utf8(out).unwrap();
-    let prefix = "Type 'yes ";
-    let suffix = "' to approve, or anything else to deny: ";
-    let start = rendered
-        .rfind(prefix)
-        .expect("TTY prompt must print confirmation instruction")
-        + prefix.len();
-    let rest = &rendered[start..];
-    let end = rest
-        .find(suffix)
-        .expect("TTY prompt must end confirmation instruction with deny notice");
-    rest[..end].to_string()
-}
-
-fn denied_tty_cases(code: &str) -> Vec<(Vec<u8>, &'static str)> {
-    let wrong_code = if code == "0".repeat(64) {
-        "1".repeat(64)
-    } else {
-        "0".repeat(64)
-    };
+fn denied_tty_cases() -> Vec<(Vec<u8>, &'static str)> {
     let not_confirmed = "operator did not confirm approval";
     vec![
         (b"".to_vec(), "operator closed prompt (EOF)"),
@@ -76,20 +48,11 @@ fn denied_tty_cases(code: &str) -> Vec<(Vec<u8>, &'static str)> {
         (b"n\n".to_vec(), "operator denied request"),
         (b"NO\n".to_vec(), "operator denied request"),
         (b"y\n".to_vec(), not_confirmed),
-        (b"yes\n".to_vec(), not_confirmed),
-        (format!("YES {code}\n").into_bytes(), not_confirmed),
-        (format!("Yes {code}\n").into_bytes(), not_confirmed),
-        (format!("yes {}\n", &code[..8]).into_bytes(), not_confirmed),
-        (format!("y {code}\n").into_bytes(), not_confirmed),
-        (format!("  yes {code}\n").into_bytes(), not_confirmed),
-        (format!("yes {code} \n").into_bytes(), not_confirmed),
-        (format!("yes  {code}\n").into_bytes(), not_confirmed),
-        (
-            format!("yes {}\n", code.to_ascii_uppercase()).into_bytes(),
-            not_confirmed,
-        ),
-        (format!("yes {code}\r\r\n").into_bytes(), not_confirmed),
-        (format!("yes {wrong_code}\n").into_bytes(), not_confirmed),
+        (b"YES\n".to_vec(), not_confirmed),
+        (b"Yes\n".to_vec(), not_confirmed),
+        (b"  yes\n".to_vec(), not_confirmed),
+        (b"yes \n".to_vec(), not_confirmed),
+        (b"yes\r\r\n".to_vec(), not_confirmed),
         (b"maybe\n".to_vec(), not_confirmed),
         (b"yy\n".to_vec(), not_confirmed),
         (b"yes!\n".to_vec(), not_confirmed),
@@ -97,17 +60,13 @@ fn denied_tty_cases(code: &str) -> Vec<(Vec<u8>, &'static str)> {
 }
 
 #[test]
-fn tty_prompt_approves_only_exact_yes_with_confirmation_code_and_fails_closed_otherwise() {
+fn tty_prompt_approves_only_exact_yes_and_fails_closed_otherwise() {
     let kp = Ed25519Keypair::from_secret_bytes([0x22; 32]);
     let view = sample_view(&kp);
-    let code = observed_tty_confirmation_code(&view);
     let mandate_id_str = view.mandate_id().to_string();
-    assert_eq!(code.len(), 64);
-    assert!(code.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')));
-    assert!(code.bytes().any(|b| b.is_ascii_lowercase()));
 
-    let expected_prompt = format!("Type 'yes {code}' to approve, or anything else to deny: ");
-    for accepted in [format!("yes {code}\n"), format!("yes {code}\r\n")] {
+    let expected_prompt = "Approve and sign this mandate? [yes/N]: ";
+    for accepted in ["yes\n", "yes\r\n"] {
         let mut out = Vec::new();
         let mut prompt = TtyPrompt::new(Cursor::new(accepted.as_bytes()), &mut out);
         assert_eq!(prompt.prompt(&view), Ok(ApprovalOutcome::Approved));
@@ -120,10 +79,10 @@ fn tty_prompt_approves_only_exact_yes_with_confirmation_code_and_fails_closed_ot
         assert!(rendered.contains(view.anchor_id()));
         assert_eq!(view.valid_from(), 1_760_000_000);
         assert_eq!(view.valid_until(), 1_760_003_600);
-        assert!(rendered.contains(&expected_prompt));
+        assert!(rendered.contains(expected_prompt));
     }
 
-    for (input, expected_reason) in denied_tty_cases(&code) {
+    for (input, expected_reason) in denied_tty_cases() {
         let mut out = Vec::new();
         let mut prompt = TtyPrompt::new(Cursor::new(input.as_slice()), &mut out);
         assert_eq!(
@@ -410,12 +369,10 @@ fn prompt_view_and_osascript_error_branches_fail_closed() {
 fn tty_prompt_fails_closed_on_eof_without_newline_and_multi_line_buffered_input() {
     let kp = Ed25519Keypair::from_secret_bytes([0x68; 32]);
     let view = sample_view(&kp);
-    let code = observed_tty_confirmation_code(&view);
 
-    // 1. EOF before newline on "yes <code64>" must fail closed (never Approved).
+    // 1. EOF before newline on "yes" must fail closed (never Approved).
     let mut out = Vec::new();
-    let no_nl = format!("yes {code}");
-    let mut prompt = TtyPrompt::new(Cursor::new(no_nl.as_bytes()), &mut out);
+    let mut prompt = TtyPrompt::new(Cursor::new(b"yes".as_slice()), &mut out);
     assert_eq!(
         prompt.prompt(&view),
         Ok(ApprovalOutcome::Denied {
@@ -423,10 +380,9 @@ fn tty_prompt_fails_closed_on_eof_without_newline_and_multi_line_buffered_input(
         })
     );
 
-    // 2. Pasted multi-line "yes <code64>\nyes <code64>\n" (full 64-hex digest) across 2 requests: both Denied.
+    // 2. Pasted multi-line "yes\nyes\n" across 2 requests: both Denied.
     let mut out2 = Vec::new();
-    let doubled = format!("yes {code}\nyes {code}\n");
-    let mut multi = TtyPrompt::new(Cursor::new(doubled.as_bytes()), &mut out2);
+    let mut multi = TtyPrompt::new(Cursor::new(b"yes\nyes\n".as_slice()), &mut out2);
     assert_eq!(
         multi.prompt(&view),
         Ok(ApprovalOutcome::Denied {
@@ -636,7 +592,7 @@ fn wysiwys_prompt_view_rejects_ansi_newlines_bidi_inverted_window_and_mismatched
 }
 
 #[test]
-fn tty_prompt_confirmation_code_blocks_pretyped_buffers_and_cross_mandate_replay() {
+fn tty_prompt_rejects_pretyped_multi_line_buffers() {
     let kp = Ed25519Keypair::from_secret_bytes([0x6c; 32]);
     let benign_view = sample_view(&kp);
     let agent = KeyId::new("ed25519", "2".repeat(64)).unwrap();
@@ -655,11 +611,6 @@ fn tty_prompt_confirmation_code_blocks_pretyped_buffers_and_cross_mandate_replay
         "local-ed25519".to_string(),
     )
     .unwrap();
-    let benign_code = observed_tty_confirmation_code(&benign_view);
-    let escalated_code = observed_tty_confirmation_code(&escalated_view);
-    assert_eq!(benign_code.len(), 64);
-    assert_eq!(escalated_code.len(), 64);
-    assert_ne!(benign_code, escalated_code);
 
     // 1. Pre-typed "y\n".repeat(4097) spans the 8192-byte BufReader boundary; both calls MUST Deny.
     let repeated_y = "y\n".repeat(4097);
@@ -700,36 +651,6 @@ fn tty_prompt_confirmation_code_blocks_pretyped_buffers_and_cross_mandate_replay
             reason: "operator closed prompt (EOF)".to_string(),
         })
     );
-
-    // 3. Pasted approval for benign mandate ("yes <benign_code>\n") MUST Deny escalated mandate.
-    let benign_reply = format!("yes {benign_code}\n");
-    let mut out3 = Vec::new();
-    let mut p3 = TtyPrompt::new(Cursor::new(benign_reply.as_bytes()), &mut out3);
-    assert_eq!(
-        p3.prompt(&escalated_view),
-        Ok(ApprovalOutcome::Denied {
-            reason: "operator did not confirm approval".to_string(),
-        })
-    );
-
-    // 4. Even flooding "yes <benign_code>\n" across the 8192-byte chunk boundary never approves
-    // a subsequent escalated mandate.
-    let flood_benign = benign_reply.repeat(700);
-    let mut out4 = Vec::new();
-    let mut p4 = TtyPrompt::new(
-        BufReader::new(Cursor::new(flood_benign.into_bytes())),
-        &mut out4,
-    );
-    assert_eq!(
-        p4.prompt(&benign_view),
-        Ok(ApprovalOutcome::Denied {
-            reason: "ambiguous multi-line TTY input rejected".to_string(),
-        })
-    );
-    assert!(matches!(
-        p4.prompt(&escalated_view),
-        Ok(ApprovalOutcome::Denied { .. })
-    ));
 }
 
 #[test]
@@ -782,62 +703,4 @@ fn wysiwys_prompt_view_rejects_mismatched_signer_key_and_valid_canonical_bidi_di
         matches!(bidi_err, PromptError::InvalidView(ref detail) if detail.contains("forbidden character U+202E")),
         "expected U+202E Unicode filter rejection, got {bidi_err:?}"
     );
-}
-
-#[test]
-fn tty_prompt_rejects_replay_when_validity_window_signer_or_anchor_changes() {
-    let kp1 = Ed25519Keypair::from_secret_bytes([0x6f; 32]);
-    let kp2 = Ed25519Keypair::from_secret_bytes([0x70; 32]);
-    let base = sample_view(&kp1);
-    let base_code = observed_tty_confirmation_code(&base);
-    assert_eq!(base_code.len(), 64);
-    let base_reply = format!("yes {base_code}\n");
-
-    // 1. Same canonical mandate text with extended valid_until (1760003600 -> 1760086400).
-    let extended_until = WysiwysPromptView::new(
-        base.canonical_mandate().to_string(),
-        base.mandate_id(),
-        1_760_000_000,
-        1_760_086_400,
-        kp1.key_id(),
-        "local-ed25519".to_string(),
-    )
-    .unwrap();
-    // 2. Changed valid_from.
-    let shifted_from = WysiwysPromptView::new(
-        base.canonical_mandate().to_string(),
-        base.mandate_id(),
-        1_760_000_060,
-        1_760_003_600,
-        kp1.key_id(),
-        "local-ed25519".to_string(),
-    )
-    .unwrap();
-    // 3. Changed anchor_id.
-    let other_anchor = WysiwysPromptView::new(
-        base.canonical_mandate().to_string(),
-        base.mandate_id(),
-        1_760_000_000,
-        1_760_003_600,
-        kp1.key_id(),
-        "yubikey-fido2".to_string(),
-    )
-    .unwrap();
-    // 4. Changed signer_key_id.
-    let other_signer = sample_view(&kp2);
-
-    for variant in [extended_until, shifted_from, other_anchor, other_signer] {
-        let variant_code = observed_tty_confirmation_code(&variant);
-        assert_eq!(variant_code.len(), 64);
-        assert_ne!(variant_code, base_code);
-
-        let mut out = Vec::new();
-        let mut prompt = TtyPrompt::new(Cursor::new(base_reply.as_bytes()), &mut out);
-        assert_eq!(
-            prompt.prompt(&variant),
-            Ok(ApprovalOutcome::Denied {
-                reason: "operator did not confirm approval".to_string(),
-            })
-        );
-    }
 }

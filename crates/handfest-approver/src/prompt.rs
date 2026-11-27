@@ -9,7 +9,7 @@ use std::io::{self, BufRead, Write};
 use std::time::Duration;
 
 use handfest_anchors::{AnchorError, CommandRunner, SystemCommandRunner};
-use handfest_core::ast::{encode_lower_hex, try_format_rfc3339_utc, KeyId, MandateId};
+use handfest_core::ast::{try_format_rfc3339_utc, KeyId, MandateId};
 use handfest_core::cnl::{parse_mandate, try_render_canonical};
 use handfest_core::gate::validate_proof_shape;
 
@@ -283,14 +283,10 @@ impl TtyPrompt<BufReader<File>, File> {
 
 impl<R: BufRead, W: Write> ApprovalPrompt for TtyPrompt<R, W> {
     fn prompt(&mut self, view: &WysiwysPromptView) -> Result<ApprovalOutcome, PromptError> {
-        let code = tty_confirmation_code(view);
         writeln!(self.writer, "\n{}", view.format_display())
             .map_err(|err| PromptError::Io(err.to_string()))?;
-        write!(
-            self.writer,
-            "Type 'yes {code}' to approve, or anything else to deny: "
-        )
-        .map_err(|err| PromptError::Io(err.to_string()))?;
+        write!(self.writer, "Approve and sign this mandate? [yes/N]: ")
+            .map_err(|err| PromptError::Io(err.to_string()))?;
         self.writer
             .flush()
             .map_err(|err| PromptError::Io(err.to_string()))?;
@@ -311,7 +307,7 @@ impl<R: BufRead, W: Write> ApprovalPrompt for TtyPrompt<R, W> {
             Ok(TtyReadResult::TooLong) => Ok(ApprovalOutcome::Denied {
                 reason: "operator input exceeded maximum reply length".to_string(),
             }),
-            Ok(TtyReadResult::Line(reply)) => Ok(classify_tty_reply(&reply, &code)),
+            Ok(TtyReadResult::Line(reply)) => Ok(classify_tty_reply(&reply)),
             Err(err) => Err(PromptError::Io(err.to_string())),
         }
     }
@@ -407,42 +403,9 @@ fn drain_tty_until_newline<R: BufRead>(reader: &mut R) -> io::Result<bool> {
     }
 }
 
-/// Computes the full 256-bit (64 lowercase hex digits) domain-separated SHA-256 confirmation
-/// digest bound to every signed field of `view` using length-prefixed framing.
-fn tty_confirmation_code(view: &WysiwysPromptView) -> String {
-    const DOMAIN: &[u8] = b"handfest-approver-tty-confirm-v1\0";
-    let canonical = view.canonical_mandate.as_bytes();
-    let signer_key = view.signer_key_id.to_string();
-    let signer_key_bytes = signer_key.as_bytes();
-    let anchor_bytes = view.anchor_id.as_bytes();
-
-    let mut buf = Vec::with_capacity(
-        DOMAIN.len()
-            + 8
-            + canonical.len()
-            + 8
-            + 8
-            + 8
-            + signer_key_bytes.len()
-            + 8
-            + anchor_bytes.len(),
-    );
-    buf.extend_from_slice(DOMAIN);
-    buf.extend_from_slice(&(canonical.len() as u64).to_be_bytes());
-    buf.extend_from_slice(canonical);
-    buf.extend_from_slice(&view.valid_from.to_be_bytes());
-    buf.extend_from_slice(&view.valid_until.to_be_bytes());
-    buf.extend_from_slice(&(signer_key_bytes.len() as u64).to_be_bytes());
-    buf.extend_from_slice(signer_key_bytes);
-    buf.extend_from_slice(&(anchor_bytes.len() as u64).to_be_bytes());
-    buf.extend_from_slice(anchor_bytes);
-
-    encode_lower_hex(MandateId::sha256(&buf).as_bytes())
-}
-
-fn classify_tty_reply(raw: &str, expected_code: &str) -> ApprovalOutcome {
+fn classify_tty_reply(raw: &str) -> ApprovalOutcome {
     let line = raw.strip_suffix('\r').unwrap_or(raw);
-    if line.strip_prefix("yes ") == Some(expected_code) {
+    if line == "yes" {
         return ApprovalOutcome::Approved;
     }
     let trimmed = line.trim();
@@ -687,60 +650,20 @@ mod tests {
     }
 
     #[test]
-    fn tty_confirmation_code_is_64_lower_hex_and_matches_domain_separated_sha256() {
+    fn tty_prompt_accepts_exact_yes_and_rejects_other_replies() {
         let view = build_view("1", 1_760_000_000, 1_760_003_600, "local-ed25519");
-        let code = tty_confirmation_code(&view);
-        assert_eq!(code.len(), 64);
-        assert!(code.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')));
 
-        // Independently recompute the domain-separated length-prefixed SHA-256 digest.
-        let signer_str = view.signer_key_id().to_string();
-        let mut expected_preimage = Vec::new();
-        expected_preimage.extend_from_slice(b"handfest-approver-tty-confirm-v1\0");
-        expected_preimage.extend_from_slice(&(view.canonical_mandate().len() as u64).to_be_bytes());
-        expected_preimage.extend_from_slice(view.canonical_mandate().as_bytes());
-        expected_preimage.extend_from_slice(&view.valid_from().to_be_bytes());
-        expected_preimage.extend_from_slice(&view.valid_until().to_be_bytes());
-        expected_preimage.extend_from_slice(&(signer_str.len() as u64).to_be_bytes());
-        expected_preimage.extend_from_slice(signer_str.as_bytes());
-        expected_preimage.extend_from_slice(&(view.anchor_id().len() as u64).to_be_bytes());
-        expected_preimage.extend_from_slice(view.anchor_id().as_bytes());
-        let expected_hex = encode_lower_hex(MandateId::sha256(&expected_preimage).as_bytes());
-        assert_eq!(code, expected_hex);
-    }
-
-    #[test]
-    fn tty_confirmation_code_binds_all_signed_fields_and_rejects_replay() {
-        let base = build_view("1", 1_760_000_000, 1_760_003_600, "local-ed25519");
-        let base_code = tty_confirmation_code(&base);
-        let base_reply = format!("yes {base_code}\n");
-
-        // Same view approves cleanly.
         let mut out_ok = Vec::new();
-        let mut p_ok = TtyPrompt::new(Cursor::new(base_reply.as_bytes()), &mut out_ok);
-        assert_eq!(p_ok.prompt(&base), Ok(ApprovalOutcome::Approved));
+        let mut p_ok = TtyPrompt::new(Cursor::new(b"yes\n".as_slice()), &mut out_ok);
+        assert_eq!(p_ok.prompt(&view), Ok(ApprovalOutcome::Approved));
 
-        // Extended valid_until (same canonical mandate text & mandate_id!) MUST change code & deny.
-        let extended_until = build_view("1", 1_760_000_000, 1_760_086_400, "local-ed25519");
-        assert_eq!(base.canonical_mandate(), extended_until.canonical_mandate());
-        assert_eq!(base.mandate_id(), extended_until.mandate_id());
-        let changed_from = build_view("1", 1_760_000_100, 1_760_003_600, "local-ed25519");
-        let changed_signer = build_view("3", 1_760_000_000, 1_760_003_600, "local-ed25519");
-        let changed_anchor = build_view("1", 1_760_000_000, 1_760_003_600, "yubikey-piv");
-
-        for mutated in [extended_until, changed_from, changed_signer, changed_anchor] {
-            let mutated_code = tty_confirmation_code(&mutated);
-            assert_eq!(mutated_code.len(), 64);
-            assert_ne!(mutated_code, base_code);
-
+        for bad in [b"y\n".as_slice(), b"YES\n", b"yes \n", b"no\n", b"\n"] {
             let mut out = Vec::new();
-            let mut prompt = TtyPrompt::new(Cursor::new(base_reply.as_bytes()), &mut out);
-            assert_eq!(
-                prompt.prompt(&mutated),
-                Ok(ApprovalOutcome::Denied {
-                    reason: "operator did not confirm approval".to_string(),
-                })
-            );
+            let mut prompt = TtyPrompt::new(Cursor::new(bad), &mut out);
+            assert!(matches!(
+                prompt.prompt(&view),
+                Ok(ApprovalOutcome::Denied { .. })
+            ));
         }
     }
 }
