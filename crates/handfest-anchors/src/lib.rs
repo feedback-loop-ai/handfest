@@ -13,7 +13,17 @@ use handfest_core::ActorKind;
 use rand_core::OsRng;
 use serde::{Deserialize, Serialize};
 
+mod signer;
+mod ssh_sk;
+
 pub use handfest_core::AssuranceLevel;
+pub use signer::{
+    sign_mandate_with, CommandOutput, CommandRunner, MandateSigner, SystemCommandRunner,
+};
+pub use ssh_sk::{
+    verify_ssh_sk_ed25519, SshSkEd25519Verifier, SshSkPublicKey, SshSkSigner, SSHSIG_NAMESPACE,
+    SSH_SK_ED25519_SCHEME, SSH_SK_ED25519_SSH_TYPE,
+};
 
 /// Domain-separation prefix prepended to length-prefixed envelope metadata and canonical
 /// `HANDFEST v1` text before Ed25519 signing.
@@ -88,6 +98,15 @@ pub enum AnchorError {
         hop: usize,
         source: Box<AnchorError>,
     },
+    CommandIo {
+        program: String,
+        detail: String,
+    },
+    CommandFailed {
+        program: String,
+        status: Option<i32>,
+        stderr: String,
+    },
 }
 
 impl fmt::Display for AnchorError {
@@ -156,6 +175,19 @@ impl fmt::Display for AnchorError {
             }
             Self::EmptyChain => f.write_str("mandate chain must contain at least one mandate"),
             Self::ChainHop { hop, source } => write!(f, "chain hop {hop}: {source}"),
+            Self::CommandIo { program, detail } => {
+                write!(f, "failed to run '{program}': {detail}")
+            }
+            Self::CommandFailed {
+                program,
+                status,
+                stderr,
+            } => match (status, stderr.is_empty()) {
+                (Some(code), true) => write!(f, "'{program}' exited with status {code}"),
+                (Some(code), false) => write!(f, "'{program}' exited with status {code}: {stderr}"),
+                (None, true) => write!(f, "'{program}' terminated by signal"),
+                (None, false) => write!(f, "'{program}' terminated by signal: {stderr}"),
+            },
         }
     }
 }
@@ -288,32 +320,22 @@ impl Ed25519Keypair {
         valid_from: i64,
         valid_until: i64,
     ) -> Result<SignedMandate, AnchorError> {
-        let ast = parse_canonical(canonical_words).map_err(AnchorError::NonCanonicalMandate)?;
-        let anchor_id = anchor_id.into();
-        validate_proof_shape(&anchor_id, valid_from, valid_until).map_err(map_proof_shape_error)?;
+        sign_mandate_with(self, canonical_words, anchor_id, valid_from, valid_until)
+    }
+}
 
-        let my_key_id = self.key_id();
-        if ast.from().key() != &my_key_id {
-            return Err(AnchorError::SignerMismatch {
-                expected: ast.from().key().to_string(),
-                actual: my_key_id.to_string(),
-            });
-        }
+impl MandateSigner for Ed25519Keypair {
+    fn key_id(&self) -> KeyId {
+        Ed25519Keypair::key_id(self)
+    }
 
-        let mut signed = SignedMandate {
-            canonical_words: canonical_words.to_string(),
-            anchor_id,
-            assurance: format_assurance(AssuranceLevel::LocalKey).to_string(),
-            actor_kind: format_actor_kind(ast.from().kind()).to_string(),
-            signer_key: my_key_id.to_string(),
-            valid_from,
-            valid_until,
-            signature_hex: String::new(),
-        };
-        let payload = signing_payload(&signed);
-        let signature: Signature = self.signing_key.sign(&payload);
-        signed.signature_hex = hex::encode(signature.to_bytes());
-        Ok(signed)
+    fn assurance(&self) -> AssuranceLevel {
+        AssuranceLevel::LocalKey
+    }
+
+    fn sign_payload(&self, payload: &[u8]) -> Result<Vec<u8>, AnchorError> {
+        let signature: Signature = self.signing_key.sign(payload);
+        Ok(signature.to_bytes().to_vec())
     }
 }
 
@@ -357,11 +379,13 @@ impl AnchorRegistry {
         Self::default()
     }
 
-    /// Creates a registry pre-populated with the built-in trust-anchor verifiers (`ed25519`).
+    /// Creates a registry pre-populated with the built-in trust-anchor verifiers
+    /// (`ed25519`, `ssh-sk-ed25519`).
     #[must_use]
     pub fn default_registry() -> Self {
         let mut registry = Self::new();
         registry.register("ed25519", Ed25519Verifier);
+        registry.register(SSH_SK_ED25519_SCHEME, SshSkEd25519Verifier);
         registry
     }
 
@@ -483,8 +507,19 @@ fn enforce_proof_window_and_ast_postconditions(
     Ok(())
 }
 
-/// Verifies a single Ed25519 [`SignedMandate`] envelope and returns a [`VerifiedMandate`].
-pub fn verify_ed25519(signed: &SignedMandate) -> Result<VerifiedMandate, AnchorError> {
+pub(crate) struct ValidatedEnvelopeHeader {
+    pub(crate) ast: handfest_core::ast::HandfestAst,
+    pub(crate) actor_kind: ActorKind,
+    pub(crate) assurance: AssuranceLevel,
+    pub(crate) signer_key: KeyId,
+    pub(crate) verifying_key: VerifyingKey,
+}
+
+pub(crate) fn validate_envelope_header(
+    signed: &SignedMandate,
+    expected_scheme: &str,
+    expected_assurance: AssuranceLevel,
+) -> Result<ValidatedEnvelopeHeader, AnchorError> {
     let ast = parse_canonical(&signed.canonical_words).map_err(AnchorError::NonCanonicalMandate)?;
     validate_proof_shape(&signed.anchor_id, signed.valid_from, signed.valid_until)
         .map_err(map_proof_shape_error)?;
@@ -498,14 +533,14 @@ pub fn verify_ed25519(signed: &SignedMandate) -> Result<VerifiedMandate, AnchorE
     }
 
     let assurance = parse_assurance(&signed.assurance)?;
-    if assurance != AssuranceLevel::LocalKey {
+    if assurance != expected_assurance {
         return Err(AnchorError::UnsupportedAssurance {
-            expected: AssuranceLevel::LocalKey,
+            expected: expected_assurance,
             actual: assurance,
         });
     }
 
-    let signer_key = parse_ed25519_key_id(&signed.signer_key)?;
+    let (signer_key, pub_bytes) = parse_hex32_key_id(&signed.signer_key, expected_scheme)?;
     if &signer_key != ast.from().key() {
         return Err(AnchorError::SignerMismatch {
             expected: ast.from().key().to_string(),
@@ -513,47 +548,96 @@ pub fn verify_ed25519(signed: &SignedMandate) -> Result<VerifiedMandate, AnchorE
         });
     }
 
-    let pub_bytes =
-        decode_lower_hex_fixed::<32>(signer_key.value()).map_err(AnchorError::InvalidPublicKey)?;
-    let verifying_key = VerifyingKey::from_bytes(&pub_bytes)
-        .map_err(|err| AnchorError::InvalidPublicKey(err.to_string()))?;
+    let verifying_key =
+        parse_canonical_ed25519_verifying_key(&pub_bytes).map_err(AnchorError::InvalidPublicKey)?;
 
+    Ok(ValidatedEnvelopeHeader {
+        ast,
+        actor_kind,
+        assurance,
+        signer_key,
+        verifying_key,
+    })
+}
+
+pub(crate) fn parse_canonical_ed25519_verifying_key(
+    pub_bytes: &[u8; 32],
+) -> Result<VerifyingKey, String> {
+    // RFC 8032 Section 5.1.3: reject non-canonical field encodings y >= p (p = 2^255 - 19).
+    let is_non_canonical_y =
+        (pub_bytes[31] & 0x7f) == 0x7f && pub_bytes[1..31] == [0xff; 30] && pub_bytes[0] >= 0xed;
+    if is_non_canonical_y {
+        return Err("non-canonical Ed25519 public key encoding".to_string());
+    }
+    let verifying_key = VerifyingKey::from_bytes(pub_bytes).map_err(|err| err.to_string())?;
+    if verifying_key.is_weak() {
+        return Err("weak small-order Ed25519 public key".to_string());
+    }
+    Ok(verifying_key)
+}
+
+/// Verifies a single Ed25519 [`SignedMandate`] envelope and returns a [`VerifiedMandate`].
+pub fn verify_ed25519(signed: &SignedMandate) -> Result<VerifiedMandate, AnchorError> {
+    let header = validate_envelope_header(signed, "ed25519", AssuranceLevel::LocalKey)?;
     let sig_bytes = decode_lower_hex_fixed::<64>(&signed.signature_hex)
         .map_err(AnchorError::InvalidSignature)?;
     let signature = Signature::from_bytes(&sig_bytes);
 
     let payload = signing_payload(signed);
-    verifying_key
+    header
+        .verifying_key
         .verify_strict(&payload, &signature)
         .map_err(|err| AnchorError::InvalidSignature(err.to_string()))?;
 
     let proof = VerifiedAnchorProof {
         anchor_id: signed.anchor_id.clone(),
-        assurance,
-        signer_key,
-        actor_kind,
+        assurance: header.assurance,
+        signer_key: header.signer_key,
+        actor_kind: header.actor_kind,
         valid_from: signed.valid_from,
         valid_until: signed.valid_until,
     };
 
-    Ok(VerifiedMandate { ast, proof })
+    Ok(VerifiedMandate {
+        ast: header.ast,
+        proof,
+    })
 }
 
-/// Verifies every Ed25519 mandate in a chain, returning `Vec<VerifiedMandate>` ready for
+/// Verifies every mandate in a chain using a pluggable [`AnchorVerifier`], enforcing
+/// [`verify_verifier_postconditions`] on every hop and returning `Vec<VerifiedMandate>` ready for
 /// `handfest_core::gate::authorize`.
-pub fn verify_chain(mandates: &[SignedMandate]) -> Result<Vec<VerifiedMandate>, AnchorError> {
+///
+/// Fails closed on empty chains (`AnchorError::EmptyChain`) and wraps per-hop verification or
+/// postcondition failures in `AnchorError::ChainHop { hop, source }`.
+pub fn verify_chain_with(
+    verifier: &dyn AnchorVerifier,
+    mandates: &[SignedMandate],
+) -> Result<Vec<VerifiedMandate>, AnchorError> {
     if mandates.is_empty() {
         return Err(AnchorError::EmptyChain);
     }
     let mut verified = Vec::with_capacity(mandates.len());
     for (hop, signed) in mandates.iter().enumerate() {
-        let vm = verify_ed25519(signed).map_err(|source| AnchorError::ChainHop {
-            hop,
-            source: Box::new(source),
-        })?;
+        let vm = verifier
+            .verify(signed)
+            .and_then(|vm| {
+                verify_verifier_postconditions(signed, &vm)?;
+                Ok(vm)
+            })
+            .map_err(|source| AnchorError::ChainHop {
+                hop,
+                source: Box::new(source),
+            })?;
         verified.push(vm);
     }
     Ok(verified)
+}
+
+/// Verifies every mandate in a chain via [`AnchorRegistry::default_registry`], returning
+/// `Vec<VerifiedMandate>` ready for `handfest_core::gate::authorize`.
+pub fn verify_chain(mandates: &[SignedMandate]) -> Result<Vec<VerifiedMandate>, AnchorError> {
+    verify_chain_with(&AnchorRegistry::default_registry(), mandates)
 }
 
 /// Builds the domain-separated, length-prefixed payload signed by Ed25519 anchors.
@@ -634,7 +718,7 @@ pub const fn format_assurance(level: AssuranceLevel) -> &'static str {
     }
 }
 
-fn map_proof_shape_error(err: ProofShapeError) -> AnchorError {
+pub(crate) fn map_proof_shape_error(err: ProofShapeError) -> AnchorError {
     match err {
         ProofShapeError::EmptyAnchorId => {
             AnchorError::InvalidAnchorId("anchor_id must not be empty".to_string())
@@ -653,17 +737,28 @@ fn map_proof_shape_error(err: ProofShapeError) -> AnchorError {
     }
 }
 
-fn parse_ed25519_key_id(raw: &str) -> Result<KeyId, AnchorError> {
+fn parse_hex32_key_id(raw: &str, expected_scheme: &str) -> Result<(KeyId, [u8; 32]), AnchorError> {
     let key_id = KeyId::parse(raw)
         .map_err(|err| AnchorError::InvalidPublicKey(format!("invalid KeyId '{raw}': {err}")))?;
-    if key_id.scheme() != "ed25519" {
+    if key_id.scheme() != expected_scheme {
         return Err(AnchorError::InvalidPublicKey(format!(
-            "expected 'ed25519' key scheme, got '{}'",
+            "expected '{expected_scheme}' key scheme, got '{}'",
             key_id.scheme()
         )));
     }
-    let _ = decode_lower_hex_fixed::<32>(key_id.value()).map_err(AnchorError::InvalidPublicKey)?;
-    Ok(key_id)
+    let pub_bytes =
+        decode_lower_hex_fixed::<32>(key_id.value()).map_err(AnchorError::InvalidPublicKey)?;
+    Ok((key_id, pub_bytes))
+}
+
+fn ensure_lower_hex_digits(input: &str) -> Result<(), String> {
+    if !input
+        .bytes()
+        .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+    {
+        return Err("expected lowercase hexadecimal digits only".to_string());
+    }
+    Ok(())
 }
 
 fn decode_lower_hex_fixed<const N: usize>(input: &str) -> Result<[u8; N], String> {
@@ -674,13 +769,22 @@ fn decode_lower_hex_fixed<const N: usize>(input: &str) -> Result<[u8; N], String
             input.len()
         ));
     }
-    if !input
-        .bytes()
-        .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
-    {
-        return Err("expected lowercase hexadecimal digits only".to_string());
-    }
+    ensure_lower_hex_digits(input)?;
     let mut out = [0u8; N];
     hex::decode_to_slice(input, &mut out).map_err(|err| err.to_string())?;
     Ok(out)
+}
+
+pub(crate) fn decode_lower_hex_vec(input: &str) -> Result<Vec<u8>, String> {
+    if input.is_empty() {
+        return Err("expected non-empty lowercase hex string".to_string());
+    }
+    if !input.len().is_multiple_of(2) {
+        return Err(format!(
+            "expected even-length lowercase hex string, got {} chars",
+            input.len()
+        ));
+    }
+    ensure_lower_hex_digits(input)?;
+    hex::decode(input).map_err(|err| err.to_string())
 }

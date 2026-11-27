@@ -1364,3 +1364,331 @@ fn check_policy_map_rejects_invalid_utf8_stdin_before_opening_ledger() {
         );
     }
 }
+
+#[cfg(unix)]
+fn push_ssh_field(buf: &mut Vec<u8>, bytes: &[u8]) {
+    buf.extend_from_slice(&(u32::try_from(bytes.len()).unwrap()).to_be_bytes());
+    buf.extend_from_slice(bytes);
+}
+
+#[cfg(unix)]
+fn encode_b64_fixture(input: &[u8]) -> String {
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::new();
+    for chunk in input.chunks(3) {
+        let b0 = chunk[0];
+        let b1 = if chunk.len() > 1 { chunk[1] } else { 0 };
+        let b2 = if chunk.len() > 2 { chunk[2] } else { 0 };
+        out.push(TABLE[(b0 >> 2) as usize] as char);
+        out.push(TABLE[(((b0 & 0x03) << 4) | (b1 >> 4)) as usize] as char);
+        out.push(if chunk.len() > 1 {
+            TABLE[(((b1 & 0x0f) << 2) | (b2 >> 6)) as usize] as char
+        } else {
+            '='
+        });
+        out.push(if chunk.len() > 2 {
+            TABLE[(b2 & 0x3f) as usize] as char
+        } else {
+            '='
+        });
+    }
+    out
+}
+
+#[cfg(unix)]
+fn build_ssh_sk_fixtures(
+    dir: &std::path::Path,
+    sk: &ed25519_dalek::SigningKey,
+    application: &str,
+    yk_key_id: &str,
+    mandate_raw: &str,
+) -> (PathBuf, Vec<u8>, String) {
+    use ed25519_dalek::Signer;
+    use handfest_anchors::{
+        signing_payload, SignedMandate, SSHSIG_NAMESPACE, SSH_SK_ED25519_SSH_TYPE,
+    };
+    use handfest_core::cnl::{parse_mandate, render_canonical};
+    use sha2::{Digest, Sha256, Sha512};
+
+    let mut pk_blob = Vec::new();
+    push_ssh_field(&mut pk_blob, SSH_SK_ED25519_SSH_TYPE.as_bytes());
+    push_ssh_field(&mut pk_blob, sk.verifying_key().as_bytes());
+    push_ssh_field(&mut pk_blob, application.as_bytes());
+
+    let pub_path = dir.join("id_ed25519_sk.pub");
+    fs::write(
+        &pub_path,
+        format!(
+            "{SSH_SK_ED25519_SSH_TYPE} {} yubikey@test\n",
+            encode_b64_fixture(&pk_blob)
+        ),
+    )
+    .unwrap();
+
+    let canonical = render_canonical(&parse_mandate(mandate_raw).unwrap());
+    let expected_envelope = SignedMandate {
+        canonical_words: canonical,
+        anchor_id: "yubikey-ssh-sk".to_string(),
+        assurance: "passkey".to_string(),
+        actor_kind: "human".to_string(),
+        signer_key: yk_key_id.to_string(),
+        valid_from: handfest_core::ast::parse_rfc3339_utc("2026-11-24T17:00:00Z").unwrap(),
+        valid_until: handfest_core::ast::parse_rfc3339_utc("2026-11-25T01:00:00Z").unwrap(),
+        signature_hex: String::new(),
+    };
+    let expected_payload = signing_payload(&expected_envelope);
+    let payload_sha512 = Sha512::digest(&expected_payload);
+
+    let mut preimage = Vec::new();
+    preimage.extend_from_slice(b"SSHSIG");
+    push_ssh_field(&mut preimage, SSHSIG_NAMESPACE.as_bytes());
+    push_ssh_field(&mut preimage, b"");
+    push_ssh_field(&mut preimage, b"sha512");
+    push_ssh_field(&mut preimage, &payload_sha512);
+
+    let mut sk_signed = [0u8; 69];
+    sk_signed[0..32].copy_from_slice(&Sha256::digest(application.as_bytes()));
+    sk_signed[32] = 0x01;
+    sk_signed[33..37].copy_from_slice(&17u32.to_be_bytes());
+    sk_signed[37..69].copy_from_slice(&Sha256::digest(&preimage));
+    let ed_sig = sk.sign(&sk_signed);
+
+    let mut sig_blob = Vec::new();
+    push_ssh_field(&mut sig_blob, SSH_SK_ED25519_SSH_TYPE.as_bytes());
+    push_ssh_field(&mut sig_blob, &ed_sig.to_bytes());
+    sig_blob.push(0x01);
+    sig_blob.extend_from_slice(&17u32.to_be_bytes());
+
+    let mut raw_sshsig = Vec::new();
+    raw_sshsig.extend_from_slice(b"SSHSIG");
+    raw_sshsig.extend_from_slice(&1u32.to_be_bytes());
+    push_ssh_field(&mut raw_sshsig, &pk_blob);
+    push_ssh_field(&mut raw_sshsig, SSHSIG_NAMESPACE.as_bytes());
+    push_ssh_field(&mut raw_sshsig, b"");
+    push_ssh_field(&mut raw_sshsig, b"sha512");
+    push_ssh_field(&mut raw_sshsig, &sig_blob);
+
+    let pem = format!(
+        "-----BEGIN SSH SIGNATURE-----\n{}\n-----END SSH SIGNATURE-----\n",
+        encode_b64_fixture(&raw_sshsig)
+    );
+    (pub_path, expected_payload, pem)
+}
+
+#[cfg(unix)]
+fn install_fake_ssh_keygen(
+    dir: &std::path::Path,
+    expected_key_path: &std::path::Path,
+    expected_payload: &[u8],
+    pem: &str,
+) -> String {
+    use handfest_anchors::SSHSIG_NAMESPACE;
+    use std::os::unix::fs::PermissionsExt;
+
+    let payload_path = dir.join("expected.payload");
+    let pem_path = dir.join("expected.sig");
+    fs::write(&payload_path, expected_payload).unwrap();
+    fs::write(&pem_path, pem).unwrap();
+
+    let bin_dir = dir.join("bin");
+    fs::create_dir(&bin_dir).unwrap();
+    let fake_bin = bin_dir.join("ssh-keygen");
+    let sh_quote = |p: &std::path::Path| -> String {
+        format!("'{}'", p.display().to_string().replace('\'', "'\\''"))
+    };
+    let script = format!(
+        "#!/bin/sh\n\
+         set -eu\n\
+         if [ \"$1\" != '-Y' ] || [ \"$2\" != 'sign' ] || [ \"$3\" != '-f' ] || [ \"$4\" != {key} ] || [ \"$5\" != '-n' ] || [ \"$6\" != '{ns}' ]; then\n\
+           echo \"unexpected args: $*\" >&2\n\
+           exit 42\n\
+         fi\n\
+         cmp -s - {payload}\n\
+         cat {pem}\n",
+        key = sh_quote(expected_key_path),
+        ns = SSHSIG_NAMESPACE,
+        payload = sh_quote(&payload_path),
+        pem = sh_quote(&pem_path),
+    );
+    fs::write(&fake_bin, script).unwrap();
+    fs::set_permissions(&fake_bin, fs::Permissions::from_mode(0o755)).unwrap();
+
+    format!(
+        "{}:{}",
+        bin_dir.display(),
+        std::env::var("PATH").unwrap_or_default()
+    )
+}
+
+#[cfg(unix)]
+fn run_handfest_ok(args: &[&str], path_env: Option<&str>) -> String {
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_handfest"));
+    cmd.args(args);
+    if let Some(p) = path_env {
+        cmd.env("PATH", p);
+    }
+    let out = cmd.output().unwrap();
+    assert!(
+        out.status.success(),
+        "handfest {:?} failed: stdout={} stderr={}",
+        args,
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8(out.stdout).unwrap()
+}
+
+#[cfg(unix)]
+#[test]
+fn ssh_sk_end_to_end_keyid_sign_verify_check_and_audit() {
+    let dir = TempDir::new().unwrap();
+    let sk = ed25519_dalek::SigningKey::from_bytes(&[0xa5; 32]);
+    let expected_yk_id = format!(
+        "ssh-sk-ed25519:{}",
+        hex::encode(sk.verifying_key().as_bytes())
+    );
+    let agent_key_id = format!("ed25519:{}", "b".repeat(64));
+    let mandate_raw = format!(
+        concat!(
+            "HANDFEST v1\n",
+            "FROM human \"Valentin\" (key: {from})\n",
+            "TO agent \"Claude\" (key: {to})\n",
+            "DELEGATION max 0 hops\n",
+            "ALLOW git.pr.merge\n",
+            "ON repo \"feedback-loop-ai/handfest\"\n",
+            "WHERE context.time >= 2026-11-24T17:00:00Z\n",
+            "  AND context.time < 2026-11-25T01:00:00Z\n",
+            "  AND resource.author == \"valentin\"\n",
+            "LIMIT 2 calls\n",
+        ),
+        from = expected_yk_id,
+        to = agent_key_id,
+    );
+    let mandate_path = dir.path().join("yubikey_root.hf");
+    fs::write(&mandate_path, &mandate_raw).unwrap();
+
+    let (pub_path, expected_payload, pem) = build_ssh_sk_fixtures(
+        dir.path(),
+        &sk,
+        "ssh:handfest",
+        &expected_yk_id,
+        &mandate_raw,
+    );
+
+    // 1. `handfest keyid --ssh-key`
+    let keyid_stdout = run_handfest_ok(&["keyid", "--ssh-key", pub_path.to_str().unwrap()], None);
+    assert_eq!(keyid_stdout.trim(), expected_yk_id);
+
+    // 2. `handfest sign --ssh-key` (defaults anchor_id to yubikey-ssh-sk)
+    let path_env = install_fake_ssh_keygen(dir.path(), &pub_path, &expected_payload, &pem);
+    let signed_path = dir.path().join("yubikey_root.signed.json");
+    let _ = run_handfest_ok(
+        &[
+            "sign",
+            "--mandate",
+            mandate_path.to_str().unwrap(),
+            "--ssh-key",
+            pub_path.to_str().unwrap(),
+            "--valid-from",
+            "2026-11-24T17:00:00Z",
+            "--valid-until",
+            "2026-11-25T01:00:00Z",
+            "--out",
+            signed_path.to_str().unwrap(),
+        ],
+        Some(&path_env),
+    );
+    let signed_json: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&signed_path).unwrap()).unwrap();
+    assert_eq!(signed_json["anchor_id"], "yubikey-ssh-sk");
+    assert_eq!(signed_json["assurance"], "passkey");
+    assert_eq!(signed_json["signer_key"], expected_yk_id);
+
+    // 3. `handfest verify`
+    let verify_stdout = run_handfest_ok(&["verify", signed_path.to_str().unwrap()], None);
+    let verify_json: serde_json::Value = serde_json::from_str(&verify_stdout).unwrap();
+    assert_eq!(verify_json["status"], "verified");
+    assert_eq!(verify_json["hops"], 1);
+
+    // 4. `handfest check` -> Permit, then `handfest audit`
+    let ledger_path = dir.path().join("yubikey_ledger.sqlite");
+    let check_stdout = run_handfest_ok(
+        &[
+            "check",
+            "--ledger",
+            ledger_path.to_str().unwrap(),
+            "--chain",
+            signed_path.to_str().unwrap(),
+            "--actor-key",
+            &agent_key_id,
+            "--action",
+            "git.pr.merge",
+            "--resource-kind",
+            "repo",
+            "--resource-id",
+            "feedback-loop-ai/handfest",
+            "--facts",
+            r#"{"resource.author":"valentin"}"#,
+            "--now",
+            "2026-11-24T18:30:00Z",
+        ],
+        None,
+    );
+    let check_json: serde_json::Value = serde_json::from_str(&check_stdout).unwrap();
+    assert_eq!(check_json["verdict"], "permit");
+
+    let audit_stdout = run_handfest_ok(
+        &[
+            "audit",
+            "--ledger",
+            ledger_path.to_str().unwrap(),
+            "--actor-key",
+            &agent_key_id,
+        ],
+        None,
+    );
+    let audit_json: serde_json::Value = serde_json::from_str(&audit_stdout).unwrap();
+    assert_eq!(audit_json["status"], "ok");
+    assert_eq!(audit_json["verified_receipts"], 1);
+    assert_eq!(audit_json["track_record"]["permits"], 1);
+}
+
+#[test]
+fn cli_keyid_and_sign_ssh_key_fail_closed_on_bad_inputs() {
+    let dir = TempDir::new().unwrap();
+    let bad_pub = dir.path().join("not_sk.pub");
+    fs::write(
+        &bad_pub,
+        "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAA
+",
+    )
+    .unwrap();
+
+    let keyid_err = Command::new(env!("CARGO_BIN_EXE_handfest"))
+        .args(["keyid", "--ssh-key", bad_pub.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(!keyid_err.status.success());
+    assert!(String::from_utf8_lossy(&keyid_err.stderr).contains("sk-ssh-ed25519@openssh.com"));
+
+    // `--key` and `--ssh-key` conflict at the binary level.
+    let conflict = Command::new(env!("CARGO_BIN_EXE_handfest"))
+        .args([
+            "sign",
+            "--mandate",
+            "m.hf",
+            "--key",
+            "k.json",
+            "--ssh-key",
+            bad_pub.to_str().unwrap(),
+            "--valid-from",
+            "2026-11-24T17:00:00Z",
+            "--valid-until",
+            "2026-11-25T01:00:00Z",
+        ])
+        .output()
+        .unwrap();
+    assert!(!conflict.status.success());
+    let stderr = String::from_utf8_lossy(&conflict.stderr);
+    assert!(stderr.contains("--key") && stderr.contains("--ssh-key"));
+}

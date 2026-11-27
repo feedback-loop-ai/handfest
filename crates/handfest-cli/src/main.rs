@@ -9,7 +9,10 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
-use handfest_anchors::{verify_chain, Ed25519KeyFile, Ed25519Keypair, SignedMandate};
+use handfest_anchors::{
+    sign_mandate_with, verify_chain, Ed25519KeyFile, Ed25519Keypair, MandateSigner, SignedMandate,
+    SshSkPublicKey, SshSkSigner, SystemCommandRunner,
+};
 use handfest_core::ast::{is_valid_timestamp, parse_rfc3339_utc, KeyId};
 use handfest_core::cnl::{parse_mandate, try_render_canonical};
 use handfest_core::gate::ActionRequest;
@@ -45,23 +48,33 @@ enum Commands {
         #[arg(long)]
         out: Option<PathBuf>,
     },
+    /// Derives and prints the canonical HANDFEST KeyId for an existing key file.
+    Keyid {
+        /// Path to an OpenSSH FIDO2 key handle or `.pub` file (`sk-ssh-ed25519@openssh.com`).
+        #[arg(long)]
+        ssh_key: PathBuf,
+    },
     /// Canonicalizes and signs a HANDFEST v1 mandate into a SignedMandate JSON envelope.
     Sign {
         /// Path to the HANDFEST v1 mandate text file.
         #[arg(long)]
         mandate: PathBuf,
         /// Path to the Ed25519 secret key JSON file created by `handfest keygen`.
-        #[arg(long)]
-        key: PathBuf,
+        #[arg(long, required_unless_present = "ssh_key", conflicts_with = "ssh_key")]
+        key: Option<PathBuf>,
+        /// Path to an OpenSSH FIDO2 key handle or `.pub` file (`sk-ssh-ed25519@openssh.com`).
+        #[arg(long, required_unless_present = "key", conflicts_with = "key")]
+        ssh_key: Option<PathBuf>,
         /// Anchor validity start timestamp (RFC 3339 UTC or Unix seconds).
         #[arg(long)]
         valid_from: String,
         /// Anchor validity end timestamp (RFC 3339 UTC or Unix seconds).
         #[arg(long)]
         valid_until: String,
-        /// Trust anchor identifier recorded in the SignedMandate envelope.
-        #[arg(long, default_value = "local-ed25519")]
-        anchor_id: String,
+        /// Trust anchor identifier recorded in the SignedMandate envelope
+        /// (defaults to `local-ed25519` with `--key` or `yubikey-ssh-sk` with `--ssh-key`).
+        #[arg(long)]
+        anchor_id: Option<String>,
         /// Optional path to write the SignedMandate JSON (prints JSON to stdout if omitted).
         #[arg(long)]
         out: Option<PathBuf>,
@@ -150,21 +163,32 @@ fn run(cli: Cli) -> Result<ExitCode, String> {
     match cli.command {
         Commands::Fmt { file } => cmd_fmt(&file),
         Commands::Keygen { out } => cmd_keygen(out.as_deref()),
+        Commands::Keyid { ssh_key } => cmd_keyid(&ssh_key),
         Commands::Sign {
             mandate,
             key,
+            ssh_key,
             valid_from,
             valid_until,
             anchor_id,
             out,
-        } => cmd_sign(
-            &mandate,
-            &key,
-            &valid_from,
-            &valid_until,
-            &anchor_id,
-            out.as_deref(),
-        ),
+        } => {
+            let signer = match (key, ssh_key) {
+                (Some(key_path), None) => SignerConfig::LocalEd25519 { key_path },
+                (None, Some(key_path)) => SignerConfig::SshSkEd25519 { key_path },
+                _ => return Err("exactly one of --key or --ssh-key must be supplied".to_string()),
+            };
+            let resolved_anchor_id =
+                anchor_id.unwrap_or_else(|| signer.default_anchor_id().to_string());
+            cmd_sign(&SignArgs {
+                mandate_path: mandate,
+                signer,
+                valid_from,
+                valid_until,
+                anchor_id: resolved_anchor_id,
+                out,
+            })
+        }
         Commands::Verify { signed } => cmd_verify(&signed),
         Commands::Check {
             ledger,
@@ -208,6 +232,30 @@ fn run(cli: Cli) -> Result<ExitCode, String> {
         }
         Commands::Audit { ledger, actor_key } => cmd_audit(&ledger, actor_key.as_deref()),
     }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum SignerConfig {
+    LocalEd25519 { key_path: PathBuf },
+    SshSkEd25519 { key_path: PathBuf },
+}
+
+impl SignerConfig {
+    const fn default_anchor_id(&self) -> &'static str {
+        match self {
+            Self::LocalEd25519 { .. } => "local-ed25519",
+            Self::SshSkEd25519 { .. } => "yubikey-ssh-sk",
+        }
+    }
+}
+
+struct SignArgs {
+    mandate_path: PathBuf,
+    signer: SignerConfig,
+    valid_from: String,
+    valid_until: String,
+    anchor_id: String,
+    out: Option<PathBuf>,
 }
 
 enum CheckSource {
@@ -257,39 +305,66 @@ fn cmd_keygen(out: Option<&Path>) -> Result<ExitCode, String> {
     Ok(ExitCode::SUCCESS)
 }
 
-fn cmd_sign(
-    mandate_path: &Path,
-    key_path: &Path,
+fn cmd_keyid(ssh_key_path: &Path) -> Result<ExitCode, String> {
+    let pub_key = SshSkPublicKey::from_key_path(ssh_key_path)
+        .map_err(|err| format!("failed to load SSH security key: {err}"))?;
+    println!("{}", pub_key.key_id());
+    Ok(ExitCode::SUCCESS)
+}
+
+fn resolve_signer(config: &SignerConfig) -> Result<Box<dyn MandateSigner>, String> {
+    match config {
+        SignerConfig::LocalEd25519 { key_path } => {
+            let key_raw = fs::read_to_string(key_path)
+                .map_err(|err| format!("failed to read '{}': {err}", key_path.display()))?;
+            let key_file: Ed25519KeyFile = serde_json::from_str(&key_raw)
+                .map_err(|err| format!("invalid key file JSON: {err}"))?;
+            let keypair = Ed25519Keypair::from_key_file(&key_file)
+                .map_err(|err| format!("failed to load Ed25519 key: {err}"))?;
+            Ok(Box::new(keypair))
+        }
+        SignerConfig::SshSkEd25519 { key_path } => {
+            let signer = SshSkSigner::from_key_path(key_path, SystemCommandRunner)
+                .map_err(|err| format!("failed to load SSH security key: {err}"))?;
+            Ok(Box::new(signer))
+        }
+    }
+}
+
+fn sign_canonical_with_signer(
+    canonical: &str,
+    signer: &dyn MandateSigner,
     valid_from_raw: &str,
     valid_until_raw: &str,
     anchor_id: &str,
-    out: Option<&Path>,
-) -> Result<ExitCode, String> {
-    let mandate_raw = fs::read_to_string(mandate_path)
-        .map_err(|err| format!("failed to read '{}': {err}", mandate_path.display()))?;
+) -> Result<SignedMandate, String> {
+    let valid_from = parse_timestamp_arg("valid-from", valid_from_raw)?;
+    let valid_until = parse_timestamp_arg("valid-until", valid_until_raw)?;
+    sign_mandate_with(signer, canonical, anchor_id, valid_from, valid_until)
+        .map_err(|err| format!("failed to sign mandate: {err}"))
+}
+
+fn cmd_sign(args: &SignArgs) -> Result<ExitCode, String> {
+    let mandate_raw = fs::read_to_string(&args.mandate_path)
+        .map_err(|err| format!("failed to read '{}': {err}", args.mandate_path.display()))?;
     let ast = parse_mandate(&mandate_raw).map_err(|err| format!("invalid mandate: {err}"))?;
     let canonical = try_render_canonical(&ast).map_err(|err| format!("render error: {err}"))?;
 
-    let key_raw = fs::read_to_string(key_path)
-        .map_err(|err| format!("failed to read '{}': {err}", key_path.display()))?;
-    let key_file: Ed25519KeyFile =
-        serde_json::from_str(&key_raw).map_err(|err| format!("invalid key file JSON: {err}"))?;
-    let keypair = Ed25519Keypair::from_key_file(&key_file)
-        .map_err(|err| format!("failed to load Ed25519 key: {err}"))?;
-
-    let valid_from = parse_timestamp_arg("valid-from", valid_from_raw)?;
-    let valid_until = parse_timestamp_arg("valid-until", valid_until_raw)?;
-
-    let signed = keypair
-        .sign_mandate(&canonical, anchor_id, valid_from, valid_until)
-        .map_err(|err| format!("failed to sign mandate: {err}"))?;
+    let signer = resolve_signer(&args.signer)?;
+    let signed = sign_canonical_with_signer(
+        &canonical,
+        signer.as_ref(),
+        &args.valid_from,
+        &args.valid_until,
+        &args.anchor_id,
+    )?;
     let mandate_id = ast
         .try_mandate_id()
         .map_err(|err| format!("failed to hash mandate: {err}"))?;
     let json_text =
         serde_json::to_string_pretty(&signed).map_err(|err| format!("serialize error: {err}"))?;
 
-    if let Some(path) = out {
+    if let Some(path) = args.out.as_deref() {
         fs::write(path, format!("{json_text}\n"))
             .map_err(|err| format!("failed to write '{}': {err}", path.display()))?;
         println!("{mandate_id}");
@@ -574,31 +649,5 @@ fn write_secret_file(path: &Path, content: &str) -> Result<(), String> {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn classify_existing_ledger_open_error_maps_all_variants() {
-        assert_eq!(
-            classify_existing_ledger_open_error(&LedgerError::NotFound("missing".into())),
-            "missing_ledger"
-        );
-        assert_eq!(
-            classify_existing_ledger_open_error(&LedgerError::Integrity("bad".into())),
-            "invalid_ledger"
-        );
-        assert_eq!(
-            classify_existing_ledger_open_error(&LedgerError::Storage("cantopen".into())),
-            "storage_error"
-        );
-        let json_err = serde_json::from_str::<serde_json::Value>("{").unwrap_err();
-        assert_eq!(
-            classify_existing_ledger_open_error(&LedgerError::Json(json_err)),
-            "storage_error"
-        );
-        assert_eq!(
-            classify_existing_ledger_open_error(&LedgerError::QuotaAccounting("overflow".into())),
-            "storage_error"
-        );
-    }
-}
+#[path = "main_tests.rs"]
+mod tests;
