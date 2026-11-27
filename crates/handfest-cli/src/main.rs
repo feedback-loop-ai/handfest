@@ -1,6 +1,8 @@
 //! Reference CLI for formatting, signing, verifying, checking, and auditing `handfest` mandates.
 
 mod facts;
+mod init;
+mod keyid;
 mod policy_check;
 mod revoke;
 mod sign;
@@ -11,7 +13,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
-use handfest_anchors::{verify_chain, Ed25519Keypair, SignedMandate, SshSkPublicKey};
+use handfest_anchors::{verify_chain, Ed25519Keypair, SignedMandate};
 use handfest_core::ast::{is_valid_timestamp, parse_rfc3339_utc, KeyId};
 use handfest_core::cnl::{parse_mandate, try_render_canonical};
 use handfest_core::gate::{check_chain_revocations, ActionRequest};
@@ -21,6 +23,8 @@ use handfest_ledger::{LedgerError, SqliteLedger};
 use serde_json::json;
 
 use crate::facts::parse_facts_arg;
+use crate::init::{run_init_cli, InitCliArgs};
+use crate::keyid::{run_keyid_cli, PrincipalKeyArgs};
 use crate::policy_check::resolve_policy_map_request;
 use crate::revoke::{
     current_utc_unix_seconds, load_and_verify_revocations, run_revoke_cli,
@@ -52,12 +56,10 @@ enum Commands {
         #[arg(long)]
         out: Option<PathBuf>,
     },
-    /// Derives and prints the canonical HANDFEST KeyId for an existing key file.
-    Keyid {
-        /// Path to an OpenSSH FIDO2 key handle or `.pub` file (`sk-ssh-ed25519@openssh.com`).
-        #[arg(long)]
-        ssh_key: PathBuf,
-    },
+    /// Derives and prints the canonical HANDFEST KeyId for an existing key or YubiKey interface.
+    Keyid(PrincipalKeyArgs),
+    /// Bootstraps an outside-workspace Handfest config directory, SQLite ledger, agent key, and public-only profile.json.
+    Init(InitCliArgs),
     /// Canonicalizes and signs a HANDFEST v1 mandate into a SignedMandate JSON envelope.
     Sign {
         /// Path to the HANDFEST v1 mandate text file.
@@ -234,7 +236,8 @@ fn run(cli: Cli) -> Result<ExitCode, String> {
     match cli.command {
         Commands::Fmt { file } => cmd_fmt(&file),
         Commands::Keygen { out } => cmd_keygen(out.as_deref()),
-        Commands::Keyid { ssh_key } => cmd_keyid(&ssh_key),
+        Commands::Keyid(args) => run_keyid_cli(args),
+        Commands::Init(args) => run_init_cli(args),
         Commands::Sign {
             mandate,
             key,
@@ -406,12 +409,6 @@ fn cmd_keygen(out: Option<&Path>) -> Result<ExitCode, String> {
     Ok(ExitCode::SUCCESS)
 }
 
-fn cmd_keyid(ssh_key_path: &Path) -> Result<ExitCode, String> {
-    let pub_key = SshSkPublicKey::from_key_path(ssh_key_path)
-        .map_err(|err| format!("failed to load SSH security key: {err}"))?;
-    println!("{}", pub_key.key_id());
-    Ok(ExitCode::SUCCESS)
-}
 fn cmd_verify(
     paths: &[PathBuf],
     revocation_paths: &[PathBuf],

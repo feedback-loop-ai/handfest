@@ -1784,4 +1784,39 @@ fi
 assert_strict_rfc8259_json_line "handfest-mcp rejects empty tool name stderr" "$TMP_DIR/mcp_stderr.txt" "d['error'] == 'startup_failed' and d['code'] == 'policy_invalid'"
 pass "Policy map tool-name validation shares one codec and passes live parity against handfest-mcp (unused \\n/\\t accepted; empty rejected)"
 
+# Test: plugins/install.sh installs all 3 SKILL.md files, 0755 hook, 0700 HANDFEST_HOME, and localized valid templates without clobbering policy-map.json
+INSTALL_HOME="$TMP_DIR/install-home"
+INSTALL_HF_HOME="$TMP_DIR/install-handfest & config"
+mkdir -p "$INSTALL_HOME"
+HOME="$INSTALL_HOME" HANDFEST_HOME="$INSTALL_HF_HOME" "$REPO_ROOT/plugins/install.sh" >"$TMP_DIR/install_stdout.txt"
+assert_eq "install.sh agy skill matches source" "$(cat "$INSTALL_HOME/.gemini/config/skills/handfest/SKILL.md")" "$(cat "$REPO_ROOT/plugins/agy/SKILL.md")"
+assert_eq "install.sh claude skill matches source" "$(cat "$INSTALL_HOME/.claude/skills/handfest/SKILL.md")" "$(cat "$REPO_ROOT/plugins/claude-code/SKILL.md")"
+assert_eq "install.sh codex skill matches source" "$(cat "$INSTALL_HOME/.codex/skills/handfest/SKILL.md")" "$(cat "$REPO_ROOT/plugins/agy/SKILL.md")"
+python3 -I - "$INSTALL_HF_HOME" <<'PY_INSTALL'
+import json, os, stat, sys, tomllib
+
+hf_home = sys.argv[1]
+assert (stat.S_IMODE(os.stat(hf_home).st_mode)) == 0o700, "HANDFEST_HOME must be 0700"
+hook_path = os.path.join(hf_home, "hooks", "pre-tool-use.sh")
+assert (stat.S_IMODE(os.stat(hook_path).st_mode)) == 0o755, "pre-tool-use.sh must be 0755"
+
+for rel in ("agy-mcp.json", "claude-mcp.json", "claude-settings.json", "dsh-mcp.json", "policy-map.example.json"):
+    p = os.path.join(hf_home, "templates", rel)
+    raw = open(p, "r", encoding="utf-8").read()
+    assert "/path/to/handfest-config" not in raw, f"unlocalized placeholder left in {rel}"
+    json.loads(raw)
+
+codex_raw = open(os.path.join(hf_home, "templates", "codex-config.toml"), "r", encoding="utf-8").read()
+assert "/path/to/handfest-config" not in codex_raw
+parsed_toml = tomllib.loads(codex_raw)
+args = parsed_toml["mcp_servers"]["github_handfest"]["args"]
+assert f"{hf_home}/mandates/root.signed.json" in args, f"localized path missing in codex toml: {args!r}"
+PY_INSTALL
+
+# Re-running install.sh must preserve an operator's existing policy-map.json
+echo '{"tools":{}}' >"$INSTALL_HF_HOME/policy-map.json"
+HOME="$INSTALL_HOME" HANDFEST_HOME="$INSTALL_HF_HOME" "$REPO_ROOT/plugins/install.sh" >/dev/null
+assert_eq "install.sh preserves existing policy-map.json" "$(cat "$INSTALL_HF_HOME/policy-map.json")" '{"tools":{}}'
+pass "plugins/install.sh installed all 3 skills, 0755 hook, 0700 HANDFEST_HOME, and localized valid JSON/TOML templates without overwriting policy-map.json"
+
 echo "ALL $PASS_COUNT HOOK & PLUGIN TESTS PASSED."

@@ -242,13 +242,63 @@ fn cli_sign_flags_reject_conflict_or_missing_and_parse_keyid() {
         clap::error::ErrorKind::MissingRequiredArgument
     );
 
-    // `keyid --ssh-key` parses cleanly.
+    // `keyid` parses all 5 mutually exclusive principal key flags cleanly and rejects missing/conflict.
     let parsed_keyid = Cli::try_parse_from(["handfest", "keyid", "--ssh-key", "id_ed25519_sk.pub"])
         .expect("parse keyid --ssh-key");
     match parsed_keyid.command {
-        Commands::Keyid { ssh_key } => assert_eq!(ssh_key, PathBuf::from("id_ed25519_sk.pub")),
+        Commands::Keyid(args) => {
+            assert_eq!(args.ssh_key, Some(PathBuf::from("id_ed25519_sk.pub")));
+            assert_eq!(args.key, None);
+            assert_eq!(args.fido2_cred, None);
+            assert_eq!(args.gpg_key, None);
+            assert_eq!(args.piv_pubkey, None);
+        }
         other => panic!("unexpected command: {other:?}"),
     }
+
+    let keyid_missing =
+        Cli::try_parse_from(["handfest", "keyid"]).expect_err("keyid with no key flag must fail");
+    assert_eq!(
+        keyid_missing.kind(),
+        clap::error::ErrorKind::MissingRequiredArgument
+    );
+
+    let keyid_conflict = Cli::try_parse_from([
+        "handfest",
+        "keyid",
+        "--key",
+        "a.json",
+        "--piv-pubkey",
+        "b.pem",
+    ])
+    .expect_err("keyid with two key flags must fail");
+    assert_eq!(
+        keyid_conflict.kind(),
+        clap::error::ErrorKind::ArgumentConflict
+    );
+
+    let init_conflict = Cli::try_parse_from([
+        "handfest",
+        "init",
+        "--principal-name",
+        "Valentin",
+        "--ssh-key",
+        "a.pub",
+        "--gpg-key",
+        "0123456789abcdef0123456789abcdef01234567",
+    ])
+    .expect_err("init with two key flags must fail");
+    assert_eq!(
+        init_conflict.kind(),
+        clap::error::ErrorKind::ArgumentConflict
+    );
+
+    let init_missing = Cli::try_parse_from(["handfest", "init", "--principal-name", "Valentin"])
+        .expect_err("init with no key flag must fail");
+    assert_eq!(
+        init_missing.kind(),
+        clap::error::ErrorKind::MissingRequiredArgument
+    );
 }
 
 #[test]
