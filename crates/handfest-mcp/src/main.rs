@@ -10,12 +10,13 @@ use std::time::Duration;
 
 use clap::error::ErrorKind;
 use clap::Parser;
-use handfest_anchors::{AnchorRegistry, SignedMandate};
+use handfest_anchors::{AnchorRegistry, SignedMandate, SignedRevocation};
 use handfest_core::ast::{parse_rfc3339_utc, KeyId};
 use handfest_core::exact_json::write_json_string;
 use handfest_ledger::SqliteLedger;
 use handfest_mcp::{
-    verify_mandate_chain_with, Clock, FixedClock, MappingError, McpProxy, ProxyError, SystemClock,
+    verify_mandate_chain_with, verify_revocations_with, Clock, FixedClock, MappingError, McpProxy,
+    ProxyError, SystemClock,
 };
 
 const CHILD_EXIT_GRACE_POLLS: usize = 20;
@@ -47,6 +48,10 @@ struct Cli {
     /// Optional fixed UTC evaluation timestamp in RFC 3339 format (YYYY-MM-DDTHH:MM:SSZ).
     #[arg(long)]
     now: Option<String>,
+
+    /// Optional signed revocation JSON files enforced alongside persisted ledger revocations (repeatable).
+    #[arg(long = "revocation")]
+    revocations: Vec<PathBuf>,
 
     /// Upstream MCP server command and arguments (passed after `--`).
     #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true)]
@@ -242,6 +247,11 @@ fn build_proxy(cli: &Cli) -> Result<McpProxy<RuntimeClock, SqliteLedger>, Startu
     let verified_chain = verify_mandate_chain_with(&verifier, &signed_chain).map_err(|err| {
         StartupError::ChainInvalid(format!("startup mandate chain verification failed: {err}"))
     })?;
+    let signed_revocations = load_signed_revocations(&cli.revocations)?;
+    let verified_revocations =
+        verify_revocations_with(&verifier, &signed_revocations).map_err(|err| {
+            StartupError::ChainInvalid(format!("startup revocation verification failed: {err}"))
+        })?;
 
     let actor_key = KeyId::parse(&cli.actor_key).map_err(|err| {
         StartupError::CliArgs(format!("invalid --actor-key '{}': {err}", cli.actor_key))
@@ -271,15 +281,34 @@ fn build_proxy(cli: &Cli) -> Result<McpProxy<RuntimeClock, SqliteLedger>, Startu
         ))
     })?;
 
-    McpProxy::new(verified_chain, actor_key, policy_map, ledger, clock).map_err(|err| match err {
-        ProxyError::Mapping(map_err) => {
-            StartupError::PolicyInvalid(format!("failed to initialize MCP proxy: {map_err}"))
-        }
-        ProxyError::InvalidChain(_) | ProxyError::Anchor(_) => {
-            StartupError::ChainInvalid(format!("failed to initialize MCP proxy: {err}"))
-        }
-        other => StartupError::RuntimeError(format!("failed to initialize MCP proxy: {other}")),
-    })
+    McpProxy::new(verified_chain, actor_key, policy_map, ledger, clock)
+        .map(|proxy| proxy.with_revocations(verified_revocations))
+        .map_err(|err| match err {
+            ProxyError::Mapping(map_err) => {
+                StartupError::PolicyInvalid(format!("failed to initialize MCP proxy: {map_err}"))
+            }
+            ProxyError::InvalidChain(_) | ProxyError::Anchor(_) => {
+                StartupError::ChainInvalid(format!("failed to initialize MCP proxy: {err}"))
+            }
+            other => StartupError::RuntimeError(format!("failed to initialize MCP proxy: {other}")),
+        })
+}
+
+fn load_signed_revocations(paths: &[PathBuf]) -> Result<Vec<SignedRevocation>, StartupError> {
+    let mut revocations = Vec::with_capacity(paths.len());
+    for path in paths {
+        let raw = fs::read_to_string(path).map_err(|err| {
+            StartupError::ChainIo(format!("failed to read '{}': {err}", path.display()))
+        })?;
+        let signed: SignedRevocation = serde_json::from_str(&raw).map_err(|err| {
+            StartupError::ChainInvalid(format!(
+                "invalid SignedRevocation JSON in '{}': {err}",
+                path.display()
+            ))
+        })?;
+        revocations.push(signed);
+    }
+    Ok(revocations)
 }
 
 fn load_signed_mandates(paths: &[PathBuf]) -> Result<Vec<SignedMandate>, StartupError> {

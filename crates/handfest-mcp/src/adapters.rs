@@ -4,10 +4,13 @@ use std::fmt;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use handfest_anchors::{
-    verify_verifier_postconditions, AnchorError, AnchorRegistry, AnchorVerifier, SignedMandate,
+    verify_revocations_with as verify_anchor_revocations_with, verify_verifier_postconditions,
+    AnchorError, AnchorRegistry, AnchorVerifier, SignedMandate, SignedRevocation,
 };
 use handfest_core::ast::MandateId;
-use handfest_core::gate::{verify_chain_structure, ChainStructureError, VerifiedMandate};
+use handfest_core::gate::{
+    verify_chain_structure, ChainStructureError, RevocationSnapshot, VerifiedMandate,
+};
 use handfest_ledger::LedgerError;
 
 use crate::mapping::MappingError;
@@ -188,6 +191,21 @@ pub fn verify_mandate_chain_with<V: AnchorVerifier + ?Sized>(
 /// Convenience wrapper verifying a mandate chain via [`AnchorRegistry::default_registry`].
 pub fn verify_mandate_chain(signed: &[SignedMandate]) -> Result<Vec<VerifiedMandate>, ProxyError> {
     verify_mandate_chain_with(&AnchorRegistry::default_registry(), signed)
+}
+
+/// Verifies a slice of [`SignedRevocation`] envelopes using a pluggable [`AnchorVerifier`] into a
+/// [`RevocationSnapshot`].
+pub fn verify_revocations_with<V: AnchorVerifier + ?Sized>(
+    verifier: &V,
+    signed: &[SignedRevocation],
+) -> Result<RevocationSnapshot, ProxyError> {
+    verify_anchor_revocations_with(verifier, signed).map_err(ProxyError::Anchor)
+}
+
+/// Convenience wrapper verifying [`SignedRevocation`] envelopes via
+/// [`AnchorRegistry::default_registry`].
+pub fn verify_revocations(signed: &[SignedRevocation]) -> Result<RevocationSnapshot, ProxyError> {
+    verify_revocations_with(&AnchorRegistry::default_registry(), signed)
 }
 
 pub(crate) fn validate_verified_chain(

@@ -15,6 +15,7 @@ pub use mapping::{
     ToolPolicyMap, TypedScalar,
 };
 pub use proxy::{
-    verify_mandate_chain, verify_mandate_chain_with, Clock, FixedClock, McpProxy, ProxyError,
-    SystemClock, DEFAULT_MAX_LINE_BYTES, DEFAULT_SHUTDOWN_TIMEOUT, HANDFEST_DENIED_ERROR_CODE,
+    verify_mandate_chain, verify_mandate_chain_with, verify_revocations, verify_revocations_with,
+    Clock, FixedClock, McpProxy, ProxyError, SystemClock, DEFAULT_MAX_LINE_BYTES,
+    DEFAULT_SHUTDOWN_TIMEOUT, HANDFEST_DENIED_ERROR_CODE,
 };

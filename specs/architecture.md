@@ -12,6 +12,7 @@
    - `child.limit <= parent.limit`, with runtime usage incremented atomically across every mandate in the chain.
 4. **Interchangeable trust anchors:** External identity and signature systems (Ed25519/OpenSSH, crypto wallets, Passkeys, EUDI `SD-JWT VC`/`mdoc`, eIDAS ETSI TS 119 612 QES) live in `handfest-anchors` and normalize into `VerifiedAnchorProof`.
 5. **Verifiable track record:** Every `Permit` or `Deny` ruling produces a hash-chained `DecisionReceipt` in `handfest-ledger`, enabling deterministic audit replay and actor track-record projections.
+6. **Cryptographic grant revocation (`HANDFEST REVOKE v1`):** Revocations use a bijective WYSIWYS grammar (`render(parse(canon)) == canon`), domain-separated trust-anchor signing (`b"handfest-v1-revoke\0"`, strictly disjoint from mandate signing), pure `#![no_std]` cascading chain evaluation (`RevocationSnapshot` -> typed `DenyReason::MandateRevoked` / `DenyReason::KeyRevoked`), and hash-chained tamper-evident persistence inside the same SQLite transaction as authorization and quota updates.
 
 ## Roadmap
 

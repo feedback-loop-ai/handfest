@@ -40,16 +40,35 @@ CREATE TABLE IF NOT EXISTS quota_sums (
     PRIMARY KEY (mandate_id, unit, field)
 )";
 
+const REVOCATIONS_CREATE_SQL: &str = "\
+CREATE TABLE IF NOT EXISTS revocations (
+    seq INTEGER PRIMARY KEY AUTOINCREMENT,
+    prev_entry_hash TEXT,
+    entry_hash TEXT NOT NULL UNIQUE,
+    revocation_id TEXT NOT NULL UNIQUE,
+    canonical_words TEXT NOT NULL,
+    anchor_id TEXT NOT NULL,
+    assurance TEXT NOT NULL,
+    actor_kind TEXT NOT NULL,
+    signer_key TEXT NOT NULL,
+    valid_from INTEGER NOT NULL,
+    valid_until INTEGER NOT NULL,
+    signature_hex TEXT NOT NULL
+)";
+
 const SQLITE_SEQUENCE_DDL: &str = "CREATE TABLE sqlite_sequence(name,seq)";
 
-const REQUIRED_SCHEMA_OBJECTS: [(&str, &str); 7] = [
+const REQUIRED_SCHEMA_OBJECTS: [(&str, &str); 10] = [
     ("table", "receipts"),
     ("table", "quota_calls"),
     ("table", "quota_sums"),
+    ("table", "revocations"),
     ("index", "idx_receipts_actor_key"),
     ("index", "sqlite_autoindex_receipts_1"),
     ("index", "sqlite_autoindex_quota_calls_1"),
     ("index", "sqlite_autoindex_quota_sums_1"),
+    ("index", "sqlite_autoindex_revocations_1"),
+    ("index", "sqlite_autoindex_revocations_2"),
 ];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -98,6 +117,7 @@ where
             IDX_RECEIPTS_ACTOR_KEY_CREATE_SQL,
             QUOTA_CALLS_CREATE_SQL,
             QUOTA_SUMS_CREATE_SQL,
+            REVOCATIONS_CREATE_SQL,
         ] {
             tx.execute_batch(ddl)?;
         }
@@ -156,6 +176,7 @@ fn validate_schema_object(row: &SchemaRow) -> Result<(), LedgerError> {
         ("table", "receipts") => ("receipts", Some(expected_ddl(RECEIPTS_CREATE_SQL))),
         ("table", "quota_calls") => ("quota_calls", Some(expected_ddl(QUOTA_CALLS_CREATE_SQL))),
         ("table", "quota_sums") => ("quota_sums", Some(expected_ddl(QUOTA_SUMS_CREATE_SQL))),
+        ("table", "revocations") => ("revocations", Some(expected_ddl(REVOCATIONS_CREATE_SQL))),
         ("table", "sqlite_sequence") => ("sqlite_sequence", Some(SQLITE_SEQUENCE_DDL.to_string())),
         ("index", "idx_receipts_actor_key") => (
             "receipts",
@@ -164,6 +185,8 @@ fn validate_schema_object(row: &SchemaRow) -> Result<(), LedgerError> {
         ("index", "sqlite_autoindex_receipts_1") => ("receipts", None),
         ("index", "sqlite_autoindex_quota_calls_1") => ("quota_calls", None),
         ("index", "sqlite_autoindex_quota_sums_1") => ("quota_sums", None),
+        ("index", "sqlite_autoindex_revocations_1") => ("revocations", None),
+        ("index", "sqlite_autoindex_revocations_2") => ("revocations", None),
         (other, name) => {
             return Err(LedgerError::Integrity(format!(
                 "unexpected {other} '{name}' in ledger schema"

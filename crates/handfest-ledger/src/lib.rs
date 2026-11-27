@@ -7,16 +7,22 @@ mod codec;
 mod lock_probe_test_util;
 mod preflight;
 mod quotas;
+mod revocations;
 mod schema;
 mod sqlite;
 
 use std::fmt;
 
 use handfest_core::ast::{KeyId, MandateId};
-use handfest_core::gate::{ActionRequest, DecisionReceipt, VerifiedFacts, VerifiedMandate};
+use handfest_core::gate::{
+    ActionRequest, DecisionReceipt, RevocationSnapshot, VerifiedFacts, VerifiedMandate,
+    VerifiedRevocation,
+};
+use handfest_core::revocation::RevocationId;
 use serde::{Deserialize, Serialize};
 
 pub use handfest_core::Verdict;
+pub use revocations::StoredRevocation;
 pub use sqlite::SqliteLedger;
 
 use crate::codec::key_id_serde;
@@ -117,7 +123,42 @@ pub trait ReceiptLedger {
         request: &ActionRequest,
         facts: &VerifiedFacts,
         now: i64,
+    ) -> Result<(Verdict, DecisionReceipt), LedgerError> {
+        self.evaluate_and_record_with_revocations(
+            chain,
+            request,
+            facts,
+            &RevocationSnapshot::new(),
+            now,
+        )
+    }
+
+    /// Atomically loads persisted revocations and prior quotas, merges `extra_revocations`,
+    /// evaluates `chain` via `handfest_core::gate::authorize_with_revocations`, records the
+    /// resulting hash-chained [`DecisionReceipt`], and on `Verdict::Permit` increments quotas
+    /// across every `MandateId` in `chain`.
+    fn evaluate_and_record_with_revocations(
+        &mut self,
+        chain: &[VerifiedMandate],
+        request: &ActionRequest,
+        facts: &VerifiedFacts,
+        extra_revocations: &RevocationSnapshot,
+        now: i64,
     ) -> Result<(Verdict, DecisionReceipt), LedgerError>;
+
+    /// Atomically persists a verified revocation into the tamper-evident ledger store without
+    /// modifying any mandate quota counters.
+    fn record_revocation(
+        &mut self,
+        revocation: &VerifiedRevocation,
+        signature_hex: &str,
+    ) -> Result<RevocationId, LedgerError>;
+
+    /// Loads and integrity-verifies all persisted revocations as a [`RevocationSnapshot`].
+    fn load_revocations(&self) -> Result<RevocationSnapshot, LedgerError>;
+
+    /// Loads and integrity-verifies all persisted [`StoredRevocation`] records in canonical order.
+    fn list_stored_revocations(&self) -> Result<Vec<StoredRevocation>, LedgerError>;
 
     /// Atomically builds a pre-gate denial receipt via
     /// `handfest_core::gate::build_denial_receipt` linked to the current hash-chain tip and

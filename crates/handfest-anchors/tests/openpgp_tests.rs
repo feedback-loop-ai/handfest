@@ -1307,3 +1307,42 @@ fn adversarial_truncated_signature_and_pubkey_bodies_fail_closed() {
         );
     }
 }
+
+#[test]
+fn openpgp_revocation_signs_and_verifies_via_registry() {
+    let sk = SigningKey::from_bytes(&[0x62; 32]);
+    let pubkey = sk.verifying_key().to_bytes();
+    let key_id = openpgp_ed25519_key_id(&pubkey);
+    let target = handfest_core::ast::MandateId::sha256(b"openpgp-rev-target");
+    let words = format!(
+        "HANDFEST REVOKE v1\n\
+         BY human \"Valentin\" (key: {key_id})\n\
+         TARGET mandate {target}\n\
+         EFFECTIVE 2026-11-26T17:15:00Z\n\
+         REASON \"openpgp kill\"\n"
+    );
+    let vf = ts("2026-11-26T17:00:00Z");
+    let vu = ts("2026-11-26T18:00:00Z");
+
+    let mut env = handfest_anchors::SignedRevocation {
+        canonical_words: words,
+        anchor_id: "yubikey-openpgp".to_string(),
+        assurance: "passkey".to_string(),
+        actor_kind: "human".to_string(),
+        signer_key: key_id.to_string(),
+        valid_from: vf,
+        valid_until: vu,
+        signature_hex: String::new(),
+    };
+    let payload = handfest_anchors::revocation_signing_payload(&env);
+    let sig_pkt = build_v4_sig_packet(&sk, &payload, 8, &[], &[], PacketHeaderFormat::Old1);
+    env.signature_hex = hex::encode(sig_pkt);
+
+    let verified = handfest_anchors::verify_revocation_openpgp_ed25519(&env)
+        .expect("verify OpenPGP revocation");
+    assert_eq!(verified.proof.assurance, AssuranceLevel::Passkey);
+    assert_eq!(
+        handfest_anchors::verify_revocation(&env).expect("verify via default registry"),
+        verified
+    );
+}

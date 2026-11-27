@@ -1083,3 +1083,42 @@ fn ssh_sk_review_remediation_up_uv_flags_and_inner_sig_blob_truncation() {
         ));
     }
 }
+
+#[test]
+fn ssh_sk_signer_signs_and_verifies_revocation_via_registry() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let sk = SigningKey::from_bytes(&[0x61; 32]);
+    let pub_line = format_openssh_pub(&sk, "ssh:", Some("yubikey-rev"));
+    let key_path = dir.path().join("id_ed25519_sk");
+    let pub_path = dir.path().join("id_ed25519_sk.pub");
+    fs::write(&key_path, "dummy-handle").unwrap();
+    fs::write(&pub_path, &pub_line).unwrap();
+
+    let runner = FakeSshKeygenRunner::new(sk, "ssh:");
+    let signer = SshSkSigner::from_key_path(&key_path, runner).unwrap();
+    let target = MandateId::sha256(b"ssh-sk-rev-target");
+    let words = format!(
+        "HANDFEST REVOKE v1\n\
+         BY human \"Valentin\" (key: {})\n\
+         TARGET mandate {target}\n\
+         EFFECTIVE 2026-11-26T17:15:00Z\n\
+         REASON \"ssh-sk kill\"\n",
+        signer.key_id()
+    );
+    let signed = handfest_anchors::sign_revocation_with(
+        &signer,
+        &words,
+        "yubikey-ssh-sk",
+        ts("2026-11-26T17:00:00Z"),
+        ts("2026-11-26T18:00:00Z"),
+    )
+    .expect("sign SSH-SK revocation");
+
+    let verified = handfest_anchors::verify_revocation_ssh_sk_ed25519(&signed)
+        .expect("verify SSH-SK revocation");
+    assert_eq!(verified.proof.assurance, AssuranceLevel::Passkey);
+    assert_eq!(
+        handfest_anchors::verify_revocation(&signed).expect("verify via default registry"),
+        verified
+    );
+}

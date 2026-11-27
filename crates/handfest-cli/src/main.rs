@@ -2,6 +2,7 @@
 
 mod facts;
 mod policy_check;
+mod revoke;
 mod sign;
 
 use std::fs;
@@ -13,7 +14,7 @@ use clap::{Parser, Subcommand};
 use handfest_anchors::{verify_chain, Ed25519Keypair, SignedMandate, SshSkPublicKey};
 use handfest_core::ast::{is_valid_timestamp, parse_rfc3339_utc, KeyId};
 use handfest_core::cnl::{parse_mandate, try_render_canonical};
-use handfest_core::gate::ActionRequest;
+use handfest_core::gate::{check_chain_revocations, ActionRequest};
 use handfest_core::lattice::subsumes;
 use handfest_core::Verdict;
 use handfest_ledger::{LedgerError, SqliteLedger};
@@ -21,6 +22,10 @@ use serde_json::json;
 
 use crate::facts::parse_facts_arg;
 use crate::policy_check::resolve_policy_map_request;
+use crate::revoke::{
+    current_utc_unix_seconds, load_and_verify_revocations, run_revoke_cli,
+    verify_stored_revocations_signatures, RevokeCliArgs,
+};
 use crate::sign::{build_piv_signer_config, cmd_sign, SignArgs, SignerConfig};
 
 #[derive(Debug, Parser)]
@@ -131,11 +136,22 @@ enum Commands {
         #[arg(long)]
         out: Option<PathBuf>,
     },
-    /// Verifies 1+ signed mandates as a delegation chain (signatures + lattice narrowing).
+    /// Signs a canonical HANDFEST REVOKE v1 statement and optionally records it in a ledger.
+    Revoke(RevokeCliArgs),
+    /// Verifies 1+ signed mandates as a delegation chain (signatures + lattice narrowing + revocations).
     Verify {
         /// Ordered signed mandate JSON files (root first, leaf last).
         #[arg(required = true)]
         signed: Vec<PathBuf>,
+        /// Optional signed revocation JSON files to check against the chain (repeatable).
+        #[arg(long = "revocation")]
+        revocations: Vec<PathBuf>,
+        /// Optional SQLite ledger database path whose persisted revocations are also checked.
+        #[arg(long)]
+        ledger: Option<PathBuf>,
+        /// Optional evaluation UTC timestamp for checking revocation EFFECTIVE times (defaults to now).
+        #[arg(long)]
+        now: Option<String>,
     },
     /// Evaluates a request against a mandate chain, records receipt & quotas in SQLite,
     /// and exits 0 on Permit or non-zero on Deny.
@@ -188,6 +204,9 @@ enum Commands {
         /// Fail closed unless the ledger already exists and has a valid initialized schema.
         #[arg(long, default_value_t = false)]
         require_existing_ledger: bool,
+        /// Optional signed revocation JSON files to enforce alongside ledger revocations (repeatable).
+        #[arg(long = "revocation")]
+        revocations: Vec<PathBuf>,
     },
     /// Verifies ledger hash-chain integrity and optionally prints an actor's TrackRecord.
     Audit {
@@ -231,27 +250,16 @@ fn run(cli: Cli) -> Result<ExitCode, String> {
             anchor_id,
             out,
         } => {
-            let signer = match (key, ssh_key, fido2_cred, gpg_key, piv_pubkey) {
-                (Some(key_path), None, None, None, None) => SignerConfig::LocalEd25519 { key_path },
-                (None, Some(key_path), None, None, None) => SignerConfig::SshSkEd25519 { key_path },
-                (None, None, Some(cred_path), None, None) => SignerConfig::Fido2Ed25519 {
-                    cred_path,
-                    device_path: fido2_device,
-                },
-                (None, None, None, Some(fingerprint), None) => {
-                    SignerConfig::OpenPgpEd25519 { fingerprint }
-                }
-                (None, None, None, None, Some(pubkey_path)) => SignerConfig::PivEd25519 {
-                    pubkey_path,
-                    config: build_piv_signer_config(piv_module, piv_id)?,
-                },
-                _ => {
-                    return Err(
-                        "exactly one of --key, --ssh-key, --fido2-cred, --gpg-key, or --piv-pubkey must be supplied"
-                            .to_string(),
-                    );
-                }
-            };
+            let signer = build_signer_config(
+                key,
+                ssh_key,
+                fido2_cred,
+                fido2_device,
+                gpg_key,
+                piv_pubkey,
+                piv_module,
+                piv_id,
+            )?;
             let anchor_id = anchor_id.unwrap_or_else(|| signer.default_anchor_id().to_string());
             cmd_sign(&SignArgs {
                 mandate_path: mandate,
@@ -262,7 +270,13 @@ fn run(cli: Cli) -> Result<ExitCode, String> {
                 out,
             })
         }
-        Commands::Verify { signed } => cmd_verify(&signed),
+        Commands::Revoke(args) => run_revoke_cli(args),
+        Commands::Verify {
+            signed,
+            revocations,
+            ledger,
+            now,
+        } => cmd_verify(&signed, &revocations, ledger.as_deref(), now.as_deref()),
         Commands::Check {
             ledger,
             chain,
@@ -276,6 +290,7 @@ fn run(cli: Cli) -> Result<ExitCode, String> {
             tool_input,
             now,
             require_existing_ledger,
+            revocations,
         } => {
             let source = match (policy_map, tool_name) {
                 (Some(policy_map), Some(tool_name)) => CheckSource::PolicyMap {
@@ -301,6 +316,7 @@ fn run(cli: Cli) -> Result<ExitCode, String> {
                 source,
                 now,
                 require_existing_ledger,
+                revocations,
             })
         }
         Commands::Audit { ledger, actor_key } => cmd_audit(&ledger, actor_key.as_deref()),
@@ -328,6 +344,42 @@ struct CheckArgs {
     source: CheckSource,
     now: String,
     require_existing_ledger: bool,
+    revocations: Vec<PathBuf>,
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "maps clap signer CLI flags directly into SignerConfig"
+)]
+pub(crate) fn build_signer_config(
+    key: Option<PathBuf>,
+    ssh_key: Option<PathBuf>,
+    fido2_cred: Option<PathBuf>,
+    fido2_device: Option<String>,
+    gpg_key: Option<String>,
+    piv_pubkey: Option<PathBuf>,
+    piv_module: Option<String>,
+    piv_id: Option<String>,
+) -> Result<SignerConfig, String> {
+    match (key, ssh_key, fido2_cred, gpg_key, piv_pubkey) {
+        (Some(key_path), None, None, None, None) => Ok(SignerConfig::LocalEd25519 { key_path }),
+        (None, Some(key_path), None, None, None) => Ok(SignerConfig::SshSkEd25519 { key_path }),
+        (None, None, Some(cred_path), None, None) => Ok(SignerConfig::Fido2Ed25519 {
+            cred_path,
+            device_path: fido2_device,
+        }),
+        (None, None, None, Some(fingerprint), None) => {
+            Ok(SignerConfig::OpenPgpEd25519 { fingerprint })
+        }
+        (None, None, None, None, Some(pubkey_path)) => Ok(SignerConfig::PivEd25519 {
+            pubkey_path,
+            config: build_piv_signer_config(piv_module, piv_id)?,
+        }),
+        _ => Err(
+            "exactly one of --key, --ssh-key, --fido2-cred, --gpg-key, or --piv-pubkey must be supplied"
+                .to_string(),
+        ),
+    }
 }
 
 fn cmd_fmt(file: &Path) -> Result<ExitCode, String> {
@@ -360,7 +412,12 @@ fn cmd_keyid(ssh_key_path: &Path) -> Result<ExitCode, String> {
     println!("{}", pub_key.key_id());
     Ok(ExitCode::SUCCESS)
 }
-fn cmd_verify(paths: &[PathBuf]) -> Result<ExitCode, String> {
+fn cmd_verify(
+    paths: &[PathBuf],
+    revocation_paths: &[PathBuf],
+    ledger_path: Option<&Path>,
+    now_raw: Option<&str>,
+) -> Result<ExitCode, String> {
     let signed = load_signed_mandates(paths)?;
     let verified =
         verify_chain(&signed).map_err(|err| format!("signature verification failed: {err}"))?;
@@ -377,19 +434,44 @@ fn cmd_verify(paths: &[PathBuf]) -> Result<ExitCode, String> {
         })?;
     }
 
-    let mut chain_ids = Vec::with_capacity(verified.len());
+    let mut chain_id_strings = Vec::with_capacity(verified.len());
     for vm in &verified {
         let mid = vm
             .ast
             .try_mandate_id()
             .map_err(|err| format!("failed to hash mandate: {err}"))?;
-        chain_ids.push(mid.to_string());
+        chain_id_strings.push(mid.to_string());
+    }
+
+    let mut revocations = load_and_verify_revocations(revocation_paths)?;
+    if let Some(lp) = ledger_path {
+        let ledger = SqliteLedger::open_read_only(lp)
+            .map_err(|err| format!("failed to open ledger '{}': {err}", lp.display()))?;
+        let stored = ledger
+            .list_stored_revocations()
+            .map_err(|err| format!("failed to load ledger revocations: {err}"))?;
+        verify_stored_revocations_signatures(&stored)?;
+        for record in stored {
+            revocations.insert(record.verified).map_err(|err| {
+                format!("invalid stored revocation {}: {err}", record.revocation_id)
+            })?;
+        }
+    }
+
+    if !revocations.is_empty() || now_raw.is_some() {
+        let now = match now_raw {
+            Some(raw) => parse_timestamp_arg("now", raw)?,
+            None => current_utc_unix_seconds()?,
+        };
+        if let Err(deny) = check_chain_revocations(&verified, &revocations, now) {
+            return Err(format!("mandate chain revoked: {deny}"));
+        }
     }
 
     let output = json!({
         "status": "verified",
         "hops": verified.len(),
-        "chain_ids": chain_ids,
+        "chain_ids": chain_id_strings,
     });
     println!(
         "{}",
@@ -436,6 +518,7 @@ fn cmd_check(args: &CheckArgs) -> Result<ExitCode, String> {
     let signed = load_signed_mandates(&args.chain)?;
     let verified =
         verify_chain(&signed).map_err(|err| format!("signature verification failed: {err}"))?;
+    let extra_revocations = load_and_verify_revocations(&args.revocations)?;
 
     let mut ledger = if args.require_existing_ledger {
         match SqliteLedger::open_existing(&args.ledger) {
@@ -450,7 +533,7 @@ fn cmd_check(args: &CheckArgs) -> Result<ExitCode, String> {
             .map_err(|err| format!("failed to open ledger '{}': {err}", args.ledger.display()))?
     };
     let (verdict, receipt) = ledger
-        .evaluate_and_record(&verified, &request, &facts, now)
+        .evaluate_and_record_with_revocations(&verified, &request, &facts, &extra_revocations, now)
         .map_err(|err| format!("ledger evaluation failed: {err}"))?;
 
     match verdict {
@@ -514,6 +597,11 @@ fn cmd_audit(ledger_path: &Path, actor_key_raw: Option<&str>) -> Result<ExitCode
     let (verified_receipts, track_record) = ledger
         .audit_snapshot(actor_key.as_ref())
         .map_err(|err| format!("audit integrity check failed: {err}"))?;
+    let stored_revocations = ledger
+        .list_stored_revocations()
+        .map_err(|err| format!("audit revocation check failed: {err}"))?;
+    verify_stored_revocations_signatures(&stored_revocations)
+        .map_err(|err| format!("audit revocation signature check failed: {err}"))?;
 
     let output = match track_record {
         Some(record) => json!({

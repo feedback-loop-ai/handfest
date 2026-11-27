@@ -9,12 +9,20 @@ use alloc::vec::Vec;
 use sha2::{Digest, Sha256};
 
 use crate::ast::{
-    is_valid_ident, is_valid_quoted_str, is_valid_timestamp, try_format_rfc3339_utc, AstError,
-    Decimal, HandfestAst, KeyId, MandateId, Predicate, PredicateOp, Quota, Scalar,
+    is_valid_ident, is_valid_quoted_str, is_valid_timestamp, AstError, Decimal, HandfestAst, KeyId,
+    MandateId, Predicate, PredicateOp, Quota, Scalar,
 };
 use crate::gate_errors::ProofMetaError;
 pub use crate::gate_errors::{ChainStructureError, ProofShapeError, RuntimeChainError};
+use crate::gate_format::{
+    format_action, format_fact_scalar, format_resource, hash_str, write_escaped_receipt_quoted,
+    write_escaped_receipt_token,
+};
 use crate::lattice::{scalar_satisfies, subsumes_with_parent_id, NarrowError};
+pub use crate::revocation::{
+    check_chain_revocations, DenyReason, RevocationProofError, RevocationSnapshot,
+    VerifiedRevocation,
+};
 use crate::{ActorKind, AssuranceLevel, Verdict};
 
 /// Normalized cryptographic / regulatory verification proof supplied by an external trust anchor.
@@ -201,80 +209,37 @@ impl DecisionReceipt {
     }
 }
 
-fn hash_str(hasher: &mut Sha256, s: &str) {
-    hasher.update((s.len() as u64).to_be_bytes());
-    hasher.update(s.as_bytes());
-}
-
-fn write_escaped_receipt_token(out: &mut String, value: &str) {
-    for ch in value.chars() {
-        match ch {
-            '\\' => out.push_str("\\\\"),
-            c if c.is_control() => {
-                for esc in c.escape_default() {
-                    out.push(esc);
-                }
-            }
-            c => out.push(c),
-        }
-    }
-}
-
-fn write_escaped_receipt_quoted(out: &mut String, value: &str) {
-    out.push('"');
-    for ch in value.chars() {
-        match ch {
-            '"' => out.push_str("\\\""),
-            '\\' => out.push_str("\\\\"),
-            c if c.is_control() => {
-                for esc in c.escape_default() {
-                    out.push(esc);
-                }
-            }
-            c => out.push(c),
-        }
-    }
-    out.push('"');
-}
-
-fn format_action(action: &str) -> String {
-    let mut out = String::with_capacity(action.len());
-    write_escaped_receipt_token(&mut out, action);
-    out
-}
-
-fn format_resource(kind: &str, id: &str) -> String {
-    let mut out = String::with_capacity(kind.len() + id.len() + 3);
-    write_escaped_receipt_token(&mut out, kind);
-    out.push(' ');
-    write_escaped_receipt_quoted(&mut out, id);
-    out
-}
-
-fn format_fact_scalar(val: &Scalar) -> String {
-    match val {
-        Scalar::Str(s) => {
-            let mut out = String::with_capacity(s.len() + 2);
-            write_escaped_receipt_quoted(&mut out, s);
-            out
-        }
-        Scalar::Timestamp(ts) => {
-            try_format_rfc3339_utc(*ts).unwrap_or_else(|_| format!("Timestamp({ts})"))
-        }
-        Scalar::Decimal(d) => format!("{d}"),
-        Scalar::Int(n) => format!("{n}"),
-        Scalar::Bool(b) => (if *b { "true" } else { "false" }).to_string(),
-    }
-}
-
 /// Deterministically evaluates a full delegation chain against a concrete request, verified facts,
-/// prior chain-wide quota usage, and explicit UTC timestamp `now`.
+/// prior chain-wide quota usage, and explicit UTC timestamp `now` (with an empty revocation snapshot).
 #[must_use]
 pub fn authorize(
     chain: &[VerifiedMandate],
     request: &ActionRequest,
     facts: &VerifiedFacts,
     usage: &QuotaSnapshot,
+    now: i64,
+    prev_receipt_hash: Option<MandateId>,
+) -> (Verdict, DecisionReceipt) {
+    authorize_with_revocations(
+        chain,
+        request,
+        facts,
+        usage,
+        &RevocationSnapshot::new(),
+        now,
+        prev_receipt_hash,
+    )
+}
+
+/// Deterministically evaluates a full delegation chain against a concrete request, verified facts,
+/// prior chain-wide quota usage, verified revocations, and explicit UTC timestamp `now`.
+#[must_use]
+pub fn authorize_with_revocations(
+    chain: &[VerifiedMandate],
+    request: &ActionRequest,
+    facts: &VerifiedFacts,
+    usage: &QuotaSnapshot,
+    revocations: &RevocationSnapshot,
     now: i64,
     prev_receipt_hash: Option<MandateId>,
 ) -> (Verdict, DecisionReceipt) {
@@ -294,7 +259,7 @@ pub fn authorize(
 
     let verdict = match ast_error {
         Some(reason) => Verdict::Deny { reason },
-        None => match evaluate_chain(chain, &chain_ids, request, facts, usage, now) {
+        None => match evaluate_chain(chain, &chain_ids, request, facts, usage, revocations, now) {
             Ok(()) => Verdict::Permit,
             Err(reason) => Verdict::Deny { reason },
         },
@@ -443,10 +408,13 @@ fn evaluate_chain(
     request: &ActionRequest,
     facts: &VerifiedFacts,
     usage: &QuotaSnapshot,
+    revocations: &RevocationSnapshot,
     now: i64,
 ) -> Result<(), String> {
     verify_chain_runtime_prevalidated(chain, Some(chain_ids), &request.actor_key, now)
         .map_err(|err| err.to_string())?;
+    crate::revocation::check_chain_revocations_with_ids(chain, chain_ids, revocations, now)
+        .map_err(|deny| deny.to_string())?;
 
     if !is_valid_concrete_action(&request.action) {
         return Err(format!(

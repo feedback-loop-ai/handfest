@@ -3,14 +3,16 @@
 
 use ed25519_dalek::{Signature, VerifyingKey};
 use handfest_core::ast::KeyId;
-use handfest_core::gate::{VerifiedAnchorProof, VerifiedMandate};
+use handfest_core::gate::{VerifiedAnchorProof, VerifiedMandate, VerifiedRevocation};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::base64::{decode_standard, encode_standard};
 use crate::{
-    decode_lower_hex_var, parse_hex32_key_id, signing_payload, validate_envelope_header,
-    AnchorError, AnchorVerifier, AssuranceLevel, CommandRunner, MandateSigner, SignedMandate,
+    decode_lower_hex_var, parse_hex32_key_id,
+    revocation::{revocation_signing_payload, validate_revocation_header},
+    signing_payload, validate_envelope_header, AnchorError, AnchorVerifier, AssuranceLevel,
+    CommandRunner, MandateSigner, SignedMandate, SignedRevocation,
 };
 
 /// Canonical `KeyId` scheme for FIDO2 / WebAuthn Ed25519 (`COSE alg = -8`) keys.
@@ -159,6 +161,44 @@ impl AnchorVerifier for Fido2Ed25519Verifier {
     fn verify(&self, signed: &SignedMandate) -> Result<VerifiedMandate, AnchorError> {
         verify_fido2_ed25519(signed)
     }
+
+    fn verify_revocation(
+        &self,
+        signed: &SignedRevocation,
+    ) -> Result<VerifiedRevocation, AnchorError> {
+        verify_revocation_fido2_ed25519(signed)
+    }
+}
+
+/// Verifies a single FIDO2 / WebAuthn Ed25519 [`SignedRevocation`] envelope offline in pure Rust.
+pub fn verify_revocation_fido2_ed25519(
+    signed: &SignedRevocation,
+) -> Result<VerifiedRevocation, AnchorError> {
+    let header = validate_revocation_header(signed, FIDO2_ED25519_SCHEME, AssuranceLevel::Passkey)?;
+    let raw_envelope = decode_lower_hex_var(&signed.signature_hex, MAX_ENVELOPE_BYTES)
+        .map_err(AnchorError::InvalidSignature)?;
+    let envelope = Fido2AssertionEnvelope::decode(&raw_envelope)?;
+    verify_auth_data_invariants(&envelope.auth_data, &envelope.rp_id)?;
+
+    let client_data_hash = sha256_bytes(&revocation_signing_payload(signed));
+    verify_assertion_signature(
+        &header.verifying_key,
+        &envelope.auth_data,
+        &client_data_hash,
+        &envelope.signature,
+    )?;
+
+    Ok(VerifiedRevocation {
+        ast: header.ast,
+        proof: VerifiedAnchorProof {
+            anchor_id: signed.anchor_id.clone(),
+            assurance: header.assurance,
+            signer_key: header.signer_key,
+            actor_kind: header.actor_kind,
+            valid_from: signed.valid_from,
+            valid_until: signed.valid_until,
+        },
+    })
 }
 
 /// Verifies a single FIDO2 / WebAuthn Ed25519 [`SignedMandate`] envelope offline in pure Rust.

@@ -29,6 +29,7 @@ use crate::ActorKind;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AstError {
     InvalidMandateId(String),
+    InvalidRevocationId(String),
     InvalidKeyId(String),
     InvalidActionPat(String),
     InvalidResourceKind(String),
@@ -48,6 +49,7 @@ impl fmt::Display for AstError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::InvalidMandateId(msg) => write!(f, "invalid mandate id: {msg}"),
+            Self::InvalidRevocationId(msg) => write!(f, "invalid revocation id: {msg}"),
             Self::InvalidKeyId(msg) => write!(f, "invalid key id: {msg}"),
             Self::InvalidActionPat(msg) => write!(f, "invalid action pattern: {msg}"),
             Self::InvalidResourceKind(msg) => write!(f, "invalid resource kind: {msg}"),
@@ -89,44 +91,55 @@ impl MandateId {
 
     /// Parses a strict `sha256:<64-lowercase-hex>` digest string.
     pub fn parse(input: &str) -> Result<Self, AstError> {
-        let Some(hex) = input.strip_prefix("sha256:") else {
-            return Err(AstError::InvalidMandateId(
-                "must start with 'sha256:'".to_string(),
-            ));
-        };
-        if hex.len() != 64 {
-            return Err(AstError::InvalidMandateId(
-                "expected 64 lowercase hex characters".to_string(),
-            ));
-        }
-        let mut bytes = [0u8; 32];
-        let raw = hex.as_bytes();
-        for (i, slot) in bytes.iter_mut().enumerate() {
-            let hi = decode_lower_hex(raw[i * 2])?;
-            let lo = decode_lower_hex(raw[i * 2 + 1])?;
-            *slot = (hi << 4) | lo;
-        }
-        Ok(Self(bytes))
+        parse_sha256_digest(input)
+            .map(Self)
+            .map_err(AstError::InvalidMandateId)
     }
 }
 
-fn decode_lower_hex(b: u8) -> Result<u8, AstError> {
+pub(crate) fn sha256_bytes(bytes: &[u8]) -> [u8; 32] {
+    let digest = Sha256::digest(bytes);
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&digest);
+    out
+}
+
+pub(crate) fn parse_sha256_digest(input: &str) -> Result<[u8; 32], String> {
+    let Some(hex) = input.strip_prefix("sha256:") else {
+        return Err("must start with 'sha256:'".to_string());
+    };
+    if hex.len() != 64 {
+        return Err("expected 64 lowercase hex characters".to_string());
+    }
+    let mut bytes = [0u8; 32];
+    let raw = hex.as_bytes();
+    for (i, slot) in bytes.iter_mut().enumerate() {
+        let hi = decode_lower_hex(raw[i * 2])?;
+        let lo = decode_lower_hex(raw[i * 2 + 1])?;
+        *slot = (hi << 4) | lo;
+    }
+    Ok(bytes)
+}
+
+fn decode_lower_hex(b: u8) -> Result<u8, String> {
     match b {
         b'0'..=b'9' => Ok(b - b'0'),
         b'a'..=b'f' => Ok(b - b'a' + 10),
-        _ => Err(AstError::InvalidMandateId(
-            "digest must contain only lowercase hex digits".to_string(),
-        )),
+        _ => Err("digest must contain only lowercase hex digits".to_string()),
     }
+}
+
+pub(crate) fn fmt_sha256_digest(bytes: &[u8; 32], f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    f.write_str("sha256:")?;
+    for byte in bytes {
+        write!(f, "{byte:02x}")?;
+    }
+    Ok(())
 }
 
 impl fmt::Display for MandateId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str("sha256:")?;
-        for byte in self.0 {
-            write!(f, "{byte:02x}")?;
-        }
-        Ok(())
+        fmt_sha256_digest(&self.0, f)
     }
 }
 
@@ -176,7 +189,7 @@ pub(crate) fn is_valid_key_value(s: &str) -> bool {
             .all(|b| b.is_ascii_graphic() && !matches!(b, b',' | b'(' | b')' | b'"'))
 }
 
-pub(super) fn validate_quoted_str(value: &str, context: &str) -> Result<(), AstError> {
+pub(crate) fn validate_quoted_str(value: &str, context: &str) -> Result<(), AstError> {
     if !is_valid_quoted_str(value) {
         return Err(AstError::InvalidString(format!(
             "{context} must not contain control characters"
@@ -326,7 +339,7 @@ impl ActorDecl {
         &self.attrs
     }
 
-    fn canonicalize(&mut self) {
+    pub(crate) fn canonicalize(&mut self) {
         for v in self.attrs.values_mut() {
             if let Scalar::Decimal(d) = v {
                 *d = d.canonical();

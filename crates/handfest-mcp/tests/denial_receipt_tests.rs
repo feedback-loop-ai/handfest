@@ -11,7 +11,7 @@ use handfest_anchors::{Ed25519Keypair, SignedMandate};
 use handfest_core::ast::{parse_rfc3339_utc, KeyId, MandateId};
 use handfest_core::cnl::{parse_mandate, try_render_canonical};
 use handfest_core::gate::{
-    authorize, build_denial_receipt, ActionRequest, DecisionReceipt, QuotaSnapshot, VerifiedFacts,
+    build_denial_receipt, ActionRequest, DecisionReceipt, QuotaSnapshot, VerifiedFacts,
     VerifiedMandate,
 };
 use handfest_core::{ActorKind, Verdict};
@@ -30,17 +30,47 @@ struct RecordingLedger {
 }
 
 impl ReceiptLedger for RecordingLedger {
-    fn evaluate_and_record(
+    fn evaluate_and_record_with_revocations(
         &mut self,
         chain: &[VerifiedMandate],
         request: &ActionRequest,
         facts: &VerifiedFacts,
+        extra_revocations: &handfest_core::gate::RevocationSnapshot,
         now: i64,
     ) -> Result<(Verdict, DecisionReceipt), LedgerError> {
         let prev = self.receipts.last().map(|r| r.receipt_hash);
-        let (verdict, receipt) = authorize(chain, request, facts, &QuotaSnapshot::new(), now, prev);
+        let (verdict, receipt) = handfest_core::gate::authorize_with_revocations(
+            chain,
+            request,
+            facts,
+            &QuotaSnapshot::new(),
+            extra_revocations,
+            now,
+            prev,
+        );
         self.receipts.push(receipt.clone());
         Ok((verdict, receipt))
+    }
+
+    fn record_revocation(
+        &mut self,
+        revocation: &handfest_core::gate::VerifiedRevocation,
+        _signature_hex: &str,
+    ) -> Result<handfest_core::revocation::RevocationId, LedgerError> {
+        revocation
+            .ast
+            .try_revocation_id()
+            .map_err(|err| LedgerError::Integrity(err.to_string()))
+    }
+
+    fn load_revocations(&self) -> Result<handfest_core::gate::RevocationSnapshot, LedgerError> {
+        Ok(handfest_core::gate::RevocationSnapshot::new())
+    }
+
+    fn list_stored_revocations(
+        &self,
+    ) -> Result<Vec<handfest_ledger::StoredRevocation>, LedgerError> {
+        Ok(Vec::new())
     }
 
     fn record_denial(

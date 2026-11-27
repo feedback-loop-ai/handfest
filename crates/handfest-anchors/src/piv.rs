@@ -6,12 +6,13 @@ use std::path::{Path, PathBuf};
 
 use ed25519_dalek::{Signature, VerifyingKey};
 use handfest_core::ast::KeyId;
-use handfest_core::gate::VerifiedMandate;
+use handfest_core::gate::{VerifiedMandate, VerifiedRevocation};
 use rand_core::{OsRng, RngCore};
 
 use crate::{
-    verify_ed25519_for_scheme, AnchorError, AnchorVerifier, AssuranceLevel, CommandRunner,
-    MandateSigner, SignedMandate, SystemCommandRunner,
+    revocation::verify_revocation_ed25519_for_scheme, verify_ed25519_for_scheme, AnchorError,
+    AnchorVerifier, AssuranceLevel, CommandRunner, MandateSigner, SignedMandate, SignedRevocation,
+    SystemCommandRunner,
 };
 
 /// Canonical `KeyId` scheme for YubiKey PIV Ed25519 smartcard keys.
@@ -53,6 +54,21 @@ impl AnchorVerifier for PivEd25519Verifier {
     fn verify(&self, signed: &SignedMandate) -> Result<VerifiedMandate, AnchorError> {
         verify_piv_ed25519(signed)
     }
+
+    fn verify_revocation(
+        &self,
+        signed: &SignedRevocation,
+    ) -> Result<VerifiedRevocation, AnchorError> {
+        verify_revocation_piv_ed25519(signed)
+    }
+}
+
+/// Verifies a single PIV Ed25519 (`piv-ed25519:<hex>`) [`SignedRevocation`] envelope and returns a
+/// [`VerifiedRevocation`] with [`AssuranceLevel::Passkey`].
+pub fn verify_revocation_piv_ed25519(
+    signed: &SignedRevocation,
+) -> Result<VerifiedRevocation, AnchorError> {
+    verify_revocation_ed25519_for_scheme(signed, PIV_ED25519_SCHEME, AssuranceLevel::Passkey)
 }
 
 /// Verifies a single PIV Ed25519 (`piv-ed25519:<hex>`) [`SignedMandate`] envelope and returns a

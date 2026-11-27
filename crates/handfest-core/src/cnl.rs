@@ -37,7 +37,7 @@ impl core::error::Error for ParseError {}
 
 /// Parses a `HANDFEST v1` Controlled-English mandate into a typed `HandfestAst`.
 pub fn parse_mandate(input: &str) -> Result<HandfestAst, ParseError> {
-    let lines = split_lines(input)?;
+    let lines = split_lines_with_header(input, MANDATE_VERSION, "mandate")?;
     let mut idx = 0usize;
 
     expect_exact_line(&lines, &mut idx, MANDATE_VERSION)?;
@@ -158,7 +158,7 @@ pub(crate) fn write_quoted(out: &mut String, value: &str) {
     out.push('"');
 }
 
-fn write_actor(out: &mut String, actor: &ActorDecl) {
+pub(crate) fn write_actor(out: &mut String, actor: &ActorDecl) {
     out.push_str(actor_kind_str(actor.kind()));
     out.push(' ');
     write_quoted(out, actor.name());
@@ -247,18 +247,22 @@ fn write_quota(out: &mut String, quota: &Quota) {
     }
 }
 
-fn split_lines(input: &str) -> Result<Vec<&str>, ParseError> {
+pub(crate) fn split_lines_with_header<'a>(
+    input: &'a str,
+    expected_header: &str,
+    kind: &str,
+) -> Result<Vec<&'a str>, ParseError> {
     if input.is_empty() {
         return Err(ParseError::Syntax {
             line: 1,
-            message: format!("expected '{MANDATE_VERSION}', found end of input"),
+            message: format!("expected '{expected_header}', found end of input"),
         });
     }
     let Some(trimmed) = input.strip_suffix('\n') else {
         let line = input.bytes().filter(|&b| b == b'\n').count() + 1;
         return Err(ParseError::Syntax {
             line,
-            message: "mandate must end with a trailing newline ('\\n')".into(),
+            message: format!("{kind} must end with a trailing newline ('\\n')"),
         });
     };
     let trimmed = trimmed.strip_suffix('\r').unwrap_or(trimmed);
@@ -268,7 +272,11 @@ fn split_lines(input: &str) -> Result<Vec<&str>, ParseError> {
         .collect())
 }
 
-fn expect_exact_line(lines: &[&str], idx: &mut usize, expected: &str) -> Result<(), ParseError> {
+pub(crate) fn expect_exact_line(
+    lines: &[&str],
+    idx: &mut usize,
+    expected: &str,
+) -> Result<(), ParseError> {
     let line_no = *idx + 1;
     let Some(&line) = lines.get(*idx) else {
         return Err(ParseError::Syntax {
@@ -302,7 +310,7 @@ fn parse_optional_parent(lines: &[&str], idx: &mut usize) -> Result<Option<Manda
     Ok(Some(digest))
 }
 
-fn parse_actor_line(
+pub(crate) fn parse_actor_line(
     lines: &[&str],
     idx: &mut usize,
     keyword: &str,
@@ -644,14 +652,14 @@ fn looks_like_timestamp(tok: &str) -> bool {
     b.len() >= 5 && b[0..4].iter().all(u8::is_ascii_digit) && b[4] == b'-'
 }
 
-struct Cursor<'a> {
+pub(crate) struct Cursor<'a> {
     input: &'a str,
     pos: usize,
     line: usize,
 }
 
 impl<'a> Cursor<'a> {
-    const fn new(input: &'a str, line: usize) -> Self {
+    pub(crate) const fn new(input: &'a str, line: usize) -> Self {
         Self {
             input,
             pos: 0,
@@ -671,14 +679,14 @@ impl<'a> Cursor<'a> {
         self.pos += n;
     }
 
-    fn syntax(&self, message: String) -> ParseError {
+    pub(crate) fn syntax(&self, message: String) -> ParseError {
         ParseError::Syntax {
             line: self.line,
             message,
         }
     }
 
-    const fn ast(&self, error: AstError) -> ParseError {
+    pub(crate) const fn ast(&self, error: AstError) -> ParseError {
         ParseError::Ast {
             line: self.line,
             error,
@@ -691,7 +699,7 @@ impl<'a> Cursor<'a> {
         }
     }
 
-    fn expect_spaces(&mut self) -> Result<(), ParseError> {
+    pub(crate) fn expect_spaces(&mut self) -> Result<(), ParseError> {
         let start = self.pos;
         self.skip_spaces();
         if self.pos == start {
@@ -709,7 +717,7 @@ impl<'a> Cursor<'a> {
         }
     }
 
-    fn expect_str(&mut self, expected: &str) -> Result<(), ParseError> {
+    pub(crate) fn expect_str(&mut self, expected: &str) -> Result<(), ParseError> {
         if self.rest().starts_with(expected) {
             self.pos += expected.len();
             Ok(())
@@ -739,7 +747,7 @@ impl<'a> Cursor<'a> {
         true
     }
 
-    fn take_while(&mut self, pred: impl Fn(u8) -> bool) -> &'a str {
+    pub(crate) fn take_while(&mut self, pred: impl Fn(u8) -> bool) -> &'a str {
         let start = self.pos;
         let bytes = self.input.as_bytes();
         while self.pos < bytes.len() && pred(bytes[self.pos]) {
@@ -748,7 +756,7 @@ impl<'a> Cursor<'a> {
         &self.input[start..self.pos]
     }
 
-    fn take_ident(&mut self) -> Result<&'a str, ParseError> {
+    pub(crate) fn take_ident(&mut self) -> Result<&'a str, ParseError> {
         let tok = self.take_while(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-');
         if !is_valid_ident(tok) {
             return Err(self.ast(AstError::InvalidIdent(tok.to_string())));
@@ -774,7 +782,7 @@ impl<'a> Cursor<'a> {
             .map_err(|_| self.syntax(format!("invalid unsigned integer '{tok}'")))
     }
 
-    fn take_quoted(&mut self) -> Result<String, ParseError> {
+    pub(crate) fn take_quoted(&mut self) -> Result<String, ParseError> {
         self.expect_char('"')?;
         let mut out = String::new();
         let mut chars = self.rest().char_indices();
@@ -806,7 +814,7 @@ impl<'a> Cursor<'a> {
         Err(self.syntax("unterminated quoted string".into()))
     }
 
-    fn expect_eol(&mut self) -> Result<(), ParseError> {
+    pub(crate) fn expect_eol(&mut self) -> Result<(), ParseError> {
         self.skip_spaces();
         if self.pos < self.input.len() {
             return Err(self.syntax(format!("unexpected trailing text '{}'", self.rest())));

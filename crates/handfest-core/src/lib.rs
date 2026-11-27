@@ -10,14 +10,19 @@ pub mod cnl;
 pub mod exact_json;
 pub mod gate;
 mod gate_errors;
+mod gate_format;
 pub mod json_num;
 pub mod lattice;
 pub mod policy;
+pub mod revocation;
 
 use alloc::string::String;
 
 /// Current canonical wire and Controlled-English version header.
 pub const MANDATE_VERSION: &str = "HANDFEST v1";
+
+/// Current canonical wire and Controlled-English revocation version header.
+pub const REVOCATION_VERSION: &str = "HANDFEST REVOKE v1";
 
 /// Actor class participating in a mandate chain.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]

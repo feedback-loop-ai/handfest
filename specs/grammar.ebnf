@@ -37,3 +37,16 @@ bool           = "true" | "false" ;
 digest         = "sha256:" hex64 ;
 key_id         = ident ":" non_ws ;
 NL             = "\n" ;
+
+(* HANDFEST REVOKE v1 — Canonical Controlled-English Revocation Grammar *)
+(* Bijective with RevocationAst in handfest-core. *)
+
+revocation     = "HANDFEST REVOKE v1" NL
+                 "BY " actor_decl NL
+                 "TARGET " revoke_target NL
+                 "EFFECTIVE " rfc3339_ts NL
+                 [ "REASON " non_empty_quoted_str NL ] ;
+
+revoke_target  = "mandate " digest
+               | "key " key_id ;
+non_empty_quoted_str = '"' non_empty_str_chars '"' ;

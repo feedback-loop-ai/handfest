@@ -8,12 +8,13 @@ use std::fmt;
 
 use ed25519_dalek::{Signature, VerifyingKey};
 use handfest_core::ast::KeyId;
-use handfest_core::gate::{VerifiedAnchorProof, VerifiedMandate};
+use handfest_core::gate::{VerifiedAnchorProof, VerifiedMandate, VerifiedRevocation};
 use sha2::{Digest, Sha256, Sha512};
 
 use crate::{
     decode_lower_hex_vec, signing_payload, validate_envelope_header, AnchorError, AnchorVerifier,
-    AssuranceLevel, CommandRunner, MandateSigner, SignedMandate, SystemCommandRunner,
+    AssuranceLevel, CommandRunner, MandateSigner, SignedMandate, SignedRevocation,
+    SystemCommandRunner,
 };
 
 /// Canonical `KeyId` scheme for OpenPGP / GPG smartcard Ed25519 trust anchors.
@@ -50,6 +51,13 @@ pub struct OpenPgpEd25519Verifier;
 impl AnchorVerifier for OpenPgpEd25519Verifier {
     fn verify(&self, signed: &SignedMandate) -> Result<VerifiedMandate, AnchorError> {
         verify_openpgp_ed25519(signed)
+    }
+
+    fn verify_revocation(
+        &self,
+        signed: &SignedRevocation,
+    ) -> Result<VerifiedRevocation, AnchorError> {
+        crate::verify_revocation_openpgp_ed25519(signed)
     }
 }
 
@@ -548,7 +556,7 @@ fn parse_v4_eddsa_signature(packet_bytes: &[u8]) -> Result<ParsedV4Signature<'_>
     })
 }
 
-fn verify_openpgp_detached_signature(
+pub(crate) fn verify_openpgp_detached_signature(
     verifying_key: &VerifyingKey,
     payload: &[u8],
     packet_bytes: &[u8],

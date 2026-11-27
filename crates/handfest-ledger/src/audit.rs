@@ -11,6 +11,7 @@ use crate::codec::{
     col_i64, col_opt_i64, col_opt_text, col_text, format_resource, parse_chain_ids_json,
     parse_optional_mandate_id, parse_verdict,
 };
+use crate::revocations::verify_and_load_revocations;
 use crate::schema::verify_schema_integrity;
 use crate::{LedgerError, TrackRecord};
 
@@ -146,9 +147,10 @@ fn verify_and_project_in_conn<F: FnOnce()>(
     }
 
     after_receipts_scan();
-    verify_sqlite_sequence_hwm(conn, expected_seq - 1)?;
+    verify_sqlite_sequence_hwm(conn, "receipts", expected_seq - 1)?;
     verify_quota_calls_consistency(conn, &expected_calls)?;
     verify_quota_sums_consistency(conn, &expected_calls)?;
+    let _ = verify_and_load_revocations(conn)?;
     Ok(count)
 }
 
@@ -166,7 +168,11 @@ fn record_expected_permit_calls(
     Ok(())
 }
 
-fn verify_sqlite_sequence_hwm(conn: &Connection, count_i64: i64) -> Result<(), LedgerError> {
+pub(crate) fn verify_sqlite_sequence_hwm(
+    conn: &Connection,
+    table: &str,
+    count_i64: i64,
+) -> Result<(), LedgerError> {
     let has_seq_table: bool = conn
         .query_row(
             "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'sqlite_sequence'",
@@ -179,14 +185,14 @@ fn verify_sqlite_sequence_hwm(conn: &Connection, count_i64: i64) -> Result<(), L
     if !has_seq_table {
         if count_i64 > 0 {
             return Err(LedgerError::Integrity(format!(
-                "missing sqlite_sequence table for non-empty receipts ledger ({count_i64} rows)"
+                "missing sqlite_sequence table for non-empty {table} table ({count_i64} rows)"
             )));
         }
         return Ok(());
     }
 
-    let mut stmt = conn.prepare("SELECT seq FROM sqlite_sequence WHERE name = 'receipts'")?;
-    let mut rows = stmt.query([])?;
+    let mut stmt = conn.prepare("SELECT seq FROM sqlite_sequence WHERE name = ?1")?;
+    let mut rows = stmt.query([table])?;
     let mut hwms = Vec::new();
     while let Some(row) = rows.next()? {
         let seq = col_opt_i64(row, 0, "sqlite_sequence.seq")?;
@@ -196,17 +202,17 @@ fn verify_sqlite_sequence_hwm(conn: &Connection, count_i64: i64) -> Result<(), L
     match hwms.as_slice() {
         [] if count_i64 == 0 => Ok(()),
         [] => Err(LedgerError::Integrity(format!(
-            "missing sqlite_sequence row for receipts ({count_i64} rows present)"
+            "missing sqlite_sequence row for {table} ({count_i64} rows present)"
         ))),
         [Some(seq)] if *seq == count_i64 => Ok(()),
         [Some(seq)] => Err(LedgerError::Integrity(format!(
-            "sqlite_sequence high-water mark mismatch for receipts: expected {count_i64}, got {seq}"
+            "sqlite_sequence high-water mark mismatch for {table}: expected {count_i64}, got {seq}"
         ))),
-        [None] => Err(LedgerError::Integrity(
-            "invalid NULL sqlite_sequence high-water mark for receipts".to_string(),
-        )),
+        [None] => Err(LedgerError::Integrity(format!(
+            "invalid NULL sqlite_sequence high-water mark for {table}"
+        ))),
         _ => Err(LedgerError::Integrity(format!(
-            "duplicate sqlite_sequence rows for receipts: expected at most 1, found {}",
+            "duplicate sqlite_sequence rows for {table}: expected at most 1, found {}",
             hwms.len()
         ))),
     }
@@ -440,9 +446,9 @@ mod tests {
     #[test]
     fn sqlite_sequence_hwm_covers_missing_table_missing_row_and_null_seq() {
         let no_seq = Connection::open_in_memory().unwrap();
-        verify_sqlite_sequence_hwm(&no_seq, 0).unwrap();
+        verify_sqlite_sequence_hwm(&no_seq, "receipts", 0).unwrap();
         assert!(matches!(
-            verify_sqlite_sequence_hwm(&no_seq, 1),
+            verify_sqlite_sequence_hwm(&no_seq, "receipts", 1),
             Err(LedgerError::Integrity(_))
         ));
 
@@ -450,9 +456,9 @@ mod tests {
         with_seq
             .execute_batch("CREATE TABLE receipts (seq INTEGER PRIMARY KEY AUTOINCREMENT);")
             .unwrap();
-        verify_sqlite_sequence_hwm(&with_seq, 0).unwrap();
+        verify_sqlite_sequence_hwm(&with_seq, "receipts", 0).unwrap();
         assert!(matches!(
-            verify_sqlite_sequence_hwm(&with_seq, 1),
+            verify_sqlite_sequence_hwm(&with_seq, "receipts", 1),
             Err(LedgerError::Integrity(_))
         ));
 
@@ -463,7 +469,7 @@ mod tests {
             )
             .unwrap();
         assert!(matches!(
-            verify_sqlite_sequence_hwm(&with_seq, 1),
+            verify_sqlite_sequence_hwm(&with_seq, "receipts", 1),
             Err(LedgerError::Integrity(_))
         ));
 
@@ -474,7 +480,7 @@ mod tests {
             )
             .unwrap();
         assert!(matches!(
-            verify_sqlite_sequence_hwm(&with_seq, 1),
+            verify_sqlite_sequence_hwm(&with_seq, "receipts", 1),
             Err(LedgerError::Integrity(_))
         ));
     }

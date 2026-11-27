@@ -1,3 +1,4 @@
+use handfest_core::gate::authorize;
 use std::sync::mpsc;
 
 use handfest_core::ast::{parse_rfc3339_utc, Scalar};

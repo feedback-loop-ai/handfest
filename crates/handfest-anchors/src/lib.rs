@@ -7,7 +7,7 @@ use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 use handfest_core::ast::{HandfestAst, KeyId, MAX_RFC3339_TIMESTAMP, MIN_RFC3339_TIMESTAMP};
 use handfest_core::cnl::{parse_canonical, try_render_canonical, ParseError};
 use handfest_core::gate::{
-    validate_proof_shape, ProofShapeError, VerifiedAnchorProof, VerifiedMandate,
+    validate_proof_shape, ProofShapeError, VerifiedAnchorProof, VerifiedMandate, VerifiedRevocation,
 };
 use handfest_core::ActorKind;
 use rand_core::OsRng;
@@ -17,14 +17,15 @@ mod base64;
 mod fido2;
 mod openpgp;
 mod piv;
+mod revocation;
 mod signer;
 mod ssh_sk;
 
 pub use fido2::{
     discover_fido2_device, format_fido2_ed25519_key_id, verify_fido2_ed25519,
-    Fido2AssertionEnvelope, Fido2CredentialFile, Fido2Ed25519Signer, Fido2Ed25519Verifier,
-    DEFAULT_FIDO2_RP_ID, FIDO2_ED25519_SCHEME, FIDO2_ENVELOPE_VERSION, FIDO2_FLAG_UP,
-    MIN_AUTH_DATA_LEN,
+    verify_revocation_fido2_ed25519, Fido2AssertionEnvelope, Fido2CredentialFile,
+    Fido2Ed25519Signer, Fido2Ed25519Verifier, DEFAULT_FIDO2_RP_ID, FIDO2_ED25519_SCHEME,
+    FIDO2_ENVELOPE_VERSION, FIDO2_FLAG_UP, MIN_AUTH_DATA_LEN,
 };
 pub use handfest_core::AssuranceLevel;
 pub use openpgp::{
@@ -33,15 +34,22 @@ pub use openpgp::{
 };
 pub use piv::{
     parse_ed25519_spki_der, parse_ed25519_spki_pem, piv_ed25519_key_id, verify_piv_ed25519,
-    PivEd25519Signer, PivEd25519Verifier, PivPinSource, PivSignerConfig, DEFAULT_PIV_KEY_ID,
-    DEFAULT_PIV_PIN_ENV, DEFAULT_PKCS11_MODULE, ED25519_SPKI_DER_PREFIX, PIV_ED25519_SCHEME,
+    verify_revocation_piv_ed25519, PivEd25519Signer, PivEd25519Verifier, PivPinSource,
+    PivSignerConfig, DEFAULT_PIV_KEY_ID, DEFAULT_PIV_PIN_ENV, DEFAULT_PKCS11_MODULE,
+    ED25519_SPKI_DER_PREFIX, PIV_ED25519_SCHEME,
+};
+pub use revocation::{
+    revocation_signing_payload, sign_revocation_with, verify_revocation, verify_revocation_ed25519,
+    verify_revocation_openpgp_ed25519, verify_revocation_verifier_postconditions,
+    verify_revocation_with, verify_revocations, verify_revocations_with, SignedRevocation,
+    REVOCATION_SIGNING_DOMAIN_PREFIX,
 };
 pub use signer::{
     sign_mandate_with, CommandOutput, CommandRunner, MandateSigner, SystemCommandRunner,
 };
 pub use ssh_sk::{
-    verify_ssh_sk_ed25519, SshSkEd25519Verifier, SshSkPublicKey, SshSkSigner, SSHSIG_NAMESPACE,
-    SSH_SK_ED25519_SCHEME, SSH_SK_ED25519_SSH_TYPE,
+    verify_revocation_ssh_sk_ed25519, verify_ssh_sk_ed25519, SshSkEd25519Verifier, SshSkPublicKey,
+    SshSkSigner, SSHSIG_NAMESPACE, SSH_SK_ED25519_SCHEME, SSH_SK_ED25519_SSH_TYPE,
 };
 
 /// Domain-separation prefix prepended to length-prefixed envelope metadata and canonical
@@ -53,6 +61,7 @@ pub const SIGNING_DOMAIN_PREFIX: &[u8] = b"handfest-v1-envelope\0";
 pub enum ProofIdentitySource {
     Envelope,
     Mandate,
+    Revocation,
 }
 
 impl ProofIdentitySource {
@@ -60,6 +69,7 @@ impl ProofIdentitySource {
         match self {
             Self::Envelope => "envelope",
             Self::Mandate => "mandate FROM",
+            Self::Revocation => "revocation BY",
         }
     }
 }
@@ -72,6 +82,7 @@ pub enum AnchorError {
     InvalidSignature(String),
     InvalidConfig(String),
     NonCanonicalMandate(ParseError),
+    NonCanonicalRevocation(ParseError),
     SignerMismatch {
         expected: String,
         actual: String,
@@ -138,6 +149,9 @@ impl fmt::Display for AnchorError {
             Self::InvalidSignature(msg) => write!(f, "invalid anchor signature: {msg}"),
             Self::InvalidConfig(msg) => write!(f, "invalid anchor configuration: {msg}"),
             Self::NonCanonicalMandate(err) => write!(f, "invalid or non-canonical mandate: {err}"),
+            Self::NonCanonicalRevocation(err) => {
+                write!(f, "invalid or non-canonical revocation: {err}")
+            }
             Self::SignerMismatch { expected, actual } => {
                 write!(f, "signer key mismatch: mandate FROM is '{expected}', envelope has '{actual}'")
             }
@@ -218,7 +232,7 @@ impl fmt::Display for AnchorError {
 impl std::error::Error for AnchorError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            Self::NonCanonicalMandate(err) => Some(err),
+            Self::NonCanonicalMandate(err) | Self::NonCanonicalRevocation(err) => Some(err),
             Self::ChainHop { source, .. } => Some(source.as_ref()),
             _ => None,
         }
@@ -345,6 +359,18 @@ impl Ed25519Keypair {
     ) -> Result<SignedMandate, AnchorError> {
         sign_mandate_with(self, canonical_words, anchor_id, valid_from, valid_until)
     }
+
+    /// Signs strictly canonical `HANDFEST REVOKE v1` text and all envelope metadata with domain
+    /// separation `b"handfest-v1-revoke\0"`.
+    pub fn sign_revocation(
+        &self,
+        canonical_words: &str,
+        anchor_id: impl Into<String>,
+        valid_from: i64,
+        valid_until: i64,
+    ) -> Result<SignedRevocation, AnchorError> {
+        sign_revocation_with(self, canonical_words, anchor_id, valid_from, valid_until)
+    }
 }
 
 impl MandateSigner for Ed25519Keypair {
@@ -365,6 +391,17 @@ impl MandateSigner for Ed25519Keypair {
 /// Pluggable verifier interface turning a [`SignedMandate`] into a [`VerifiedMandate`].
 pub trait AnchorVerifier {
     fn verify(&self, signed: &SignedMandate) -> Result<VerifiedMandate, AnchorError>;
+
+    /// Verifies a [`SignedRevocation`] envelope into a [`VerifiedRevocation`].
+    fn verify_revocation(
+        &self,
+        signed: &SignedRevocation,
+    ) -> Result<VerifiedRevocation, AnchorError> {
+        let scheme = KeyId::parse(&signed.signer_key)
+            .map(|k| k.scheme().to_string())
+            .unwrap_or_else(|_| signed.signer_key.clone());
+        Err(AnchorError::UnsupportedKeyScheme(scheme))
+    }
 }
 
 /// Strict Ed25519 WYSIWYS trust-anchor verifier (`AssuranceLevel::LocalKey`).
@@ -374,6 +411,13 @@ pub struct Ed25519Verifier;
 impl AnchorVerifier for Ed25519Verifier {
     fn verify(&self, signed: &SignedMandate) -> Result<VerifiedMandate, AnchorError> {
         verify_ed25519(signed)
+    }
+
+    fn verify_revocation(
+        &self,
+        signed: &SignedRevocation,
+    ) -> Result<VerifiedRevocation, AnchorError> {
+        verify_revocation_ed25519(signed)
     }
 }
 
@@ -437,6 +481,22 @@ impl AnchorVerifier for AnchorRegistry {
         let vm = verifier.verify(signed)?;
         verify_verifier_postconditions(signed, &vm)?;
         Ok(vm)
+    }
+
+    fn verify_revocation(
+        &self,
+        signed: &SignedRevocation,
+    ) -> Result<VerifiedRevocation, AnchorError> {
+        let key_id = KeyId::parse(&signed.signer_key).map_err(|err| {
+            AnchorError::InvalidPublicKey(format!("invalid KeyId '{}': {err}", signed.signer_key))
+        })?;
+        let verifier = self
+            .verifiers
+            .get(key_id.scheme())
+            .ok_or_else(|| AnchorError::UnsupportedKeyScheme(key_id.scheme().to_string()))?;
+        let vr = verifier.verify_revocation(signed)?;
+        verify_revocation_verifier_postconditions(signed, &vr)?;
+        Ok(vr)
     }
 }
 
@@ -679,25 +739,53 @@ pub fn verify_chain(mandates: &[SignedMandate]) -> Result<Vec<VerifiedMandate>, 
 /// Binds `anchor_id`, `assurance`, `actor_kind`, `signer_key`, `valid_from`, `valid_until`,
 /// and `canonical_words` unambiguously so tampering with any envelope field invalidates the
 /// signature.
+pub(crate) struct EnvelopeFields<'a> {
+    pub(crate) anchor_id: &'a str,
+    pub(crate) assurance: &'a str,
+    pub(crate) actor_kind: &'a str,
+    pub(crate) signer_key: &'a str,
+    pub(crate) valid_from: i64,
+    pub(crate) valid_until: i64,
+    pub(crate) canonical_words: &'a str,
+}
+
+pub(crate) fn build_envelope_signing_payload(
+    domain_prefix: &[u8],
+    fields: EnvelopeFields<'_>,
+) -> Vec<u8> {
+    let capacity = domain_prefix.len()
+        + (8 * 7)
+        + fields.anchor_id.len()
+        + fields.assurance.len()
+        + fields.actor_kind.len()
+        + fields.signer_key.len()
+        + fields.canonical_words.len();
+    let mut payload = Vec::with_capacity(capacity);
+    payload.extend_from_slice(domain_prefix);
+    push_len_prefixed_str(&mut payload, fields.anchor_id);
+    push_len_prefixed_str(&mut payload, fields.assurance);
+    push_len_prefixed_str(&mut payload, fields.actor_kind);
+    push_len_prefixed_str(&mut payload, fields.signer_key);
+    payload.extend_from_slice(&fields.valid_from.to_be_bytes());
+    payload.extend_from_slice(&fields.valid_until.to_be_bytes());
+    push_len_prefixed_str(&mut payload, fields.canonical_words);
+    payload
+}
+
 #[must_use]
 pub fn signing_payload(signed: &SignedMandate) -> Vec<u8> {
-    let capacity = SIGNING_DOMAIN_PREFIX.len()
-        + (8 * 7)
-        + signed.anchor_id.len()
-        + signed.assurance.len()
-        + signed.actor_kind.len()
-        + signed.signer_key.len()
-        + signed.canonical_words.len();
-    let mut payload = Vec::with_capacity(capacity);
-    payload.extend_from_slice(SIGNING_DOMAIN_PREFIX);
-    push_len_prefixed_str(&mut payload, &signed.anchor_id);
-    push_len_prefixed_str(&mut payload, &signed.assurance);
-    push_len_prefixed_str(&mut payload, &signed.actor_kind);
-    push_len_prefixed_str(&mut payload, &signed.signer_key);
-    payload.extend_from_slice(&signed.valid_from.to_be_bytes());
-    payload.extend_from_slice(&signed.valid_until.to_be_bytes());
-    push_len_prefixed_str(&mut payload, &signed.canonical_words);
-    payload
+    build_envelope_signing_payload(
+        SIGNING_DOMAIN_PREFIX,
+        EnvelopeFields {
+            anchor_id: &signed.anchor_id,
+            assurance: &signed.assurance,
+            actor_kind: &signed.actor_kind,
+            signer_key: &signed.signer_key,
+            valid_from: signed.valid_from,
+            valid_until: signed.valid_until,
+            canonical_words: &signed.canonical_words,
+        },
+    )
 }
 
 fn push_len_prefixed_str(buf: &mut Vec<u8>, value: &str) {

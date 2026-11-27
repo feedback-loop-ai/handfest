@@ -7,8 +7,10 @@ use std::time::Duration;
 
 use handfest_core::ast::{KeyId, MandateId};
 use handfest_core::gate::{
-    authorize, build_denial_receipt, ActionRequest, DecisionReceipt, VerifiedFacts, VerifiedMandate,
+    authorize_with_revocations, build_denial_receipt, ActionRequest, DecisionReceipt,
+    RevocationSnapshot, VerifiedFacts, VerifiedMandate, VerifiedRevocation,
 };
+use handfest_core::revocation::RevocationId;
 use handfest_core::Verdict;
 use rusqlite::{
     params, Connection, OpenFlags, OptionalExtension, Transaction, TransactionBehavior,
@@ -17,8 +19,9 @@ use rusqlite::{
 use crate::audit::{run_audit_tx, run_verified_track_record};
 use crate::preflight::{open_read_only_guarded, open_writable_guarded, ActiveHandleGuard};
 use crate::quotas::{apply_quota_updates, compute_quota_updates, load_quota_snapshot};
-use crate::schema::{initialize_or_verify_schema, verify_existing_schema};
-use crate::{LedgerError, ReceiptLedger, TrackRecord};
+use crate::revocations::{record_revocation_tx, verify_and_load_revocations};
+use crate::schema::{initialize_or_verify_schema, verify_existing_schema, verify_schema_integrity};
+use crate::{LedgerError, ReceiptLedger, StoredRevocation, TrackRecord};
 
 const BUSY_TIMEOUT_MS: u64 = 5_000;
 pub(crate) const EXISTING_LEDGER_OPEN_FLAGS: OpenFlags =
@@ -174,6 +177,27 @@ impl SqliteLedger {
         facts: &VerifiedFacts,
         now: i64,
     ) -> Result<(Verdict, DecisionReceipt), LedgerError> {
+        self.evaluate_and_record_with_revocations(
+            chain,
+            request,
+            facts,
+            &RevocationSnapshot::new(),
+            now,
+        )
+    }
+
+    /// Atomically loads persisted revocations (verifying their integrity), merges
+    /// `extra_revocations`, loads prior quotas, evaluates `chain` via
+    /// `handfest_core::gate::authorize_with_revocations`, persists the hash-chained
+    /// `DecisionReceipt`, and on `Permit` increments quotas across every `MandateId` in `chain`.
+    pub fn evaluate_and_record_with_revocations(
+        &mut self,
+        chain: &[VerifiedMandate],
+        request: &ActionRequest,
+        facts: &VerifiedFacts,
+        extra_revocations: &RevocationSnapshot,
+        now: i64,
+    ) -> Result<(Verdict, DecisionReceipt), LedgerError> {
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -181,8 +205,18 @@ impl SqliteLedger {
         let prev_receipt_hash = load_latest_receipt_hash(&tx)?;
         let chain_ids: Vec<MandateId> = chain.iter().map(|vm| vm.ast.mandate_id()).collect();
         let usage = load_quota_snapshot(&tx, &chain_ids)?;
+        let (_, mut revocations) = verify_and_load_revocations(&tx)?;
+        revocations.extend_from(extra_revocations);
 
-        let (verdict, receipt) = authorize(chain, request, facts, &usage, now, prev_receipt_hash);
+        let (verdict, receipt) = authorize_with_revocations(
+            chain,
+            request,
+            facts,
+            &usage,
+            &revocations,
+            now,
+            prev_receipt_hash,
+        );
 
         let quota_updates = if verdict == Verdict::Permit {
             Some(compute_quota_updates(chain, &chain_ids, facts, &usage)?)
@@ -198,6 +232,41 @@ impl SqliteLedger {
 
         tx.commit()?;
         Ok((verdict, receipt))
+    }
+
+    /// Atomically persists a verified revocation into the tamper-evident `revocations` hash chain
+    /// without modifying any quota counters or receipts.
+    pub fn record_revocation(
+        &mut self,
+        revocation: &VerifiedRevocation,
+        signature_hex: &str,
+    ) -> Result<RevocationId, LedgerError> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let revocation_id = record_revocation_tx(&tx, revocation, signature_hex)?;
+        tx.commit()?;
+        Ok(revocation_id)
+    }
+
+    /// Loads and integrity-verifies all persisted revocations as a [`RevocationSnapshot`] inside
+    /// a single read transaction.
+    pub fn load_revocations(&self) -> Result<RevocationSnapshot, LedgerError> {
+        let tx = self.conn.unchecked_transaction()?;
+        verify_schema_integrity(&tx)?;
+        let (_, snapshot) = verify_and_load_revocations(&tx)?;
+        tx.commit()?;
+        Ok(snapshot)
+    }
+
+    /// Loads and integrity-verifies all persisted [`StoredRevocation`] records inside a single
+    /// read transaction.
+    pub fn list_stored_revocations(&self) -> Result<Vec<StoredRevocation>, LedgerError> {
+        let tx = self.conn.unchecked_transaction()?;
+        verify_schema_integrity(&tx)?;
+        let (stored, _) = verify_and_load_revocations(&tx)?;
+        tx.commit()?;
+        Ok(stored)
     }
 
     /// Verifies receipt `seq` contiguity (`1..=count`), hash-chain continuity from genesis
@@ -262,14 +331,38 @@ impl SqliteLedger {
 }
 
 impl ReceiptLedger for SqliteLedger {
-    fn evaluate_and_record(
+    fn evaluate_and_record_with_revocations(
         &mut self,
         chain: &[VerifiedMandate],
         request: &ActionRequest,
         facts: &VerifiedFacts,
+        extra_revocations: &RevocationSnapshot,
         now: i64,
     ) -> Result<(Verdict, DecisionReceipt), LedgerError> {
-        Self::evaluate_and_record(self, chain, request, facts, now)
+        Self::evaluate_and_record_with_revocations(
+            self,
+            chain,
+            request,
+            facts,
+            extra_revocations,
+            now,
+        )
+    }
+
+    fn record_revocation(
+        &mut self,
+        revocation: &VerifiedRevocation,
+        signature_hex: &str,
+    ) -> Result<RevocationId, LedgerError> {
+        Self::record_revocation(self, revocation, signature_hex)
+    }
+
+    fn load_revocations(&self) -> Result<RevocationSnapshot, LedgerError> {
+        Self::load_revocations(self)
+    }
+
+    fn list_stored_revocations(&self) -> Result<Vec<StoredRevocation>, LedgerError> {
+        Self::list_stored_revocations(self)
     }
 
     fn record_denial(

@@ -7,13 +7,14 @@ use std::path::{Path, PathBuf};
 
 use ed25519_dalek::{Signature, VerifyingKey};
 use handfest_core::ast::KeyId;
-use handfest_core::gate::{VerifiedAnchorProof, VerifiedMandate};
+use handfest_core::gate::{VerifiedAnchorProof, VerifiedMandate, VerifiedRevocation};
 use sha2::{Digest, Sha256, Sha512};
 
 use crate::{
-    decode_lower_hex_vec, parse_canonical_ed25519_verifying_key, signing_payload,
-    validate_envelope_header, AnchorError, AnchorVerifier, AssuranceLevel, CommandRunner,
-    MandateSigner, SignedMandate,
+    decode_lower_hex_vec, parse_canonical_ed25519_verifying_key,
+    revocation::{revocation_signing_payload, validate_revocation_header},
+    signing_payload, validate_envelope_header, AnchorError, AnchorVerifier, AssuranceLevel,
+    CommandRunner, MandateSigner, SignedMandate, SignedRevocation,
 };
 
 /// `KeyId` scheme for OpenSSH FIDO2 hardware-backed Ed25519 keys.
@@ -230,6 +231,38 @@ impl AnchorVerifier for SshSkEd25519Verifier {
     fn verify(&self, signed: &SignedMandate) -> Result<VerifiedMandate, AnchorError> {
         verify_ssh_sk_ed25519(signed)
     }
+
+    fn verify_revocation(
+        &self,
+        signed: &SignedRevocation,
+    ) -> Result<VerifiedRevocation, AnchorError> {
+        verify_revocation_ssh_sk_ed25519(signed)
+    }
+}
+
+/// Verifies a single OpenSSH `sk-ssh-ed25519@openssh.com` `SSHSIG` [`SignedRevocation`] envelope
+/// and returns a [`VerifiedRevocation`] with `AssuranceLevel::Passkey`.
+pub fn verify_revocation_ssh_sk_ed25519(
+    signed: &SignedRevocation,
+) -> Result<VerifiedRevocation, AnchorError> {
+    let header =
+        validate_revocation_header(signed, SSH_SK_ED25519_SCHEME, AssuranceLevel::Passkey)?;
+    let sshsig_bytes =
+        decode_lower_hex_vec(&signed.signature_hex).map_err(AnchorError::InvalidSignature)?;
+    let payload = revocation_signing_payload(signed);
+    let _parsed = verify_sshsig_blob(&sshsig_bytes, &header.verifying_key, &payload)?;
+
+    Ok(VerifiedRevocation {
+        ast: header.ast,
+        proof: VerifiedAnchorProof {
+            anchor_id: signed.anchor_id.clone(),
+            assurance: header.assurance,
+            signer_key: header.signer_key,
+            actor_kind: header.actor_kind,
+            valid_from: signed.valid_from,
+            valid_until: signed.valid_until,
+        },
+    })
 }
 
 /// Verifies a single OpenSSH `sk-ssh-ed25519@openssh.com` `SSHSIG` [`SignedMandate`] envelope

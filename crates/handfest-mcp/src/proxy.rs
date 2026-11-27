@@ -7,7 +7,8 @@ use std::time::Duration;
 
 use handfest_core::ast::{KeyId, MandateId};
 use handfest_core::gate::{
-    evaluate_predicate_if_known, verify_chain_runtime, ActionRequest, VerifiedMandate,
+    check_chain_revocations, evaluate_predicate_if_known, verify_chain_runtime, ActionRequest,
+    RevocationSnapshot, VerifiedMandate,
 };
 use handfest_core::Verdict;
 pub use handfest_ledger::ReceiptLedger;
@@ -15,7 +16,8 @@ use handfest_ledger::SqliteLedger;
 
 use crate::adapters::validate_verified_chain;
 pub use crate::adapters::{
-    verify_mandate_chain, verify_mandate_chain_with, Clock, FixedClock, ProxyError, SystemClock,
+    verify_mandate_chain, verify_mandate_chain_with, verify_revocations, verify_revocations_with,
+    Clock, FixedClock, ProxyError, SystemClock,
 };
 use crate::exact_json::ExactJson;
 use crate::framing::{
@@ -43,6 +45,7 @@ pub struct McpProxy<C: Clock, L: ReceiptLedger = SqliteLedger> {
     pub(crate) policy_map: CompiledPolicyMap,
     pub(crate) ledger: L,
     pub(crate) clock: C,
+    pub(crate) extra_revocations: RevocationSnapshot,
     pub(crate) max_line_bytes: usize,
     pub(crate) shutdown_timeout: Duration,
 }
@@ -80,9 +83,17 @@ impl<C: Clock, L: ReceiptLedger> McpProxy<C, L> {
             policy_map,
             ledger,
             clock,
+            extra_revocations: RevocationSnapshot::new(),
             max_line_bytes: DEFAULT_MAX_LINE_BYTES,
             shutdown_timeout: DEFAULT_SHUTDOWN_TIMEOUT,
         })
+    }
+
+    /// Attaches static verified revocations enforced alongside revocations persisted in `ledger`.
+    #[must_use]
+    pub fn with_revocations(mut self, revocations: RevocationSnapshot) -> Self {
+        self.extra_revocations = revocations;
+        self
     }
 
     /// Overrides the maximum accepted JSON-RPC frame line length in bytes.
@@ -167,23 +178,25 @@ impl<C: Clock, L: ReceiptLedger> McpProxy<C, L> {
 
         self.ensure_upstream_alive(&req_id, ctx)?;
 
-        let (verdict, receipt) =
-            match self
-                .ledger
-                .evaluate_and_record(&self.verified_chain, &request, &facts, now)
-            {
-                Ok(outcome) => outcome,
-                Err(err) => {
-                    write_jsonrpc_error(
-                        ctx.client_out,
-                        Some(&req_id),
-                        JSONRPC_INTERNAL_ERROR,
-                        &format!("handfest ledger evaluation failed: {err}"),
-                        None,
-                    )?;
-                    return Err(ProxyError::Ledger(err));
-                }
-            };
+        let (verdict, receipt) = match self.ledger.evaluate_and_record_with_revocations(
+            &self.verified_chain,
+            &request,
+            &facts,
+            &self.extra_revocations,
+            now,
+        ) {
+            Ok(outcome) => outcome,
+            Err(err) => {
+                write_jsonrpc_error(
+                    ctx.client_out,
+                    Some(&req_id),
+                    JSONRPC_INTERNAL_ERROR,
+                    &format!("handfest ledger evaluation failed: {err}"),
+                    None,
+                )?;
+                return Err(ProxyError::Ledger(err));
+            }
+        };
 
         match verdict {
             Verdict::Permit => {
@@ -244,7 +257,25 @@ impl<C: Clock, L: ReceiptLedger> McpProxy<C, L> {
             return fail_upstream_protocol(client_out, Some(req_id), detail);
         }
 
-        if verify_chain_runtime(&self.verified_chain, &self.actor_key, evaluated_at).is_err() {
+        let chain_revoked = match self.check_revocation_status(evaluated_at) {
+            Ok(Ok(())) => false,
+            Ok(Err(_)) => true,
+            Err(ProxyError::Ledger(err)) => {
+                write_jsonrpc_error(
+                    client_out,
+                    Some(req_id),
+                    JSONRPC_INTERNAL_ERROR,
+                    &format!("handfest ledger revocation verification failed: {err}"),
+                    None,
+                )?;
+                return Err(ProxyError::Ledger(err));
+            }
+            Err(err) => return Err(err),
+        };
+
+        if verify_chain_runtime(&self.verified_chain, &self.actor_key, evaluated_at).is_err()
+            || chain_revoked
+        {
             tools.clear();
         } else {
             tools.retain(|entry| {
@@ -268,7 +299,21 @@ impl<C: Clock, L: ReceiptLedger> McpProxy<C, L> {
         client_out: &mut CW,
     ) -> Result<(), ProxyError> {
         let reason = match verify_chain_runtime(&self.verified_chain, &self.actor_key, now) {
-            Ok(()) => mapping_reason,
+            Ok(()) => match self.check_revocation_status(now) {
+                Ok(Ok(())) => mapping_reason,
+                Ok(Err(rev_reason)) => rev_reason,
+                Err(ProxyError::Ledger(err)) => {
+                    write_jsonrpc_error(
+                        client_out,
+                        Some(req_id),
+                        JSONRPC_INTERNAL_ERROR,
+                        &format!("handfest ledger revocation verification failed: {err}"),
+                        None,
+                    )?;
+                    return Err(ProxyError::Ledger(err));
+                }
+                Err(err) => return Err(err),
+            },
             Err(chain_err) => chain_err.to_string(),
         };
         let receipt = match self.ledger.record_denial(
@@ -294,6 +339,15 @@ impl<C: Clock, L: ReceiptLedger> McpProxy<C, L> {
             req_id,
             &reason,
             &receipt.receipt_hash.to_string(),
+        )
+    }
+
+    fn check_revocation_status(&self, evaluated_at: i64) -> Result<Result<(), String>, ProxyError> {
+        let mut combined = self.ledger.load_revocations().map_err(ProxyError::Ledger)?;
+        combined.extend_from(&self.extra_revocations);
+        Ok(
+            check_chain_revocations(&self.verified_chain, &combined, evaluated_at)
+                .map_err(|deny| deny.to_string()),
         )
     }
 
