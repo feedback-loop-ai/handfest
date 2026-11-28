@@ -3,8 +3,10 @@
 use std::collections::BTreeMap;
 use std::fmt;
 use std::io::Write;
+use std::path::PathBuf;
 use std::time::Duration;
 
+use handfest_anchors::{AnchorRegistry, AnchorVerifier};
 use handfest_core::ast::KeyId;
 use handfest_core::gate::{
     evaluate_predicate_if_known, ActionRequest, RevocationSnapshot, VerifiedMandate,
@@ -24,6 +26,7 @@ use crate::framing::{
     JSONRPC_INTERNAL_ERROR,
 };
 use crate::mapping::{denial_resource_id, CompiledPolicyMap, ToolPolicyMap};
+pub use crate::reloader::ChainReloader;
 use crate::session::{DispatchCtx, PendingKind};
 
 /// Default maximum JSON-RPC line length in bytes (1 MiB).
@@ -41,6 +44,8 @@ pub struct McpProxy<C: Clock, L: ReceiptLedger = SqliteLedger> {
     pub(crate) policy_map: CompiledPolicyMap,
     pub(crate) max_line_bytes: usize,
     pub(crate) shutdown_timeout: Duration,
+    pub(crate) chain_reloader: Option<ChainReloader>,
+    pub(crate) chain_reload_error: Option<String>,
 }
 
 impl<C: Clock, L: ReceiptLedger> fmt::Debug for McpProxy<C, L> {
@@ -71,7 +76,45 @@ impl<C: Clock, L: ReceiptLedger> McpProxy<C, L> {
             policy_map,
             max_line_bytes: DEFAULT_MAX_LINE_BYTES,
             shutdown_timeout: DEFAULT_SHUTDOWN_TIMEOUT,
+            chain_reloader: None,
+            chain_reload_error: None,
         })
+    }
+
+    /// Atomically loads, verifies, and constructs a hot-reloading [`McpProxy`] directly from
+    /// on-disk `--chain` files using [`AnchorRegistry::default_registry`].
+    pub fn from_chain_files(
+        chain_paths: Vec<PathBuf>,
+        actor_key: KeyId,
+        policy_map: ToolPolicyMap,
+        ledger: L,
+        clock: C,
+    ) -> Result<Self, ProxyError> {
+        Self::from_chain_files_with_verifier(
+            chain_paths,
+            AnchorRegistry::default_registry(),
+            actor_key,
+            policy_map,
+            ledger,
+            clock,
+        )
+    }
+
+    /// Atomically loads, verifies, and constructs a hot-reloading [`McpProxy`] directly from
+    /// on-disk `--chain` files using a custom [`AnchorVerifier`].
+    pub fn from_chain_files_with_verifier<V: AnchorVerifier + Send + 'static>(
+        chain_paths: Vec<PathBuf>,
+        verifier: V,
+        actor_key: KeyId,
+        policy_map: ToolPolicyMap,
+        ledger: L,
+        clock: C,
+    ) -> Result<Self, ProxyError> {
+        let (verified_chain, reloader) =
+            ChainReloader::load_initial(chain_paths, verifier, &actor_key)?;
+        let mut proxy = Self::new(verified_chain, actor_key, policy_map, ledger, clock)?;
+        proxy.chain_reloader = Some(reloader);
+        Ok(proxy)
     }
 
     /// Attaches static verified revocations enforced alongside revocations persisted in `ledger`.
@@ -111,6 +154,42 @@ impl<C: Clock, L: ReceiptLedger> McpProxy<C, L> {
         self.engine.into_ledger()
     }
 
+    pub(crate) fn refresh_chain_if_changed(&mut self) -> Result<(), String> {
+        let Some(reloader) = self.chain_reloader.as_mut() else {
+            return Ok(());
+        };
+        match reloader.reload_if_changed(self.engine.actor_key()) {
+            Ok(None) => {
+                self.chain_reload_error = None;
+                Ok(())
+            }
+            Ok(Some(verified_chain)) => {
+                self.engine
+                    .replace_verified_chain(verified_chain)
+                    .expect("ChainReloader already verified chain structure");
+                self.chain_reload_error = None;
+                Ok(())
+            }
+            Err(detail) => {
+                eprintln!("handfest-mcp: mandate chain reload failed: {detail}");
+                self.chain_reload_error = Some(detail.clone());
+                Err(detail)
+            }
+        }
+    }
+
+    pub(crate) fn handle_tools_list<CW: Write>(
+        &mut self,
+        req_id: JsonRpcId,
+        raw_frame: &str,
+        ctx: &mut DispatchCtx<'_, CW>,
+    ) -> Result<(), ProxyError> {
+        if let Err(detail) = self.refresh_chain_if_changed() {
+            return write_chain_reload_denied(ctx.client_out, &req_id, &detail);
+        }
+        self.dispatch_to_upstream(req_id, PendingKind::ToolsList, raw_frame, ctx)
+    }
+
     pub(crate) fn handle_tools_call<CW: Write>(
         &mut self,
         req_id: JsonRpcId,
@@ -118,6 +197,21 @@ impl<C: Clock, L: ReceiptLedger> McpProxy<C, L> {
         raw_frame: &str,
         ctx: &mut DispatchCtx<'_, CW>,
     ) -> Result<(), ProxyError> {
+        if let Err(detail) = self.refresh_chain_if_changed() {
+            let now = self.engine.now_unix();
+            let denial_req = build_reload_denial_request(
+                self.engine.actor_key(),
+                self.policy_map.policy_map(),
+                obj,
+            );
+            return self.record_chain_unavailable_and_respond(
+                &req_id,
+                &denial_req,
+                now,
+                &format!("mandate chain reload failed: {detail}"),
+                ctx.client_out,
+            );
+        }
         let now = self.engine.now_unix();
         let (tool_name, arguments) = match extract_tool_call_params(obj) {
             Ok(parts) => parts,
@@ -192,9 +286,8 @@ impl<C: Clock, L: ReceiptLedger> McpProxy<C, L> {
     }
 
     pub(crate) fn relay_filtered_tools_list<CW: Write>(
-        &self,
+        &mut self,
         req_id: &JsonRpcId,
-        evaluated_at: i64,
         mut resp_obj: BTreeMap<String, ExactJson>,
         raw_line: Option<&str>,
         client_out: &mut CW,
@@ -237,19 +330,26 @@ impl<C: Clock, L: ReceiptLedger> McpProxy<C, L> {
             return fail_upstream_protocol(client_out, Some(req_id), detail);
         }
 
-        let chain_active = match self.engine.is_chain_active(evaluated_at) {
-            Ok(active) => active,
-            Err(PepError::Ledger(err)) => {
-                write_jsonrpc_error(
-                    client_out,
-                    Some(req_id),
-                    JSONRPC_INTERNAL_ERROR,
-                    &format!("handfest ledger revocation verification failed: {err}"),
-                    None,
-                )?;
-                return Err(ProxyError::Ledger(err));
+        let reload_healthy =
+            self.refresh_chain_if_changed().is_ok() && self.chain_reload_error.is_none();
+        let evaluated_at = self.engine.now_unix();
+        let chain_active = if reload_healthy {
+            match self.engine.is_chain_active(evaluated_at) {
+                Ok(active) => active,
+                Err(PepError::Ledger(err)) => {
+                    write_jsonrpc_error(
+                        client_out,
+                        Some(req_id),
+                        JSONRPC_INTERNAL_ERROR,
+                        &format!("handfest ledger revocation verification failed: {err}"),
+                        None,
+                    )?;
+                    return Err(ProxyError::Ledger(err));
+                }
+                Err(err) => return Err(err.into()),
             }
-            Err(err) => return Err(err.into()),
+        } else {
+            false
         };
 
         if !chain_active {
@@ -300,6 +400,39 @@ impl<C: Clock, L: ReceiptLedger> McpProxy<C, L> {
         )
     }
 
+    fn record_chain_unavailable_and_respond<CW: Write>(
+        &mut self,
+        req_id: &JsonRpcId,
+        denial_request: &ActionRequest,
+        now: i64,
+        reason: &str,
+        client_out: &mut CW,
+    ) -> Result<(), ProxyError> {
+        let receipt = match self
+            .engine
+            .record_chain_unavailable_denial(denial_request, reason, now)
+        {
+            Ok(receipt) => receipt,
+            Err(PepError::Ledger(err)) => {
+                write_jsonrpc_error(
+                    client_out,
+                    Some(req_id),
+                    JSONRPC_INTERNAL_ERROR,
+                    &format!("handfest ledger denial recording failed: {err}"),
+                    None,
+                )?;
+                return Err(ProxyError::Ledger(err));
+            }
+            Err(err) => return Err(err.into()),
+        };
+        write_denied_response(
+            client_out,
+            req_id,
+            reason,
+            &receipt.receipt_hash.to_string(),
+        )
+    }
+
     fn is_tool_permitted(&self, tool_name: &str, evaluated_at: i64) -> bool {
         let Some(policy) = self.policy_map.policy_map().get(tool_name) else {
             return false;
@@ -331,6 +464,37 @@ impl<C: Clock, L: ReceiptLedger> McpProxy<C, L> {
 
 /// Builds an [`ActionRequest`] for pre-gate mapping denials, preserving the configured mapped
 /// action and resource metadata when the tool is present in `policy_map`.
+/// Builds an [`ActionRequest`] for hot-reload denial receipts, preserving the mapped action and
+/// resource when `params` parses and maps, or falling back to `"mcp.tools.call"`.
+fn build_reload_denial_request(
+    actor_key: &KeyId,
+    policy_map: &ToolPolicyMap,
+    obj: &BTreeMap<String, ExactJson>,
+) -> ActionRequest {
+    match extract_tool_call_params(obj) {
+        Ok((tool_name, arguments)) => match policy_map.get(tool_name) {
+            Some(policy) => ActionRequest {
+                actor_key: actor_key.clone(),
+                action: policy.action.clone(),
+                resource_kind: policy.resource_kind.clone(),
+                resource_id: denial_resource_id(policy, arguments),
+            },
+            None => ActionRequest {
+                actor_key: actor_key.clone(),
+                action: "mcp.tools.call".to_string(),
+                resource_kind: "mcp_tool".to_string(),
+                resource_id: tool_name.to_string(),
+            },
+        },
+        Err(_) => ActionRequest {
+            actor_key: actor_key.clone(),
+            action: "mcp.tools.call".to_string(),
+            resource_kind: "mcp_tool".to_string(),
+            resource_id: "invalid_params".to_string(),
+        },
+    }
+}
+
 fn build_mapping_denial_request(
     actor_key: &KeyId,
     policy_map: &ToolPolicyMap,
@@ -422,4 +586,21 @@ fn extract_tool_call_params(
         return Err("tools/call params.name must not be empty".to_string());
     }
     Ok((name, params.get("arguments")))
+}
+
+pub(crate) fn write_chain_reload_denied<CW: Write>(
+    client_out: &mut CW,
+    req_id: &JsonRpcId,
+    detail: &str,
+) -> Result<(), ProxyError> {
+    let reason = format!("mandate chain reload failed: {detail}");
+    let mut data = BTreeMap::new();
+    data.insert("reason".to_string(), ExactJson::Str(reason.clone()));
+    write_jsonrpc_error(
+        client_out,
+        Some(req_id),
+        HANDFEST_DENIED_ERROR_CODE,
+        &format!("handfest denied: {reason}"),
+        Some(&ExactJson::Object(data)),
+    )
 }

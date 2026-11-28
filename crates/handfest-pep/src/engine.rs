@@ -96,6 +96,18 @@ impl<C: Clock, L: ReceiptLedger> GateEngine<C, L> {
         &self.verified_chain
     }
 
+    /// Atomically replaces the active verified mandate chain after validating all structural
+    /// invariants (root parent absence, parent digest linking, and monotonic lattice narrowing).
+    pub fn replace_verified_chain(
+        &mut self,
+        verified_chain: Vec<VerifiedMandate>,
+    ) -> Result<(), PepError> {
+        let chain_ids = validate_verified_chain(&verified_chain)?;
+        self.verified_chain = verified_chain;
+        self.chain_ids = chain_ids;
+        Ok(())
+    }
+
     /// Borrows the ordered [`MandateId`] digests for the verified chain.
     #[must_use]
     pub fn chain_ids(&self) -> &[MandateId] {
@@ -221,5 +233,26 @@ impl<C: Clock, L: ReceiptLedger> GateEngine<C, L> {
             mapping_reason,
         )?;
         Ok(PreGateDenial { reason, receipt })
+    }
+
+    /// Records an audited denial receipt when no valid mandate chain is currently available (for
+    /// example, after a hot-reload failure), persisting empty `chain_ids` (`[]`) attributed to
+    /// `self.actor_key` without consulting any stale previously loaded chain and without modifying
+    /// quota counters.
+    pub fn record_chain_unavailable_denial(
+        &mut self,
+        request: &ActionRequest,
+        reason: &str,
+        now: i64,
+    ) -> Result<DecisionReceipt, PepError> {
+        let denial_req = ActionRequest {
+            actor_key: self.actor_key.clone(),
+            action: request.action.clone(),
+            resource_kind: request.resource_kind.clone(),
+            resource_id: request.resource_id.clone(),
+        };
+        Ok(self
+            .ledger
+            .record_denial(Vec::new(), &denial_req, now, reason.to_string())?)
     }
 }

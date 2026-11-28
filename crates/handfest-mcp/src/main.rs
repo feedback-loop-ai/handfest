@@ -13,12 +13,8 @@ use handfest_anchors::AnchorRegistry;
 use handfest_core::ast::KeyId;
 use handfest_core::exact_json::write_json_string;
 use handfest_ledger::SqliteLedger;
-use handfest_mcp::{
-    verify_mandate_chain_with, verify_revocations_with, MappingError, McpProxy, ProxyError,
-};
-use handfest_pep::{
-    load_signed_mandates_files, load_signed_revocations_files, PepError, RuntimeClock,
-};
+use handfest_mcp::{verify_revocations_with, MappingError, McpProxy, ProxyError};
+use handfest_pep::{load_signed_revocations_files, PepError, RuntimeClock};
 
 const CHILD_EXIT_GRACE_POLLS: usize = 20;
 const CHILD_EXIT_POLL_INTERVAL: Duration = Duration::from_millis(10);
@@ -229,22 +225,22 @@ fn parse_upstream_command(upstream: &[String]) -> Result<(&str, &[String]), Star
 }
 
 fn build_proxy(cli: &Cli) -> Result<McpProxy<RuntimeClock, SqliteLedger>, StartupError> {
-    let signed_chain = load_signed_mandates_files(&cli.chain).map_err(map_envelope_load_error)?;
-    let verifier = AnchorRegistry::default_registry();
-    let verified_chain = verify_mandate_chain_with(&verifier, &signed_chain).map_err(|err| {
-        StartupError::ChainInvalid(format!("startup mandate chain verification failed: {err}"))
+    let actor_key = KeyId::parse(&cli.actor_key).map_err(|err| {
+        StartupError::CliArgs(format!("invalid --actor-key '{}': {err}", cli.actor_key))
     })?;
+    let clock = RuntimeClock::from_optional_rfc3339(cli.now.as_deref()).map_err(|err| {
+        StartupError::CliArgs(format!(
+            "invalid --now '{}': {err}",
+            cli.now.as_deref().unwrap_or("")
+        ))
+    })?;
+    let verifier = AnchorRegistry::default_registry();
     let signed_revocations =
         load_signed_revocations_files(&cli.revocations).map_err(map_envelope_load_error)?;
     let verified_revocations =
         verify_revocations_with(&verifier, &signed_revocations).map_err(|err| {
             StartupError::ChainInvalid(format!("startup revocation verification failed: {err}"))
         })?;
-
-    let actor_key = KeyId::parse(&cli.actor_key).map_err(|err| {
-        StartupError::CliArgs(format!("invalid --actor-key '{}': {err}", cli.actor_key))
-    })?;
-
     let policy_map =
         handfest_mcp::mapping::load_policy_map_file(&cli.policy_map).map_err(|err| match err {
             MappingError::Io(msg) => {
@@ -252,14 +248,6 @@ fn build_proxy(cli: &Cli) -> Result<McpProxy<RuntimeClock, SqliteLedger>, Startu
             }
             other => StartupError::PolicyInvalid(format!("failed to load --policy-map: {other}")),
         })?;
-
-    let clock = RuntimeClock::from_optional_rfc3339(cli.now.as_deref()).map_err(|err| {
-        StartupError::CliArgs(format!(
-            "invalid --now '{}': {err}",
-            cli.now.as_deref().unwrap_or("")
-        ))
-    })?;
-
     let ledger = SqliteLedger::open(&cli.ledger).map_err(|err| {
         StartupError::LedgerOpen(format!(
             "failed to open ledger '{}': {err}",
@@ -267,14 +255,17 @@ fn build_proxy(cli: &Cli) -> Result<McpProxy<RuntimeClock, SqliteLedger>, Startu
         ))
     })?;
 
-    McpProxy::new(verified_chain, actor_key, policy_map, ledger, clock)
+    McpProxy::from_chain_files(cli.chain.clone(), actor_key, policy_map, ledger, clock)
         .map(|proxy| proxy.with_revocations(verified_revocations))
         .map_err(|err| match err {
+            ProxyError::Io(io_err) => StartupError::ChainIo(io_err.to_string()),
             ProxyError::Mapping(map_err) => {
                 StartupError::PolicyInvalid(format!("failed to initialize MCP proxy: {map_err}"))
             }
-            ProxyError::InvalidChain(_) | ProxyError::Anchor(_) => {
-                StartupError::ChainInvalid(format!("failed to initialize MCP proxy: {err}"))
+            ProxyError::InvalidChain(_) | ProxyError::Anchor(_) | ProxyError::ChainStructure(_) => {
+                StartupError::ChainInvalid(format!(
+                    "startup mandate chain verification failed: {err}"
+                ))
             }
             other => StartupError::RuntimeError(format!("failed to initialize MCP proxy: {other}")),
         })

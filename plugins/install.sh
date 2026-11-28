@@ -88,7 +88,19 @@ escape_sed_replacement() {
   printf '%s' "$1" | sed -e 's/[\\&|]/\\&/g'
 }
 
+# Escape a string for systemd ExecStart double-quoted arguments (\ -> \\, " -> \", % -> %%, $ -> $$).
+escape_systemd_string() {
+  local s="$1"
+  local dollar='$'
+  s="${s//\\/\\\\}"
+  s="${s//\"/\\\"}"
+  s="${s//%/%%}"
+  s="${s//"$dollar"/"$dollar$dollar"}"
+  printf '%s' "$s"
+}
+
 HANDFEST_HOME_JSON_ESC="$(escape_sed_replacement "$(escape_json_toml_string "$HANDFEST_HOME")")"
+HANDFEST_HOME_SYSTEMD_ESC="$(escape_sed_replacement "$(escape_systemd_string "$HANDFEST_HOME")")"
 HOOK_CMD_RAW="$(escape_shell_single_quoted "${HANDFEST_HOME}/hooks/pre-tool-use.sh")"
 HOOK_CMD_JSON_ESC="$(escape_sed_replacement "$(escape_json_toml_string "$HOOK_CMD_RAW")")"
 
@@ -96,6 +108,14 @@ install_localized_template() {
   local src="$1"
   local dst="$2"
   sed "s|/path/to/handfest-config|${HANDFEST_HOME_JSON_ESC}|g" "$src" >"${dst}.tmp"
+  chmod 0644 "${dst}.tmp"
+  mv -f "${dst}.tmp" "$dst"
+}
+
+install_systemd_template() {
+  local src="$1"
+  local dst="$2"
+  sed "s|/path/to/handfest-config|${HANDFEST_HOME_SYSTEMD_ESC}|g" "$src" >"${dst}.tmp"
   chmod 0644 "${dst}.tmp"
   mv -f "${dst}.tmp" "$dst"
 }
@@ -115,6 +135,7 @@ mkdir -p \
   "${HANDFEST_HOME}/state" \
   "${HANDFEST_HOME}/hooks" \
   "${HANDFEST_HOME}/templates"
+chmod 0700 "${HANDFEST_HOME}/state"
 
 # 1. Install /handfest SKILL.md for Antigravity (agy), Claude Code, and Codex.
 mkdir -p \
@@ -140,6 +161,7 @@ install_localized_template "${SCRIPT_DIR}/claude-code/mcp.example.json" "${HANDF
 install_claude_settings_template "${SCRIPT_DIR}/claude-code/settings.example.json" "${HANDFEST_HOME}/templates/claude-settings.json"
 install_localized_template "${SCRIPT_DIR}/codex/config.example.toml" "${HANDFEST_HOME}/templates/codex-config.toml"
 install_localized_template "${SCRIPT_DIR}/dsh/mcp.example.json" "${HANDFEST_HOME}/templates/dsh-mcp.json"
+install_systemd_template "${SCRIPT_DIR}/systemd/handfest-approver.service.example" "${HANDFEST_HOME}/templates/handfest-approver.service"
 
 cat <<SUMMARY
 Installed Handfest skills, hook, and localized templates:
@@ -157,7 +179,14 @@ Installed Handfest skills, hook, and localized templates:
     - ${HANDFEST_HOME}/templates/codex-config.toml
     - ${HANDFEST_HOME}/templates/dsh-mcp.json
     - ${HANDFEST_HOME}/templates/policy-map.example.json
+    - ${HANDFEST_HOME}/templates/handfest-approver.service
 
 Next step (out-of-band in your human terminal):
   handfest init --dir "${HANDFEST_HOME}" --principal-name "<your-name>" --ssh-key ~/.ssh/id_ed25519_sk.pub
+
+Optional (background approver daemon via systemd --user):
+  # Match --key / --ssh-key / --gpg-key / --fido2-cred / --piv-pubkey in handfest-approver.service
+  # to the signer backend chosen in 'handfest init' above.
+  mkdir -p ~/.config/systemd/user && cp "${HANDFEST_HOME}/templates/handfest-approver.service" ~/.config/systemd/user/
+  systemctl --user daemon-reload && systemctl --user enable --now handfest-approver.service
 SUMMARY

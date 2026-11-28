@@ -1,4 +1,4 @@
-//! Pluggable human WYSIWYS approval prompts (`TtyPrompt` and `DesktopPrompt`).
+//! Pluggable human WYSIWYS approval prompts (`TtyPrompt`, `DesktopPrompt`, `TmuxPrompt`, and `AutoPrompt`).
 
 use std::fmt;
 #[cfg(unix)]
@@ -14,6 +14,11 @@ use handfest_core::cnl::{parse_mandate, try_render_canonical};
 use handfest_core::gate::validate_proof_shape;
 
 use crate::protocol::{find_forbidden_mandate_char, validate_single_line_text};
+pub use crate::tmux::{
+    run_internal_popup_prompt, AutoPrompt, BoundedCommandOutcome, BoundedCommandRunner,
+    DisplayDetector, InternalPopupOutcome, SystemDisplayDetector, TmuxPrompt,
+    DEFAULT_TMUX_TIMEOUT_SECS,
+};
 
 /// Maximum bytes read from an interactive TTY response line before failing closed.
 const MAX_TTY_REPLY_BYTES: usize = 1024;
@@ -211,7 +216,7 @@ impl fmt::Display for PromptError {
             Self::InvalidView(detail) => write!(f, "invalid prompt view: {detail}"),
             Self::Io(detail) => write!(f, "approval prompt I/O error: {detail}"),
             Self::CommandFailed { program, detail } => {
-                write!(f, "desktop approval prompt '{program}' failed: {detail}")
+                write!(f, "approval prompt '{program}' failed: {detail}")
             }
         }
     }
@@ -291,25 +296,33 @@ impl<R: BufRead, W: Write> ApprovalPrompt for TtyPrompt<R, W> {
             .flush()
             .map_err(|err| PromptError::Io(err.to_string()))?;
 
-        match read_bounded_tty_reply(&mut self.reader, MAX_TTY_REPLY_BYTES) {
-            Ok(TtyReadResult::Eof) => Ok(ApprovalOutcome::Denied {
-                reason: "operator closed prompt (EOF)".to_string(),
-            }),
-            Ok(TtyReadResult::Truncated) => Ok(ApprovalOutcome::Denied {
-                reason: "operator closed prompt before newline (EOF)".to_string(),
-            }),
-            Ok(TtyReadResult::AmbiguousMultiLine) => Ok(ApprovalOutcome::Denied {
-                reason: "ambiguous multi-line TTY input rejected".to_string(),
-            }),
-            Ok(TtyReadResult::Interrupted) => Ok(ApprovalOutcome::Denied {
-                reason: "operator interrupted prompt".to_string(),
-            }),
-            Ok(TtyReadResult::TooLong) => Ok(ApprovalOutcome::Denied {
-                reason: "operator input exceeded maximum reply length".to_string(),
-            }),
-            Ok(TtyReadResult::Line(reply)) => Ok(classify_tty_reply(&reply)),
-            Err(err) => Err(PromptError::Io(err.to_string())),
-        }
+        read_tty_approval_reply(&mut self.reader)
+    }
+}
+
+/// Reads and classifies a single bounded interactive TTY reply line, failing closed on EOF,
+/// embedded NUL / non-exact text, multi-line input, interrupts, and oversized replies.
+pub(crate) fn read_tty_approval_reply<R: BufRead>(
+    reader: &mut R,
+) -> Result<ApprovalOutcome, PromptError> {
+    match read_bounded_tty_reply(reader, MAX_TTY_REPLY_BYTES) {
+        Ok(TtyReadResult::Eof) => Ok(ApprovalOutcome::Denied {
+            reason: "operator closed prompt (EOF)".to_string(),
+        }),
+        Ok(TtyReadResult::Truncated) => Ok(ApprovalOutcome::Denied {
+            reason: "operator closed prompt before newline (EOF)".to_string(),
+        }),
+        Ok(TtyReadResult::AmbiguousMultiLine) => Ok(ApprovalOutcome::Denied {
+            reason: "ambiguous multi-line TTY input rejected".to_string(),
+        }),
+        Ok(TtyReadResult::Interrupted) => Ok(ApprovalOutcome::Denied {
+            reason: "operator interrupted prompt".to_string(),
+        }),
+        Ok(TtyReadResult::TooLong) => Ok(ApprovalOutcome::Denied {
+            reason: "operator input exceeded maximum reply length".to_string(),
+        }),
+        Ok(TtyReadResult::Line(reply)) => Ok(classify_tty_reply(&reply)),
+        Err(err) => Err(PromptError::Io(err.to_string())),
     }
 }
 
@@ -490,12 +503,7 @@ impl<R: CommandRunner> DesktopPrompt<R> {
         view: &WysiwysPromptView,
         timeout: Duration,
     ) -> Result<ApprovalOutcome, PromptError> {
-        let display = view.format_display();
-        let timeout_secs = timeout_secs_ceil(timeout);
-        match self.backend {
-            DesktopBackend::Zenity => run_zenity_prompt(&self.runner, &display, timeout_secs),
-            DesktopBackend::Osascript => run_osascript_prompt(&self.runner, &display, timeout_secs),
-        }
+        run_desktop_prompt(&self.runner, self.backend, view, timeout)
     }
 }
 
@@ -513,7 +521,21 @@ impl<R: CommandRunner> ApprovalPrompt for DesktopPrompt<R> {
     }
 }
 
-const fn timeout_secs_ceil(timeout: Duration) -> u64 {
+pub(crate) fn run_desktop_prompt<R: CommandRunner>(
+    runner: &R,
+    backend: DesktopBackend,
+    view: &WysiwysPromptView,
+    timeout: Duration,
+) -> Result<ApprovalOutcome, PromptError> {
+    let display = view.format_display();
+    let timeout_secs = timeout_secs_ceil(timeout);
+    match backend {
+        DesktopBackend::Zenity => run_zenity_prompt(runner, &display, timeout_secs),
+        DesktopBackend::Osascript => run_osascript_prompt(runner, &display, timeout_secs),
+    }
+}
+
+pub(crate) const fn timeout_secs_ceil(timeout: Duration) -> u64 {
     let secs = timeout.as_secs();
     if timeout.subsec_nanos() > 0 {
         secs.saturating_add(1)

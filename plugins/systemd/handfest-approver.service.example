@@ -1,0 +1,13 @@
+[Unit]
+Description=Handfest Out-of-Band WYSIWYS Approver Daemon
+
+[Service]
+Type=simple
+# Match the signer flag below (--key, --ssh-key, --gpg-key, --fido2-cred, or --piv-pubkey)
+# to the signer backend configured during `handfest init`.
+ExecStart=%h/.local/bin/handfest-approver --socket "/path/to/handfest-config/state/approver.sock" --key "/path/to/handfest-config/human.key.json" --prompt auto
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=default.target

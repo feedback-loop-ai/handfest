@@ -19,6 +19,7 @@ pub mod protocol;
 pub mod signer;
 #[cfg(unix)]
 mod socket;
+mod tmux;
 
 /// Maximum supported finite request or daemon timeout (24 hours).
 ///
@@ -40,6 +41,17 @@ pub fn validate_timeout_secs(secs: u64) -> Result<Duration, String> {
         TimeoutValidationError::Zero => "--timeout-secs must be greater than 0".to_string(),
         TimeoutValidationError::ExceedsMax => {
             format!("--timeout-secs must not exceed {}", MAX_TIMEOUT.as_secs())
+        }
+    })
+}
+
+/// Validates a CLI `--timeout-ms` flag against `(0, MAX_TIMEOUT]`.
+#[cfg(unix)]
+pub fn validate_timeout_ms(ms: u64) -> Result<Duration, String> {
+    validate_finite_timeout(Duration::from_millis(ms)).map_err(|err| match err {
+        TimeoutValidationError::Zero => "--timeout-ms must be greater than 0".to_string(),
+        TimeoutValidationError::ExceedsMax => {
+            format!("--timeout-ms must not exceed {}", MAX_TIMEOUT.as_millis())
         }
     })
 }

@@ -14,7 +14,8 @@ use handfest_anchors::MandateSigner;
 use handfest_approver::daemon::{ApproverDaemon, BoundSocket, SocketMode, DEFAULT_TIMEOUT_SECS};
 #[cfg(unix)]
 use handfest_approver::prompt::{
-    ApprovalOutcome, ApprovalPrompt, DesktopPrompt, PromptError, TtyPrompt, WysiwysPromptView,
+    run_internal_popup_prompt, ApprovalOutcome, ApprovalPrompt, AutoPrompt, DesktopPrompt,
+    InternalPopupOutcome, PromptError, TmuxPrompt, TtyPrompt, WysiwysPromptView,
 };
 #[cfg(unix)]
 use handfest_approver::signer::{build_piv_signer_config, resolve_signer, SignerConfig};
@@ -22,8 +23,10 @@ use handfest_approver::signer::{build_piv_signer_config, resolve_signer, SignerC
 #[cfg(unix)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 enum PromptMode {
+    Auto,
     Tty,
     Desktop,
+    Tmux,
 }
 
 #[cfg(unix)]
@@ -151,8 +154,8 @@ struct Cli {
     socket: PathBuf,
     #[command(flatten)]
     signer: SignerFlags,
-    /// Human approval prompt mode (`tty` reads from `/dev/tty`; `desktop` shows a native dialog).
-    #[arg(long, value_enum, default_value_t = PromptMode::Tty)]
+    /// Human approval prompt mode (`auto` selects desktop or tmux per request; `tty`, `desktop`, `tmux`).
+    #[arg(long, value_enum, default_value_t = PromptMode::Auto)]
     prompt: PromptMode,
     /// Per-request socket and approval timeout in seconds.
     #[arg(long, default_value_t = DEFAULT_TIMEOUT_SECS)]
@@ -167,16 +170,20 @@ struct Cli {
 
 #[cfg(unix)]
 enum RuntimePrompt {
+    Auto(AutoPrompt),
     Tty(TtyPrompt<std::io::BufReader<std::fs::File>, std::fs::File>),
     Desktop(DesktopPrompt),
+    Tmux(TmuxPrompt),
 }
 
 #[cfg(unix)]
 impl ApprovalPrompt for RuntimePrompt {
     fn prompt(&mut self, view: &WysiwysPromptView) -> Result<ApprovalOutcome, PromptError> {
         match self {
+            Self::Auto(prompt) => prompt.prompt(view),
             Self::Tty(prompt) => prompt.prompt(view),
             Self::Desktop(prompt) => prompt.prompt(view),
+            Self::Tmux(prompt) => prompt.prompt(view),
         }
     }
 
@@ -186,8 +193,10 @@ impl ApprovalPrompt for RuntimePrompt {
         timeout: Duration,
     ) -> Result<ApprovalOutcome, PromptError> {
         match self {
+            Self::Auto(prompt) => prompt.prompt_with_timeout(view, timeout),
             Self::Tty(prompt) => prompt.prompt_with_timeout(view, timeout),
             Self::Desktop(prompt) => prompt.prompt_with_timeout(view, timeout),
+            Self::Tmux(prompt) => prompt.prompt_with_timeout(view, timeout),
         }
     }
 }
@@ -195,11 +204,17 @@ impl ApprovalPrompt for RuntimePrompt {
 #[cfg(unix)]
 fn build_prompt(mode: PromptMode, timeout: Duration) -> Result<RuntimePrompt, String> {
     match mode {
+        PromptMode::Auto => Ok(RuntimePrompt::Auto(
+            AutoPrompt::system().with_timeout(timeout),
+        )),
         PromptMode::Tty => TtyPrompt::open_dev_tty()
             .map(RuntimePrompt::Tty)
             .map_err(|err| err.to_string()),
         PromptMode::Desktop => Ok(RuntimePrompt::Desktop(
             DesktopPrompt::system().with_timeout(timeout),
+        )),
+        PromptMode::Tmux => Ok(RuntimePrompt::Tmux(
+            TmuxPrompt::system().with_timeout(timeout),
         )),
     }
 }
@@ -233,9 +248,69 @@ fn run(cli: Cli) -> Result<ExitCode, String> {
 }
 
 #[cfg(unix)]
+#[derive(Debug, Parser)]
+#[command(name = "handfest-approver", hide = true)]
+struct InternalPopupCli {
+    /// Internal hidden mode invoked by `tmux display-popup` for pure-Rust WYSIWYS confirmation.
+    #[arg(long = "internal-popup-prompt", hide = true)]
+    internal_popup_prompt: bool,
+    /// Path to the private display file rendered by the approver daemon.
+    #[arg(long)]
+    display_file: PathBuf,
+    /// Path to the private result file where approval outcome is recorded.
+    #[arg(long)]
+    result_file: PathBuf,
+    /// Popup approval timeout in milliseconds.
+    #[arg(long)]
+    timeout_ms: u64,
+}
+
+#[cfg(unix)]
+#[derive(Debug)]
+enum Invocation {
+    Daemon(Cli),
+    InternalPopup(InternalPopupCli),
+}
+
+#[cfg(unix)]
+fn parse_invocation_from<I, T>(args: I) -> Result<Invocation, clap::Error>
+where
+    I: IntoIterator<Item = T>,
+    T: Into<std::ffi::OsString> + Clone,
+{
+    let collected: Vec<std::ffi::OsString> = args.into_iter().map(Into::into).collect();
+    if collected
+        .get(1)
+        .is_some_and(|arg| arg == "--internal-popup-prompt")
+    {
+        InternalPopupCli::try_parse_from(collected).map(Invocation::InternalPopup)
+    } else {
+        Cli::try_parse_from(collected).map(Invocation::Daemon)
+    }
+}
+
+#[cfg(unix)]
+fn run_internal_popup(cli: InternalPopupCli) -> Result<ExitCode, String> {
+    let timeout = handfest_approver::validate_timeout_ms(cli.timeout_ms)?;
+    match run_internal_popup_prompt(&cli.display_file, &cli.result_file, timeout)
+        .map_err(|err| err.to_string())?
+    {
+        InternalPopupOutcome::Approved | InternalPopupOutcome::Denied => Ok(ExitCode::SUCCESS),
+        InternalPopupOutcome::TimedOut => Ok(ExitCode::from(143)),
+    }
+}
+
+#[cfg(unix)]
 fn main() -> ExitCode {
-    let cli = Cli::parse();
-    match run(cli) {
+    let invocation = match parse_invocation_from(std::env::args_os()) {
+        Ok(inv) => inv,
+        Err(err) => err.exit(),
+    };
+    let result = match invocation {
+        Invocation::Daemon(cli) => run(cli),
+        Invocation::InternalPopup(popup_cli) => run_internal_popup(popup_cli),
+    };
+    match result {
         Ok(code) => code,
         Err(err) => {
             eprintln!("error: {err}");
@@ -291,7 +366,43 @@ mod tests {
             "/tmp/id_ed25519_sk.pub",
         ])
         .expect("parse ssh-key CLI args");
-        assert_eq!(ssh_cli.prompt, PromptMode::Tty);
+        assert_eq!(ssh_cli.prompt, PromptMode::Auto);
+
+        let tmux_cli = Cli::try_parse_from([
+            "handfest-approver",
+            "--socket",
+            "/tmp/approver.sock",
+            "--key",
+            "/tmp/root.key.json",
+            "--prompt",
+            "tmux",
+        ])
+        .expect("parse tmux prompt CLI args");
+        assert_eq!(tmux_cli.prompt, PromptMode::Tmux);
+
+        let tty_cli = Cli::try_parse_from([
+            "handfest-approver",
+            "--socket",
+            "/tmp/approver.sock",
+            "--key",
+            "/tmp/root.key.json",
+            "--prompt",
+            "tty",
+        ])
+        .expect("parse tty prompt CLI args");
+        assert_eq!(tty_cli.prompt, PromptMode::Tty);
+
+        let auto_cli = Cli::try_parse_from([
+            "handfest-approver",
+            "--socket",
+            "/tmp/approver.sock",
+            "--key",
+            "/tmp/root.key.json",
+            "--prompt",
+            "auto",
+        ])
+        .expect("parse auto prompt CLI args");
+        assert_eq!(auto_cli.prompt, PromptMode::Auto);
         assert_eq!(ssh_cli.timeout_secs, DEFAULT_TIMEOUT_SECS);
         assert_eq!(SocketMode::from(ssh_cli.socket_mode), SocketMode::OwnerOnly);
         assert_eq!(
@@ -406,5 +517,61 @@ mod tests {
             let err = run(huge_cli).unwrap_err();
             assert!(err.contains("--timeout-secs must not exceed"));
         }
+    }
+
+    #[test]
+    fn internal_popup_invocation_parses_and_rejects_invalid_timeout_or_missing_display() {
+        let inv = parse_invocation_from([
+            "handfest-approver",
+            "--internal-popup-prompt",
+            "--display-file",
+            "/tmp/nonexistent-handfest-display-file.txt",
+            "--result-file",
+            "/tmp/nonexistent-handfest-result-file.txt",
+            "--timeout-ms",
+            "0",
+        ])
+        .expect("parse internal popup invocation");
+        let Invocation::InternalPopup(popup_cli) = inv else {
+            panic!("expected InternalPopup invocation");
+        };
+        assert!(popup_cli.internal_popup_prompt);
+        let zero_err = run_internal_popup(popup_cli).unwrap_err();
+        assert!(zero_err.contains("--timeout-ms must be greater than 0"));
+
+        let over_max = (handfest_approver::MAX_TIMEOUT.as_millis() + 1).to_string();
+        let inv_over = parse_invocation_from([
+            "handfest-approver",
+            "--internal-popup-prompt",
+            "--display-file",
+            "/tmp/nonexistent-handfest-display-file.txt",
+            "--result-file",
+            "/tmp/nonexistent-handfest-result-file.txt",
+            "--timeout-ms",
+            &over_max,
+        ])
+        .unwrap();
+        let Invocation::InternalPopup(over_cli) = inv_over else {
+            panic!("expected InternalPopup invocation");
+        };
+        let over_err = run_internal_popup(over_cli).unwrap_err();
+        assert!(over_err.contains("--timeout-ms must not exceed"));
+
+        let inv_missing = parse_invocation_from([
+            "handfest-approver",
+            "--internal-popup-prompt",
+            "--display-file",
+            "/tmp/nonexistent-handfest-display-file.txt",
+            "--result-file",
+            "/tmp/nonexistent-handfest-result-file.txt",
+            "--timeout-ms",
+            "5000",
+        ])
+        .unwrap();
+        let Invocation::InternalPopup(missing_cli) = inv_missing else {
+            panic!("expected InternalPopup invocation");
+        };
+        let missing_err = run_internal_popup(missing_cli).unwrap_err();
+        assert!(missing_err.contains("failed to stat tmux display file"));
     }
 }

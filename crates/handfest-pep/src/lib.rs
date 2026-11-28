@@ -17,14 +17,17 @@ mod error;
 mod secret;
 
 pub use chain::{
-    load_signed_mandates_files, load_signed_revocations_files, validate_verified_chain,
-    verify_mandate_chain, verify_mandate_chain_with, verify_revocations, verify_revocations_with,
+    load_signed_mandates_files, load_signed_revocations_files, parse_signed_mandate_json,
+    validate_verified_chain, verify_mandate_chain, verify_mandate_chain_with, verify_revocations,
+    verify_revocations_with,
 };
 pub use clock::{Clock, FixedClock, RuntimeClock, SystemClock};
 pub use engine::{GateDecision, GateEngine, PreGateDenial};
 pub use error::PepError;
 pub use handfest_core::Verdict;
 pub use handfest_ledger::ReceiptLedger;
+#[cfg(unix)]
+pub use secret::UNIX_O_NONBLOCK;
 pub use secret::{
     decode_credential_source, is_valid_env_var_name, validate_absolute_clean_path,
     CredentialSource, SecretError, SecretString,

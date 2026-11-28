@@ -32,7 +32,7 @@ enum LoopStep {
 
 pub(crate) enum PendingKind {
     Normal,
-    ToolsList { evaluated_at: i64 },
+    ToolsList,
 }
 
 pub(crate) struct PendingRequest {
@@ -455,15 +455,7 @@ impl<C: Clock, L: ReceiptLedger> McpProxy<C, L> {
             "initialize" | "ping" => {
                 self.dispatch_to_upstream(req_id, PendingKind::Normal, raw_frame, ctx)
             }
-            "tools/list" => {
-                let evaluated_at = self.engine.now_unix();
-                self.dispatch_to_upstream(
-                    req_id,
-                    PendingKind::ToolsList { evaluated_at },
-                    raw_frame,
-                    ctx,
-                )
-            }
+            "tools/list" => self.handle_tools_list(req_id, raw_frame, ctx),
             "tools/call" => self.handle_tools_call(req_id, obj, raw_frame, ctx),
             other => {
                 let mut data = BTreeMap::new();
@@ -540,7 +532,7 @@ impl<C: Clock, L: ReceiptLedger> McpProxy<C, L> {
     }
 
     fn handle_upstream_response<CW: Write>(
-        &self,
+        &mut self,
         resp_id: JsonRpcId,
         mut obj: BTreeMap<String, ExactJson>,
         raw_line: &str,
@@ -584,9 +576,8 @@ impl<C: Clock, L: ReceiptLedger> McpProxy<C, L> {
                     write_raw_line(client_out, &ExactJson::Object(obj).to_json_string())
                 }
             }
-            PendingKind::ToolsList { evaluated_at } => self.relay_filtered_tools_list(
+            PendingKind::ToolsList => self.relay_filtered_tools_list(
                 &pending.id,
-                evaluated_at,
                 obj,
                 id_spelling_matches.then_some(raw_line),
                 client_out,

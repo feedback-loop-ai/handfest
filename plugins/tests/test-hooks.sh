@@ -1797,6 +1797,8 @@ import json, os, stat, sys, tomllib
 
 hf_home = sys.argv[1]
 assert (stat.S_IMODE(os.stat(hf_home).st_mode)) == 0o700, "HANDFEST_HOME must be 0700"
+state_dir = os.path.join(hf_home, "state")
+assert (stat.S_IMODE(os.stat(state_dir).st_mode)) == 0o700, "HANDFEST_HOME/state must be 0700"
 hook_path = os.path.join(hf_home, "hooks", "pre-tool-use.sh")
 assert (stat.S_IMODE(os.stat(hook_path).st_mode)) == 0o755, "pre-tool-use.sh must be 0755"
 
@@ -1811,7 +1813,41 @@ assert "/path/to/handfest-config" not in codex_raw
 parsed_toml = tomllib.loads(codex_raw)
 args = parsed_toml["mcp_servers"]["github_handfest"]["args"]
 assert f"{hf_home}/mandates/root.signed.json" in args, f"localized path missing in codex toml: {args!r}"
+
+svc_path = os.path.join(hf_home, "templates", "handfest-approver.service")
+assert (stat.S_IMODE(os.stat(svc_path).st_mode)) == 0o644, "systemd unit template must be 0644"
+svc_raw = open(svc_path, "r", encoding="utf-8").read()
+assert "/path/to/handfest-config" not in svc_raw, "unlocalized placeholder left in systemd unit"
+assert "After=default.target" not in svc_raw, "systemd unit must not have After=default.target ordering cycle"
+assert "--ssh-key" in svc_raw and "--gpg-key" in svc_raw and "--fido2-cred" in svc_raw and "--piv-pubkey" in svc_raw, "systemd unit must document matching signer flags"
+assert f'ExecStart=%h/.local/bin/handfest-approver --socket "{hf_home}/state/approver.sock" --key "{hf_home}/human.key.json" --prompt auto' in svc_raw, f"unexpected ExecStart in systemd unit: {svc_raw!r}"
+assert "Restart=on-failure" in svc_raw
+assert "RestartSec=2" in svc_raw
+assert "WantedBy=default.target" in svc_raw
 PY_INSTALL
+grep -q "systemctl --user enable --now handfest-approver.service" "$TMP_DIR/install_stdout.txt" || {
+  echo "FAIL [install.sh systemd hint]: missing systemctl --user hint in stdout" >&2
+  exit 1
+}
+grep -q -- "--piv-pubkey" "$TMP_DIR/install_stdout.txt" || {
+  echo "FAIL [install.sh signer note]: missing signer-matching note in stdout" >&2
+  exit 1
+}
+
+# Test: install.sh escapes literal \${USER} (and %) in systemd ExecStart paths
+INSTALL_DOLLAR_HOME="$TMP_DIR"'/install-${USER}-100%-hf'
+HOME="$INSTALL_HOME" HANDFEST_HOME="$INSTALL_DOLLAR_HOME" "$REPO_ROOT/plugins/install.sh" >/dev/null
+python3 -I - "$INSTALL_DOLLAR_HOME" <<'PY_SYSTEMD_ESC'
+import os, sys
+
+hf_home = sys.argv[1]
+svc_path = os.path.join(hf_home, "templates", "handfest-approver.service")
+svc_raw = open(svc_path, "r", encoding="utf-8").read()
+expected_escaped = hf_home.replace("%", "%%").replace("$", "$$")
+expected_line = f'ExecStart=%h/.local/bin/handfest-approver --socket "{expected_escaped}/state/approver.sock" --key "{expected_escaped}/human.key.json" --prompt auto'
+assert expected_line in svc_raw, f"expected escaped ExecStart line {expected_line!r} in {svc_raw!r}"
+assert 'install-$${USER}-100%%-hf' in svc_raw, f"expected $$ and %% escaping in systemd unit: {svc_raw!r}"
+PY_SYSTEMD_ESC
 
 # Re-running install.sh must preserve an operator's existing policy-map.json
 echo '{"tools":{}}' >"$INSTALL_HF_HOME/policy-map.json"

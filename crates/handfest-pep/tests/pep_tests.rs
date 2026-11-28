@@ -985,3 +985,89 @@ fn authorize_at_mismatched_actor_propagates_ledger_integrity_error() {
         "expected PepError::Ledger(LedgerError::Integrity(_)), got: {err:?}"
     );
 }
+
+#[test]
+fn gate_engine_replace_verified_chain_updates_active_chain_and_rejects_empty() {
+    let human = Ed25519Keypair::from_secret_bytes([81u8; 32]);
+    let agent = Ed25519Keypair::from_secret_bytes([82u8; 32]);
+    let (_, signed_limit_1) = make_signed_mandate(&human, &agent.key_id(), 1);
+    let (_, signed_limit_5) = make_signed_mandate(&human, &agent.key_id(), 5);
+    let chain_1 = verify_mandate_chain(&[signed_limit_1]).expect("verify chain 1");
+    let chain_5 = verify_mandate_chain(&[signed_limit_5]).expect("verify chain 5");
+    let id_1 = chain_1[0].ast.mandate_id();
+    let id_5 = chain_5[0].ast.mandate_id();
+
+    let ledger = SqliteLedger::open_in_memory().expect("in-memory ledger");
+    let mut engine =
+        GateEngine::new(chain_1, agent.key_id(), ledger, FixedClock::new(NOW)).expect("engine");
+    assert_eq!(engine.chain_ids(), &[id_1]);
+
+    // Replacing with an empty chain must fail closed and leave the existing chain intact.
+    let err = engine.replace_verified_chain(Vec::new()).unwrap_err();
+    assert!(matches!(err, PepError::ChainStructure(_)));
+    assert_eq!(engine.chain_ids(), &[id_1]);
+
+    // Replacing with a valid chain atomically updates both verified_chain and chain_ids.
+    engine
+        .replace_verified_chain(chain_5)
+        .expect("replace valid chain");
+    assert_eq!(engine.chain_ids(), &[id_5]);
+    assert_eq!(engine.verified_chain().len(), 1);
+    assert_eq!(engine.verified_chain()[0].ast.mandate_id(), id_5);
+}
+
+#[test]
+fn gate_engine_record_chain_unavailable_denial_uses_empty_chain_ids_and_exact_reason() {
+    let dir = tempdir().expect("tempdir");
+    let ledger =
+        SqliteLedger::open(dir.path().join("chain_unavailable.sqlite")).expect("open ledger");
+    let human = Ed25519Keypair::from_secret_bytes([61u8; 32]);
+    let actor = Ed25519Keypair::from_secret_bytes([62u8; 32]);
+    let spoofed_actor = Ed25519Keypair::from_secret_bytes([63u8; 32]);
+
+    let (_, signed) = make_signed_mandate(&human, &actor.key_id(), 5);
+    let verified = verify_mandate_chain(&[signed]).expect("verify chain");
+    let mut engine =
+        GateEngine::new(verified, actor.key_id(), ledger, FixedClock::new(NOW)).expect("engine");
+
+    // Even when `now` is past the stale chain's `VALID_UNTIL`, `record_chain_unavailable_denial`
+    // must NEVER consult the stale chain, must record `chain_ids = []`, must attribute the receipt
+    // to `engine.actor_key()`, and must preserve the exact unavailable reason.
+    let req = ActionRequest {
+        actor_key: spoofed_actor.key_id(),
+        action: "git.pr.merge".to_string(),
+        resource_kind: "repo".to_string(),
+        resource_id: "org/app".to_string(),
+    };
+    let reason = "mandate chain reload failed: signature verification failed";
+    let receipt = engine
+        .record_chain_unavailable_denial(&req, reason, VALID_UNTIL + 60)
+        .expect("record chain unavailable denial");
+
+    assert!(
+        receipt.chain_ids.is_empty(),
+        "chain unavailable denial must persist empty chain_ids, got {:?}",
+        receipt.chain_ids
+    );
+    assert_eq!(receipt.actor_key, *engine.actor_key());
+    assert_eq!(
+        receipt.verdict,
+        handfest_pep::Verdict::Deny {
+            reason: reason.to_string(),
+        }
+    );
+    assert!(receipt.verify_hash());
+    assert_eq!(engine.ledger().verify_integrity().unwrap(), 1);
+    let tr = engine.ledger().track_record(engine.actor_key()).unwrap();
+    assert_eq!(tr.denies, 1);
+    assert_eq!(tr.permits, 0);
+    assert_eq!(tr.distinct_mandates, 0);
+    assert_eq!(
+        engine
+            .ledger()
+            .track_record(&spoofed_actor.key_id())
+            .unwrap()
+            .denies,
+        0
+    );
+}

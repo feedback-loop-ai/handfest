@@ -264,8 +264,9 @@ const UNIX_O_NOFOLLOW: Option<i32> = if cfg!(all(
     None
 };
 
+/// Platform `O_NONBLOCK` bitmask for non-blocking `open(2)` on Unix targets.
 #[cfg(unix)]
-const UNIX_O_NONBLOCK: Option<i32> = if cfg!(all(
+pub const UNIX_O_NONBLOCK: Option<i32> = if cfg!(all(
     any(target_os = "linux", target_os = "android"),
     any(
         target_arch = "x86_64",

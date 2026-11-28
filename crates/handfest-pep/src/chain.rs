@@ -78,25 +78,40 @@ pub fn load_signed_revocations_files(paths: &[PathBuf]) -> Result<Vec<SignedRevo
     load_signed_envelope_files(paths, "SignedRevocation")
 }
 
+/// Deserializes a single [`SignedMandate`] JSON envelope from raw UTF-8 bytes.
+pub fn parse_signed_mandate_json(
+    bytes: &[u8],
+    source_label: &str,
+) -> Result<SignedMandate, PepError> {
+    parse_signed_envelope_json(bytes, "SignedMandate", source_label)
+}
+
+fn parse_signed_envelope_json<T: serde::de::DeserializeOwned>(
+    bytes: &[u8],
+    kind_label: &str,
+    source_label: &str,
+) -> Result<T, PepError> {
+    serde_json::from_slice(bytes).map_err(|err| {
+        PepError::InvalidChain(format!(
+            "invalid {kind_label} JSON in '{source_label}': {err}"
+        ))
+    })
+}
+
 fn load_signed_envelope_files<T: serde::de::DeserializeOwned>(
     paths: &[PathBuf],
     kind_label: &str,
 ) -> Result<Vec<T>, PepError> {
     let mut envelopes = Vec::with_capacity(paths.len());
     for path in paths {
-        let raw = fs::read_to_string(path).map_err(|err| {
+        let raw = fs::read(path).map_err(|err| {
             PepError::Io(io::Error::new(
                 err.kind(),
                 format!("failed to read '{}': {err}", path.display()),
             ))
         })?;
-        let signed: T = serde_json::from_str(&raw).map_err(|err| {
-            PepError::InvalidChain(format!(
-                "invalid {kind_label} JSON in '{}': {err}",
-                path.display()
-            ))
-        })?;
-        envelopes.push(signed);
+        let source_label = path.display().to_string();
+        envelopes.push(parse_signed_envelope_json(&raw, kind_label, &source_label)?);
     }
     Ok(envelopes)
 }
